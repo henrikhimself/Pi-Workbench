@@ -34,8 +34,6 @@ Remove extension:
 pi remove git:github.com/henrikhimself/Pi-Workbench
 ```
 
-See [INSTALL.md](INSTALL.md) for project installs, pinning a Git tag or commit, and troubleshooting.
-
 ## Configuration
 
 On first session start, pi-workbench creates these files under `~/.pi/pi-workbench/` and never overwrites user edits.
@@ -50,11 +48,14 @@ On first session start, pi-workbench creates these files under `~/.pi/pi-workben
 
 | Field | Meaning |
 |---|---|
-| `url` | External Headroom proxy URL. Disables extension proxy management. |
-| `port` | Managed proxy port. Default: `8787`. Ignored when `url` is set. |
+| `url` | External Headroom proxy URL. Disables extension proxy management. Mutually exclusive with `port`. |
+| `port` | Managed localhost proxy port. Default: `8787`. Specifying `port` implies `http://127.0.0.1:<port>` and extension management. Mutually exclusive with `url`. |
 | `memoryRoot` | Absolute or `~/` root for project Memory stores. Default: `~/.pi/pi-workbench/headroom-memory`. |
 | `memoryUser` | Logical Headroom Memory user identity. Default: OS user name. |
 
+Use exactly one proxy setting. `url` connects compression to external Headroom and never starts or installs its proxy. `port` selects extension-managed localhost Headroom. Configuring both is rejected.
+
+Headroom Memory is separate from compression proxy. It starts local project-scoped `headroom.memory.mcp_server` with CPU-only `OnnxLocalEmbedder`, so it needs `~/.pi/pi-workbench/headroom-venv` even when `url` points at healthy external Headroom. External proxy service is not Memory MCP endpoint and is not reused.
 
 ### `study-mode.json`
 

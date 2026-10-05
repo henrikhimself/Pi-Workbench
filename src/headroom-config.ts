@@ -7,7 +7,7 @@ import { WORKBENCH_PATHS } from "./paths.js";
 export interface HeadroomConfig {
   /** External proxy URL. Omit to use extension-managed proxy. */
   url?: string;
-  /** Extension-managed proxy port. Ignored when url is configured. */
+  /** Extension-managed proxy port. Mutually exclusive with url. */
   port?: number;
   /** Absolute or ~/ path for project-scoped Memory data. */
   memoryRoot?: string;
@@ -32,7 +32,6 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
   for (const key of ["url", "port", "memoryRoot", "memoryUser"]) {
     if (source[key] === undefined) continue;
     if (key === "port") {
-      // Preserve external-proxy behavior: port is irrelevant when url is set.
       config.port = source.port as number;
       continue;
     }
@@ -45,6 +44,9 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
   }
 
   if (config.url !== undefined) {
+    if (config.port !== undefined) {
+      throw configError("url and port are mutually exclusive; url configures an external proxy, while port configures a localhost managed proxy.");
+    }
     let url: URL;
     try {
       url = new URL(config.url);

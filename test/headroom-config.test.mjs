@@ -29,7 +29,14 @@ test("Headroom config: validates proxy and Memory values", () => {
     memoryUser: "alice",
   });
   assert.deepEqual(config.parseHeadroomConfig({ url: "http://127.0.0.1:9000/" }), { url: "http://127.0.0.1:9000" });
-  for (const value of [{ port: 0 }, { port: "8787" }, { url: "ftp://example.com" }, { url: "http://user@example.com" }, { memoryUser: "" }]) {
+  for (const value of [
+    { url: "http://127.0.0.1:9000", port: 8787 },
+    { port: 0 },
+    { port: "8787" },
+    { url: "ftp://example.com" },
+    { url: "http://user@example.com" },
+    { memoryUser: "" },
+  ]) {
     assert.throws(() => config.parseHeadroomConfig(value), /headroom\.json/);
   }
 });

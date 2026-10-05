@@ -30,6 +30,7 @@ import {
 } from "./headroom-config.js";
 import { WORKBENCH_PATHS } from "./paths.js";
 import { MemoryManager, MEMORY_SERVER_NAME } from "./memory-manager.js";
+import { applyMemoryGuidance, resolveMemoryGuidanceMode } from "./memory-guidance.js";
 import {
   STUDY_DECOMPILE_TOOL,
   STUDY_ENTRY_TYPE,
@@ -123,6 +124,16 @@ export default function piWorkbenchExtension(
     } catch {
       return false;
     }
+  }
+
+  function memoryGuidanceMode() {
+    const activeToolNames = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
+    return resolveMemoryGuidanceMode({
+      memoryRegistered,
+      studyEnabled,
+      studyMemoryAllowed: studyPermissions.mcpServers.has(MEMORY_SERVER_NAME),
+      activeToolNames,
+    });
   }
 
   function setMemoryStatus(ctx: ExtensionContext, state: "starting" | "ready" | "offline" | "off"): void {
@@ -220,6 +231,7 @@ export default function piWorkbenchExtension(
     } else {
       delete sections[STUDY_PROMPT_SECTION];
     }
+    applyMemoryGuidance(sections, memoryGuidanceMode());
     return renderer.buildSystemPrompt({ ...options, sections });
   }
 
@@ -451,6 +463,7 @@ export default function piWorkbenchExtension(
     } else {
       delete event.systemPromptOptions.sections[STUDY_PROMPT_SECTION];
     }
+    applyMemoryGuidance(event.systemPromptOptions.sections, memoryGuidanceMode());
   });
 
   pi.on("mcp_servers_change", () => {
