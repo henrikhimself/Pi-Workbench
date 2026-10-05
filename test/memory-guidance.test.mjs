@@ -12,7 +12,6 @@ function mode(options) {
   return guidance.resolveMemoryGuidanceMode({
     memoryRegistered: true,
     studyEnabled: false,
-    studyMemoryAllowed: false,
     activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE],
     ...options,
   });
@@ -25,10 +24,10 @@ test("Memory guidance: normal policy requires registered search and save tools",
   assert.equal(mode({ activeToolNames: [MEMORY_SAVE] }), "off");
 });
 
-test("Memory guidance: Study Mode is search-only and permission-gated", () => {
-  assert.equal(mode({ studyEnabled: true, studyMemoryAllowed: true, activeToolNames: [MEMORY_SEARCH] }), "study");
-  assert.equal(mode({ studyEnabled: true, studyMemoryAllowed: false, activeToolNames: [MEMORY_SEARCH] }), "off");
-  assert.equal(mode({ studyEnabled: true, studyMemoryAllowed: true, activeToolNames: [] }), "off");
+test("Memory guidance: Study Mode does not restrict available Memory tools", () => {
+  assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH] }), "study");
+  assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE] }), "normal");
+  assert.equal(mode({ studyEnabled: true, activeToolNames: [] }), "off");
 });
 
 test("Memory guidance: policy preserves unrelated sections and removes unavailable Memory", () => {
@@ -42,7 +41,7 @@ test("Memory guidance: policy preserves unrelated sections and removes unavailab
 
   guidance.applyMemoryGuidance(sections, "study");
   assert.equal(sections[guidance.MEMORY_PROMPT_SECTION], guidance.STUDY_MEMORY_GUIDANCE);
-  assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /never permits saving/i);
+  assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /not Study Mode, determines whether Memory can be saved/i);
 
   guidance.applyMemoryGuidance(sections, "off");
   assert.equal(sections[guidance.MEMORY_PROMPT_SECTION], undefined);

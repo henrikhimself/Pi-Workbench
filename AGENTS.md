@@ -40,6 +40,6 @@ curl -fsS http://127.0.0.1:8787/health
 - Memory uses managed Python plus `OnnxLocalEmbedder` CPU only. No PyTorch, MPS, CUDA, cloud, Ollama, or alternate embedding fallback.
 - Preserve Pi/OpenAI bridge semantics for text, tool calls/results, thinking, images, and count-changing compression output.
 - Learning Mode stays opt-in, branch-scoped, and must not obstruct direct implementation or urgent remediation. Never store learner profiles or assessments.
-- Study Mode stays tutor-only. Hard-block tools outside configured inspection/read-only MCP/bounded investigation access; block `memory_save` even when configured Memory search is available.
-- Study Mode must not generate code, patches, commands, write files, run tests, install packages, invoke generic shell/browser/Git, or store learner data.
-- Bounded Study decompilation accepts only approved local DLL paths and fixed `ilspycmd --disable-updatecheck` arguments. Bounded fetch accepts public HTTPS only; reject credentials, local/private/reserved targets, unsafe redirects, oversized/non-text responses, and writes.
+- Study Mode stays opt-in and branch-scoped guidance. It favors questions, evidence, explanations, and avoiding changes, but is not a tool or command sandbox.
+- Explicit user requests may proceed while Study Mode is enabled. Recommend `/wb:study-mode off` or confirm intent before implementation work; do not claim actions are blocked.
+- Study Mode must not create learner profiles, assessments, or stored learner data.

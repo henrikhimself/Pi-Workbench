@@ -129,6 +129,52 @@ test("ensureRunning: detects already-running external proxy, does not take owner
   }
 });
 
+test("tryRestart: restarts after an owned child exits", async () => {
+  const pm = new ProxyManager({ port: 1 });
+  const internal = pm;
+  const exitedChild = { exitCode: 1 };
+  internal.managedByThisInstance = true;
+  internal.proc = exitedChild;
+  internal.handleChildExit(exitedChild);
+
+  assert.equal(pm.isManaged, true, "unexpected exit must retain extension ownership");
+  assert.equal(internal.proc, null);
+
+  let starts = 0;
+  internal.ensureRunning = async () => {
+    starts++;
+    internal.proc = { exitCode: null };
+    return true;
+  };
+
+  const recovered = await pm.tryRestart(() => {});
+  assert.equal(recovered, true);
+  assert.equal(starts, 1);
+  assert.equal(pm.isManaged, true);
+});
+
+test("tryRestart: replaces unhealthy owned child before its exit event arrives", async () => {
+  const pm = new ProxyManager({ port: 1 });
+  const internal = pm;
+  let killed = false;
+  internal.managedByThisInstance = true;
+  internal.proc = {
+    exitCode: null,
+    kill: () => { killed = true; },
+  };
+  let starts = 0;
+  internal.ensureRunning = async () => {
+    starts++;
+    internal.proc = { exitCode: null };
+    return true;
+  };
+
+  const recovered = await pm.tryRestart(() => {});
+  assert.equal(recovered, true);
+  assert.equal(killed, true);
+  assert.equal(starts, 1);
+});
+
 test("ensureRunning: fails fast while shutdown is in progress (stopping guard)", async () => {
   // Deliberately does NOT exercise the install/spawn path (would pip install).
   // stop() sets the stopping flag; ensureRunning must bail without touching python.

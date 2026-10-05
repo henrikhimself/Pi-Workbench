@@ -7,7 +7,7 @@ import { mkdtemp } from "node:fs/promises";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
-const { hasMemoryStore, parseMemoryUser, resolveMemoryRoot, resolveMemoryStore } = await jiti.import("../src/memory-config.ts");
+const { hasMemoryStore, parseMemoryNamespace, resolveMemoryExportDirectory, resolveMemoryRoot, resolveMemoryStore } = await jiti.import("../src/memory-config.ts");
 
 test("resolveMemoryStore: projects receive stable isolated paths", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-config-"));
@@ -51,10 +51,26 @@ test("resolveMemoryStore: permits and identifies configured root inside project"
   }
 });
 
-test("Memory configuration: validates root and user values", () => {
+test("Memory configuration: resolves project-contained export directory", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-export-"));
+  const project = join(tempDir, "project");
+  const outside = join(tempDir, "outside");
+  await Promise.all([mkdir(project), mkdir(outside)]);
+
+  try {
+    assert.equal(resolveMemoryExportDirectory(project, ".headroom-memory"), join(project, ".headroom-memory"));
+    assert.throws(() => resolveMemoryExportDirectory(project, "../outside"), /must resolve below project root/);
+    assert.throws(() => resolveMemoryExportDirectory(project, outside), /must be a project-relative path/);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Memory configuration: validates root and namespace values", () => {
   assert.throws(() => resolveMemoryRoot("relative-memory"), /headroom\.json memoryRoot must be an absolute path/);
-  assert.throws(() => parseMemoryUser(""), /headroom\.json memoryUser must be a non-empty single-line value/);
-  assert.throws(() => parseMemoryUser("line\nbreak"), /headroom\.json memoryUser must be a non-empty single-line value/);
-  assert.equal(parseMemoryUser("test-user"), "test-user");
+  assert.equal(parseMemoryNamespace(undefined), "project");
+  assert.throws(() => parseMemoryNamespace(""), /headroom\.json memoryNamespace must be a non-empty single-line value/);
+  assert.throws(() => parseMemoryNamespace("line\nbreak"), /headroom\.json memoryNamespace must be a non-empty single-line value/);
+  assert.equal(parseMemoryNamespace("test-namespace"), "test-namespace");
   assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom-memory"));
 });

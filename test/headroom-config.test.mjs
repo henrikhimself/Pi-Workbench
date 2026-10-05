@@ -22,20 +22,58 @@ test("Headroom config: bootstraps documented default once without overwriting us
   }
 });
 
-test("Headroom config: validates proxy and Memory values", () => {
-  assert.deepEqual(config.parseHeadroomConfig({ port: 9000, memoryRoot: "/data/memory", memoryUser: "alice" }), {
+test("Headroom config: validates proxy, Memory, and compression values", () => {
+  assert.deepEqual(config.parseHeadroomConfig({
     port: 9000,
     memoryRoot: "/data/memory",
-    memoryUser: "alice",
+    memoryNamespace: "alice",
+    memory: { export: ".headroom-memory" },
+    compression: {
+      mode: "lossless_then_lossy",
+      targetRatio: 0.75,
+      compressUserMessages: false,
+      protectRecent: 8,
+      protectAnalysisContext: true,
+      frozenMessageCount: 2,
+    },
+  }), {
+    port: 9000,
+    memoryRoot: "/data/memory",
+    memoryNamespace: "alice",
+    memory: { export: ".headroom-memory" },
+    compression: {
+      mode: "lossless_then_lossy",
+      targetRatio: 0.75,
+      compressUserMessages: false,
+      protectRecent: 8,
+      protectAnalysisContext: true,
+      frozenMessageCount: 2,
+    },
   });
   assert.deepEqual(config.parseHeadroomConfig({ url: "http://127.0.0.1:9000/" }), { url: "http://127.0.0.1:9000" });
+  for (const mode of ["ccr", "lossy_inline", "lossless_then_lossy"]) {
+    assert.deepEqual(config.parseHeadroomConfig({ compression: { mode } }), { port: 8787, compression: { mode } });
+  }
   for (const value of [
     { url: "http://127.0.0.1:9000", port: 8787 },
     { port: 0 },
     { port: "8787" },
     { url: "ftp://example.com" },
     { url: "http://user@example.com" },
-    { memoryUser: "" },
+    { memoryNamespace: "" },
+    { memoryNamespace: "line\nbreak" },
+    { memory: null },
+    { memory: { export: "" } },
+    { memory: { export: "/outside-project" } },
+    { memory: { unknown: true } },
+    { compression: null },
+    { compression: { mode: "token" } },
+    { compression: { targetRatio: 1.1 } },
+    { compression: { targetRatio: Number.NaN } },
+    { compression: { compressUserMessages: "false" } },
+    { compression: { protectRecent: -1 } },
+    { compression: { frozenMessageCount: 1.5 } },
+    { compression: { sessionId: "must-not-be-configurable" } },
   ]) {
     assert.throws(() => config.parseHeadroomConfig(value), /headroom\.json/);
   }
@@ -45,8 +83,8 @@ test("Headroom config: loads JSON and detects ignored legacy environment variabl
   const directory = await mkdtemp(join(tmpdir(), "pi-headroom-config-"));
   const configPath = join(directory, "headroom.json");
   try {
-    await writeFile(configPath, JSON.stringify({ port: 9999, memoryUser: "tester" }));
-    assert.deepEqual(await config.loadHeadroomConfig(configPath), { port: 9999, memoryUser: "tester" });
+    await writeFile(configPath, JSON.stringify({ port: 9999, memoryNamespace: "tester" }));
+    assert.deepEqual(await config.loadHeadroomConfig(configPath), { port: 9999, memoryNamespace: "tester" });
     assert.equal(config.hasLegacyHeadroomEnvironment({ HEADROOM_URL: "http://ignored" }), true);
     assert.equal(config.hasLegacyHeadroomEnvironment({ PI_MODEL: "test-only" }), false);
   } finally {

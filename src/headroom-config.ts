@@ -1,18 +1,27 @@
+import type { CompressRequestConfig } from "headroom-ai";
 import { readFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { dirname, isAbsolute } from "node:path";
 import { DEFAULT_HEADROOM_PORT, parseHeadroomPort } from "./config.js";
 import { WORKBENCH_PATHS } from "./paths.js";
+
+export type HeadroomCompressionConfig = Omit<CompressRequestConfig, "sessionId">;
 
 export interface HeadroomConfig {
   /** External proxy URL. Omit to use extension-managed proxy. */
   url?: string;
   /** Extension-managed proxy port. Mutually exclusive with url. */
   port?: number;
+  /** Supported per-request compression overrides. */
+  compression?: HeadroomCompressionConfig;
   /** Absolute or ~/ path for project-scoped Memory data. */
   memoryRoot?: string;
-  /** Logical identity passed to Headroom Memory MCP server. */
-  memoryUser?: string;
+  /** Logical namespace passed as Headroom Memory MCP user ID. Default: project. */
+  memoryNamespace?: string;
+  /** Project-relative directory containing versioned Memory bundle files. */
+  memory?: {
+    export?: string;
+  };
 }
 
 /** Written once so users can discover configuration without environment variables. */
@@ -22,6 +31,74 @@ function configError(message: string): Error {
   return new Error(`headroom.json ${message}`);
 }
 
+const COMPRESSION_KEYS = [
+  "mode",
+  "targetRatio",
+  "compressUserMessages",
+  "protectRecent",
+  "protectAnalysisContext",
+  "frozenMessageCount",
+] as const;
+
+function parseMemoryConfig(value: unknown): NonNullable<HeadroomConfig["memory"]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("memory must be a JSON object when configured.");
+  }
+  const source = value as Record<string, unknown>;
+  for (const key of Object.keys(source)) {
+    if (key !== "export") throw configError(`memory.${key} is not supported.`);
+  }
+  if (source.export === undefined) return {};
+  if (typeof source.export !== "string" || source.export.length === 0 || /[\r\n\0]/.test(source.export)) {
+    throw configError("memory.export must be a non-empty single-line path.");
+  }
+  if (isAbsolute(source.export)) {
+    throw configError("memory.export must be a project-relative path.");
+  }
+  return { export: source.export };
+}
+
+function parseCompressionConfig(value: unknown): HeadroomCompressionConfig {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw configError("compression must be a JSON object when configured.");
+  }
+  const source = value as Record<string, unknown>;
+  for (const key of Object.keys(source)) {
+    if (!COMPRESSION_KEYS.includes(key as typeof COMPRESSION_KEYS[number])) {
+      throw configError(`compression.${key} is not supported.`);
+    }
+  }
+
+  const compression: HeadroomCompressionConfig = {};
+  if (source.mode !== undefined) {
+    if (source.mode !== "ccr" && source.mode !== "lossy_inline" && source.mode !== "lossless_then_lossy") {
+      throw configError("compression.mode must be ccr, lossy_inline, or lossless_then_lossy.");
+    }
+    compression.mode = source.mode;
+  }
+  if (source.targetRatio !== undefined) {
+    if (typeof source.targetRatio !== "number" || !Number.isFinite(source.targetRatio) || source.targetRatio < 0 || source.targetRatio > 1) {
+      throw configError("compression.targetRatio must be a finite number from 0 to 1.");
+    }
+    compression.targetRatio = source.targetRatio;
+  }
+  for (const key of ["compressUserMessages", "protectAnalysisContext"] as const) {
+    if (source[key] !== undefined) {
+      if (typeof source[key] !== "boolean") throw configError(`compression.${key} must be a boolean.`);
+      compression[key] = source[key];
+    }
+  }
+  for (const key of ["protectRecent", "frozenMessageCount"] as const) {
+    if (source[key] !== undefined) {
+      if (typeof source[key] !== "number" || !Number.isSafeInteger(source[key]) || source[key] < 0) {
+        throw configError(`compression.${key} must be a non-negative safe integer.`);
+      }
+      compression[key] = source[key];
+    }
+  }
+  return compression;
+}
+
 export function parseHeadroomConfig(value: unknown): HeadroomConfig {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw configError("must be a JSON object.");
@@ -29,18 +106,29 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
   const source = value as Record<string, unknown>;
   const config: HeadroomConfig = {};
 
-  for (const key of ["url", "port", "memoryRoot", "memoryUser"]) {
+  for (const key of ["url", "port", "memoryRoot", "memoryNamespace", "memory", "compression"]) {
     if (source[key] === undefined) continue;
     if (key === "port") {
       config.port = source.port as number;
       continue;
     }
+    if (key === "compression") {
+      config.compression = parseCompressionConfig(source.compression);
+      continue;
+    }
+    if (key === "memory") {
+      config.memory = parseMemoryConfig(source.memory);
+      continue;
+    }
     if (typeof source[key] !== "string" || source[key].length === 0) {
       throw configError(`${key} must be a non-empty string when configured.`);
     }
+    if (key === "memoryNamespace" && /[\r\n\0]/.test(source.memoryNamespace as string)) {
+      throw configError("memoryNamespace must be a non-empty single-line string when configured.");
+    }
     if (key === "url") config.url = source.url as string;
     else if (key === "memoryRoot") config.memoryRoot = source.memoryRoot as string;
-    else if (key === "memoryUser") config.memoryUser = source.memoryUser as string;
+    else if (key === "memoryNamespace") config.memoryNamespace = source.memoryNamespace as string;
   }
 
   if (config.url !== undefined) {

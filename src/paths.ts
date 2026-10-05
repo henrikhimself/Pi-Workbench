@@ -10,7 +10,6 @@ export interface WorkbenchPaths {
   headroomVenv: string;
   headroomVenvLock: string;
   headroomMemory: string;
-  studyModeConfig: string;
   headroomConfig: string;
   legacyHeadroomVenv: string;
   legacyHeadroomVenvLock: string;
@@ -26,7 +25,6 @@ export function resolveWorkbenchPaths(home: string = homedir()): WorkbenchPaths 
     headroomVenv: join(root, "headroom-venv"),
     headroomVenvLock: join(root, "headroom-venv.lock"),
     headroomMemory: join(root, "headroom-memory"),
-    studyModeConfig: join(root, "study-mode.json"),
     headroomConfig: join(root, "headroom.json"),
     // Expose only for diagnostics/tests. Callers must not migrate or use them.
     legacyHeadroomVenv: join(piRoot, "headroom-venv"),

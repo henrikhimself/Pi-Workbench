@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
-const { piToOpenAI, openAIToPi } = await jiti.import("../src/format-bridge.ts");
+const { piToOpenAI, openAIToPi, openAIToPiWithOutcome } = await jiti.import("../src/format-bridge.ts");
 
 // ─── Fixtures ─────────────────────────────────────────────────────────
 
@@ -248,10 +248,14 @@ test("openAIToPi: count mismatch — fresh user message is valid", () => {
   assert.ok(typeof m.timestamp === "number");
 });
 
-test("openAIToPi: count mismatch with image returns original context", () => {
+test("openAIToPi: image count mismatch reports unapplied safety fallback", () => {
   const original = [userImage, assistantTextOnly];
   const compressed = [{ role: "user", content: "merged" }];
-  assert.equal(openAIToPi(compressed, original), original);
+  const outcome = openAIToPiWithOutcome(compressed, original);
+  assert.equal(outcome.messages, original);
+  assert.equal(outcome.applied, false);
+  assert.equal(outcome.reason, "image-count-mismatch");
+  assert.equal(openAIToPi(compressed, original), original, "legacy wrapper preserves message result");
 });
 
 test("openAIToPi: count mismatch — fresh assistant complete with tool calls", () => {

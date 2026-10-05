@@ -15,7 +15,6 @@ test("resolveWorkbenchPaths: keeps all managed data below dedicated Workbench ro
   assert.equal(paths.headroomVenv, join(root, "headroom-venv"));
   assert.equal(paths.headroomVenvLock, join(root, "headroom-venv.lock"));
   assert.equal(paths.headroomMemory, join(root, "headroom-memory"));
-  assert.equal(paths.studyModeConfig, join(root, "study-mode.json"));
   assert.equal(paths.headroomConfig, join(root, "headroom.json"));
 });
 

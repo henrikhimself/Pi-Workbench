@@ -218,7 +218,8 @@ async function isCommandAvailable(cmd: string, args: string[]): Promise<boolean>
 
 export class ProxyManager {
   private proc: ChildProcess | null = null;
-  private weStartedIt = false;
+  /** Extension ownership survives an unexpected child exit so one restart remains eligible. */
+  private managedByThisInstance = false;
   private stopping = false;
   private port: number;
   private host: string;
@@ -235,7 +236,7 @@ export class ProxyManager {
   }
 
   get isManaged(): boolean {
-    return this.weStartedIt;
+    return this.managedByThisInstance;
   }
 
   // ── Full lifecycle: detect → install → start → health-check ───────
@@ -283,7 +284,7 @@ export class ProxyManager {
         }
 
         if (await this.healthCheck()) {
-          this.weStartedIt = true;
+          this.managedByThisInstance = true;
           return true;
         }
       }
@@ -315,15 +316,16 @@ export class ProxyManager {
   async stop(): Promise<void> {
     this.stopping = true;
 
-    if (!this.proc || !this.weStartedIt) {
+    if (!this.proc || !this.managedByThisInstance) {
       this.proc = null;
-      this.weStartedIt = false;
+      this.managedByThisInstance = false;
       return;
     }
 
     const proc = this.proc;
     this.proc = null;
-    this.weStartedIt = false;
+    // Intentional shutdown revokes ownership before child exit listener runs.
+    this.managedByThisInstance = false;
 
     // Send SIGTERM (or hard-kill on Windows)
     try {
@@ -356,14 +358,20 @@ export class ProxyManager {
    * Returns true if recovered.
    */
   async tryRestart(onStatus: (msg: string) => void): Promise<boolean> {
-    if (!this.weStartedIt) return false;
-    if (this.proc && this.proc.exitCode === null) return false; // still running
+    if (!this.managedByThisInstance) return false;
+    if (this.proc && this.proc.exitCode === null) {
+      // Exit event can race failed request/health handling. Never restart healthy child.
+      if (await this.healthCheck()) return false;
+      this.killProcess();
+    }
 
     onStatus("Headroom proxy crashed, restarting...");
     this.proc = null;
-    this.weStartedIt = false;
     this.stopping = false;
-    return this.ensureRunning(onStatus);
+    const recovered = await this.ensureRunning(onStatus);
+    // Another session may have started an external proxy while we acquired lock.
+    if (recovered && !this.proc) this.managedByThisInstance = false;
+    return recovered;
   }
 
   // ── Private: spawn the proxy ──────────────────────────────────────
@@ -388,18 +396,20 @@ export class ProxyManager {
       // spawn error (e.g. command not found) — don't crash
     });
 
-    proc.on("exit", () => {
-      if (this.proc === proc) {
-        this.proc = null;
-        this.weStartedIt = false;
-      }
-    });
+    proc.on("exit", () => this.handleChildExit(proc));
 
     // Unref streams so they don't keep the event loop alive on shutdown
     (proc.stdout as any)?.unref?.();
     (proc.stderr as any)?.unref?.();
 
     this.proc = proc;
+  }
+
+  private handleChildExit(proc: ChildProcess): void {
+    if (this.proc === proc) {
+      this.proc = null;
+      // Preserve managedByThisInstance. tryRestart() owns one recovery attempt.
+    }
   }
 
   private killProcess(): void {

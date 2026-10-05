@@ -144,20 +144,31 @@ function convertToolResultMessage(msg: PiToolResultMessage): OpenAIMessage {
  * Note: The returned messages are used as a deep copy for a single LLM call,
  * so losing metadata (timestamps, usage) is acceptable.
  */
-export function openAIToPi(compressed: OpenAIMessage[], original: Message[]): Message[] {
+export interface OpenAIToPiOutcome {
+  messages: Message[];
+  applied: boolean;
+  reason?: "image-count-mismatch";
+}
+
+export function openAIToPiWithOutcome(compressed: OpenAIMessage[], original: Message[]): OpenAIToPiOutcome {
   // A changed message count destroys image-to-message association. Preserve the
   // original transcript rather than attaching an image to the wrong message.
   if (compressed.length !== original.length && (hasPiImages(original) || hasOpenAIImages(compressed))) {
-    return original;
+    return { messages: original, applied: false, reason: "image-count-mismatch" };
   }
 
   // If counts match, use positional alignment.
   if (compressed.length === original.length) {
-    return compressed.map((compMsg, i) => alignMessage(compMsg, original[i]));
+    return { messages: compressed.map((compMsg, i) => alignMessage(compMsg, original[i])), applied: true };
   }
 
   // Counts differ without images: build fresh messages.
-  return compressed.map((compMsg) => buildFreshMessage(compMsg));
+  return { messages: compressed.map((compMsg) => buildFreshMessage(compMsg)), applied: true };
+}
+
+/** @deprecated Use openAIToPiWithOutcome when caller needs compression accounting. */
+export function openAIToPi(compressed: OpenAIMessage[], original: Message[]): Message[] {
+  return openAIToPiWithOutcome(compressed, original).messages;
 }
 
 /**

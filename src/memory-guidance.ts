@@ -6,7 +6,7 @@ Search only when prior project decisions, conventions, preferences, incidents, o
 
 Save only when user explicitly asks to remember a fact or directly confirms it in this turn. Save atomic, accurate, project-relevant facts. Never save secrets, credentials, tokens, private keys, personal data, learner data, sensitive business data, raw transcripts, speculation, or transient task state.`;
 
-export const STUDY_MEMORY_GUIDANCE = `Headroom Memory search is available for project-scoped durable context. Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present. Study Mode never permits saving Memory.`;
+export const STUDY_MEMORY_GUIDANCE = `Headroom Memory search is available for project-scoped durable context. Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present. Tool availability, not Study Mode, determines whether Memory can be saved.`;
 
 export type MemoryGuidanceMode = "normal" | "study" | "off";
 
@@ -22,7 +22,6 @@ export function applyMemoryGuidance(
 export function resolveMemoryGuidanceMode(options: {
   memoryRegistered: boolean;
   studyEnabled: boolean;
-  studyMemoryAllowed: boolean;
   activeToolNames: readonly string[];
 }): MemoryGuidanceMode {
   if (!options.memoryRegistered) return "off";
@@ -31,9 +30,6 @@ export function resolveMemoryGuidanceMode(options: {
   const searchAvailable = activeTools.has("mcp__headroom-memory__memory_search");
   if (!searchAvailable) return "off";
 
-  if (options.studyEnabled) {
-    return options.studyMemoryAllowed ? "study" : "off";
-  }
-
-  return activeTools.has("mcp__headroom-memory__memory_save") ? "normal" : "off";
+  if (activeTools.has("mcp__headroom-memory__memory_save")) return "normal";
+  return options.studyEnabled ? "study" : "off";
 }

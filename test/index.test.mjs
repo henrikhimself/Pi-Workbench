@@ -76,6 +76,124 @@ test("context: compression failure marks proxy offline instead of accepting an S
   }
 });
 
+test("context: forwards configured compression overrides to Headroom", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-compression-config-"));
+  const configPath = join(tempDir, "headroom.json");
+  let requestBody;
+
+  try {
+    await writeFile(configPath, JSON.stringify({
+      url: "http://127.0.0.1:8787",
+      compression: {
+        mode: "lossless_then_lossy",
+        targetRatio: 0.8,
+        compressUserMessages: false,
+        protectRecent: 8,
+        protectAnalysisContext: true,
+        frozenMessageCount: 2,
+      },
+    }));
+    globalThis.fetch = async (_url, init) => {
+      requestBody = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        messages: [{ role: "user", content: "compress me" }],
+        tokens_before: 2,
+        tokens_after: 2,
+        tokens_saved: 0,
+        compression_ratio: 1,
+        transforms_applied: [],
+        ccr_hashes: [],
+        compressed: false,
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    };
+
+    const handlers = new Map();
+    const pi = {
+      on(event, handler) {
+        handlers.set(event, handler);
+        return () => {};
+      },
+      registerCommand() {},
+    };
+    const mod = await jiti.import("../src/index.ts");
+    mod.default(pi, { headroomConfigPath: configPath });
+    await handlers.get("context")({ messages: [{ role: "user", content: "compress me", timestamp: 1 }] }, {
+      model: { id: "test-model" },
+      ui: {
+        theme: { fg: (_color, value) => value },
+        setStatus() {},
+        notify() {},
+      },
+    });
+
+    assert.deepEqual(requestBody.config, {
+      mode: "lossless_then_lossy",
+      target_ratio: 0.8,
+      compress_user_messages: false,
+      protect_recent: 8,
+      protect_analysis_context: true,
+      frozen_message_count: 2,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("context: image safety fallback does not report unapplied compression savings", async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      messages: [],
+      tokens_before: 100,
+      tokens_after: 10,
+      tokens_saved: 90,
+      compression_ratio: 0.1,
+      transforms_applied: ["lossy"],
+      ccr_hashes: [],
+      compressed: true,
+    }), { status: 200, headers: { "content-type": "application/json" } });
+
+    const handlers = new Map();
+    const pi = {
+      on(event, handler) {
+        handlers.set(event, handler);
+        return () => {};
+      },
+      registerCommand() {},
+    };
+    const mod = await jiti.import("../src/index.ts");
+    mod.default(pi);
+
+    const statuses = [];
+    const event = {
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: "keep this image" },
+          { type: "image", data: "QUJD", mimeType: "image/png" },
+        ],
+        timestamp: 1,
+      }],
+    };
+    const result = await handlers.get("context")(event, {
+      model: { id: "test-model" },
+      ui: {
+        theme: { fg: (_color, value) => value },
+        setStatus: (_key, value) => statuses.push(value),
+        notify() {},
+      },
+    });
+
+    assert.equal(result, undefined, "original context remains active");
+    assert.ok(statuses.some((status) => status.includes("safety fallback")));
+    assert.equal(statuses.some((status) => status.includes("saved")), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("context: healthy proxy compression failure stays online", async () => {
   const priorUrl = process.env.HEADROOM_URL;
   const originalFetch = globalThis.fetch;
@@ -173,7 +291,7 @@ test("Memory off: refuses noninteractive deletion without explicit confirmation"
   const project = join(tempDir, "project");
 
   try {
-    await writeFile(configPath, JSON.stringify({ memoryRoot: root, memoryUser: "tester" }));
+    await writeFile(configPath, JSON.stringify({ memoryRoot: root, memoryNamespace: "tester" }));
     await mkdir(project);
     const memoryConfig = await jiti.import("../src/memory-config.ts");
     const store = memoryConfig.resolveMemoryStore({ cwd: project, root, userId: "tester" });
@@ -262,12 +380,12 @@ test("Memory status: warns once when configured Memory root resolves inside proj
   }
 });
 
-test("session_start: invalid headroom.json port disables compression with diagnostics", async () => {
+test("session_start: invalid headroom.json compression disables compression with diagnostics", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-config-invalid-"));
   const configPath = join(tempDir, "headroom.json");
 
   try {
-    await writeFile(configPath, JSON.stringify({ port: "8787junk" }));
+    await writeFile(configPath, JSON.stringify({ compression: { mode: "token" } }));
 
     const handlers = new Map();
     const pi = {
@@ -305,7 +423,7 @@ test("session_start: invalid headroom.json port disables compression with diagno
     assert.ok(statuses.some((status) => status?.includes("Learning")));
     assert.ok(
       notifications.some(({ message, level }) =>
-        level === "error" && message.includes("headroom.json port must be an integer from 1 to 65535"),
+        level === "error" && message.includes("headroom.json compression.mode must be ccr, lossy_inline, or lossless_then_lossy"),
       ),
     );
   } finally {

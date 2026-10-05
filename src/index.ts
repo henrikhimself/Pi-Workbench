@@ -17,9 +17,8 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { HeadroomClient, compress } from "headroom-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
-import { dirname } from "node:path";
 import type { CompressResult } from "headroom-ai";
-import { piToOpenAI, openAIToPi } from "./format-bridge.js";
+import { piToOpenAI, openAIToPiWithOutcome } from "./format-bridge.js";
 import { ProxyManager } from "./proxy-manager.js";
 import { DEFAULT_HEADROOM_PORT } from "./config.js";
 import {
@@ -30,32 +29,15 @@ import {
 } from "./headroom-config.js";
 import { WORKBENCH_PATHS } from "./paths.js";
 import { MemoryManager, MEMORY_SERVER_NAME } from "./memory-manager.js";
+import { configureMemoryGit } from "./memory-git.js";
 import { applyMemoryGuidance, resolveMemoryGuidanceMode } from "./memory-guidance.js";
 import {
-  STUDY_DECOMPILE_TOOL,
   STUDY_ENTRY_TYPE,
-  STUDY_FETCH_TOOL,
   STUDY_GUIDANCE,
   STUDY_PROMPT_SECTION,
   STUDY_STATUS_KEY,
-  buildStudyToolLoadout,
-  defaultStudyPermissions,
-  ensureStudyPermissionsFile,
-  isAllowedSkillInvocation,
-  isBlockedSkillPath,
-  isStudyToolAllowed,
-  loadStudyPermissions,
   restoreStudyModeState,
-  type StudyPermissions,
 } from "./study-mode.js";
-import {
-  StudyDecompileParameters,
-  StudyFetchParameters,
-  fetchStudySource,
-  runStudyDecompilation,
-  type StudyDecompileResult,
-  type StudyFetchResult,
-} from "./study-tools.js";
 import {
   PRECEPTOR_ENTRY_TYPE,
   PRECEPTOR_GUIDANCE,
@@ -89,10 +71,6 @@ export default function piWorkbenchExtension(
   let memoryRootWarningShown = false;
   let preceptorEnabled = false;
   let studyEnabled = false;
-  let studySavedToolNames: string[] | undefined;
-  let studyPermissions: StudyPermissions = defaultStudyPermissions();
-  let studySkillRoots = new Map<string, string>();
-  let studyConfigWarningShown = false;
   let legacyPathWarningShown = false;
   let legacyEnvironmentWarningShown = false;
 
@@ -126,12 +104,15 @@ export default function piWorkbenchExtension(
     }
   }
 
+  function compressionStatus(): string {
+    return headroomConfig.compression ? JSON.stringify(headroomConfig.compression) : "defaults";
+  }
+
   function memoryGuidanceMode() {
     const activeToolNames = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
     return resolveMemoryGuidanceMode({
       memoryRegistered,
       studyEnabled,
-      studyMemoryAllowed: studyPermissions.mcpServers.has(MEMORY_SERVER_NAME),
       activeToolNames,
     });
   }
@@ -168,48 +149,13 @@ export default function piWorkbenchExtension(
     ctx.ui.setStatus(STUDY_STATUS_KEY, studyEnabled ? ctx.ui.theme.fg("success", "✓ Study") : undefined);
   }
 
-  function discoverStudySkills(): Set<string> {
-    studySkillRoots = new Map();
-    const discovered = new Set<string>();
-    if (typeof pi.getCommands !== "function") return discovered;
-    for (const command of pi.getCommands()) {
-      if (command.source !== "skill") continue;
-      const name = command.name.startsWith("skill:") ? command.name.slice("skill:".length) : command.name;
-      if (!name) continue;
-      discovered.add(name);
-      studySkillRoots.set(name, dirname(command.sourceInfo.path));
-    }
-    return discovered;
-  }
-
-  async function refreshStudyPermissions(ctx: ExtensionContext): Promise<void> {
-    const loaded = await loadStudyPermissions(discoverStudySkills());
-    studyPermissions = loaded.permissions;
-    if (loaded.warnings.length > 0 && !studyConfigWarningShown) {
-      studyConfigWarningShown = true;
-      ctx.ui.notify(loaded.warnings.join("\n"), "warning");
-    }
-  }
-
-  function applyStudyToolLoadout(): void {
-    if (!studyEnabled || !studySavedToolNames) return;
-    const allTools = pi.getAllTools().map((tool) => ({ name: tool.name, annotations: tool.annotations }));
-    pi.setActiveTools(buildStudyToolLoadout(studySavedToolNames, allTools, studyPermissions));
-  }
-
-  async function restoreStudyState(ctx: ExtensionContext): Promise<void> {
-    await refreshStudyPermissions(ctx);
-    const restored = restoreStudyModeState(ctx.sessionManager.getBranch());
-    studyEnabled = restored.enabled;
-    studySavedToolNames = restored.savedToolNames;
-    if (studyEnabled) applyStudyToolLoadout();
+  function restoreStudyState(ctx: ExtensionContext): void {
+    studyEnabled = restoreStudyModeState(ctx.sessionManager.getBranch()).enabled;
     setStudyStatus(ctx);
   }
 
   function persistStudyState(): void {
-    pi.appendEntry(STUDY_ENTRY_TYPE, studyEnabled
-      ? { enabled: true, savedToolNames: studySavedToolNames }
-      : { enabled: false });
+    pi.appendEntry(STUDY_ENTRY_TYPE, { enabled: studyEnabled });
   }
 
   async function buildSystemPromptPreview(ctx: ExtensionCommandContext): Promise<string> {
@@ -240,7 +186,8 @@ export default function piWorkbenchExtension(
       const manager = new MemoryManager({
         cwd: ctx.cwd ?? process.cwd(),
         root: headroomConfig.memoryRoot,
-        userId: headroomConfig.memoryUser,
+        userId: headroomConfig.memoryNamespace,
+        exportPath: headroomConfig.memory?.export,
       });
       if (manager.store.rootConfigured && manager.store.rootInsideProject && !memoryRootWarningShown) {
         memoryRootWarningShown = true;
@@ -301,50 +248,29 @@ export default function piWorkbenchExtension(
     }
   }
 
-  // ─── Study investigation tools ────────────────────────────────────
-
-  if (typeof pi.registerTool === "function") {
-    pi.registerTool({
-    name: STUDY_DECOMPILE_TOOL,
-    label: "Study decompile",
-    description: "Inspect one approved local .NET assembly. Lists types or decompiles one exact type without writing files.",
-    parameters: StudyDecompileParameters,
-    defaultActive: false,
-    annotations: { readOnlyHint: true },
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-      const result = await runStudyDecompilation(params, ctx.cwd, signal);
-      return { content: [{ type: "text", text: result.text }], details: result };
-    },
-    renderResult(result, { expanded }, theme) {
-      const details = result.details as StudyDecompileResult | undefined;
-      const summary = details
-        ? `${details.operation}${details.typeName ? ` ${details.typeName}` : ""}: ${details.assemblyPath}${details.truncated ? " (truncated)" : ""}`
-        : "Study decompilation";
-      const body = result.content.find((content) => content.type === "text");
-      return new Text(expanded && body?.type === "text" ? `${summary}\n${body.text}` : summary, 0, 0);
-    },
-  });
-
-  pi.registerTool({
-    name: STUDY_FETCH_TOOL,
-    label: "Study fetch",
-    description: "Fetch one public HTTPS source or documentation document without shell access or local writes.",
-    parameters: StudyFetchParameters,
-    defaultActive: false,
-    annotations: { readOnlyHint: true, openWorldHint: true },
-    async execute(_toolCallId, params, signal) {
-      const result = await fetchStudySource(params.url, signal);
-      return { content: [{ type: "text", text: result.text }], details: result };
-    },
-    renderResult(result, { expanded }) {
-      const details = result.details as StudyFetchResult | undefined;
-      const summary = details
-        ? `Fetched ${details.finalUrl}${details.truncated ? " (truncated)" : ""}`
-        : "Study fetch";
-      const body = result.content.find((content) => content.type === "text");
-      return new Text(expanded && body?.type === "text" ? `${summary}\n${body.text}` : summary, 0, 0);
-    },
-    });
+  /** Stop active Memory MCP around direct-store work, then restore it if needed. */
+  async function withMemoryStore<T>(
+    ctx: ExtensionContext,
+    manager: MemoryManager,
+    action: (python: string) => Promise<T>,
+  ): Promise<T | null> {
+    const restoreRegistration = memoryRegistered;
+    if (restoreRegistration) {
+      pi.unregisterMcpServer(MEMORY_SERVER_NAME);
+      memoryRegistered = false;
+    }
+    try {
+      const python = await manager.ensureRuntime((message) => {
+        ctx.ui.setStatus("headroom-memory", ctx.ui.theme.fg("dim", `⏳ ${message}`));
+      });
+      if (!python) {
+        ctx.ui.notify("Headroom Memory runtime unavailable", "error");
+        return null;
+      }
+      return await action(python);
+    } finally {
+      if (restoreRegistration) await startMemory(ctx, false);
+    }
   }
 
   // ─── Session start: install/start proxy or health-check ─────────────
@@ -360,12 +286,6 @@ export default function piWorkbenchExtension(
       legacyEnvironmentWarningShown = true;
       ctx.ui.notify("HEADROOM_* environment variables are ignored. Move settings to ~/.pi/pi-workbench/headroom.json.", "warning");
     }
-    try {
-      const created = await ensureStudyPermissionsFile();
-      if (created) ctx.ui.notify("Created Study Mode permissions at ~/.pi/pi-workbench/study-mode.json.", "info");
-    } catch {
-      ctx.ui.notify("Study Mode permissions could not be created; using safe in-memory defaults.", "warning");
-    }
     if (!legacyPathWarningShown && [
       WORKBENCH_PATHS.legacyHeadroomVenv,
       WORKBENCH_PATHS.legacyHeadroomVenvLock,
@@ -375,7 +295,7 @@ export default function piWorkbenchExtension(
       ctx.ui.notify("Legacy ~/.pi/headroom-* paths remain untouched. pi-workbench uses ~/.pi/pi-workbench; migrate or remove legacy data manually.", "info");
     }
     restorePreceptorState(ctx);
-    await restoreStudyState(ctx);
+    restoreStudyState(ctx);
     proxyWarningShown = false;
     compressionWarningShown = false;
     restartAttempted = false;
@@ -466,26 +386,6 @@ export default function piWorkbenchExtension(
     applyMemoryGuidance(event.systemPromptOptions.sections, memoryGuidanceMode());
   });
 
-  pi.on("mcp_servers_change", () => {
-    if (studyEnabled) applyStudyToolLoadout();
-  });
-
-  pi.on("input", (event, ctx) => {
-    if (!studyEnabled || isAllowedSkillInvocation(event.text, studyPermissions)) return undefined;
-    ctx.ui.notify("Study Mode blocks this skill. Configure it in ~/.pi/pi-workbench/study-mode.json or disable Study Mode.", "warning");
-    return { action: "handled" };
-  });
-
-  pi.on("tool_call", (event) => {
-    if (!studyEnabled) return undefined;
-    if (event.toolName === "read" && typeof event.input.path === "string" && isBlockedSkillPath(event.input.path, studySkillRoots, studyPermissions)) {
-      return { block: true, reason: "Study Mode blocks reads from non-allowed skill roots." };
-    }
-    const allTools = pi.getAllTools().map((tool) => ({ name: tool.name, annotations: tool.annotations }));
-    if (isStudyToolAllowed(event.toolName, event.input, studyPermissions, allTools)) return undefined;
-    return { block: true, reason: `Study Mode blocks ${event.toolName}.` };
-  });
-
   // ─── Core: compress context before every LLM call ───────────────────
 
   pi.on("context", async (event, ctx) => {
@@ -502,6 +402,7 @@ export default function piWorkbenchExtension(
       const result: CompressResult = await compress(openaiMessages, {
         client,
         model: ctx.model?.id ?? "gpt-4o",
+        ...(headroomConfig.compression ? { config: headroomConfig.compression } : {}),
       });
 
       compressionWarningShown = false;
@@ -515,8 +416,18 @@ export default function piWorkbenchExtension(
         return;
       }
 
-      // Convert compressed OpenAI → Pi-AI Message[]
-      const compressedPiMessages = openAIToPi(result.messages, piMessages);
+      // Convert compressed OpenAI → Pi-AI Message[]. Image-count safety fallback
+      // retains original context, so reported proxy savings were not applied.
+      const conversion = openAIToPiWithOutcome(result.messages, piMessages);
+      if (!conversion.applied) {
+        ctx.ui.setStatus(
+          "headroom-proxy",
+          ctx.ui.theme.fg("warning", "⚠") +
+            ctx.ui.theme.fg("dim", " Headroom safety fallback (images retained)"),
+        );
+        return;
+      }
+      const compressedPiMessages = conversion.messages;
 
       // Update stats
       lastStats = {
@@ -675,6 +586,7 @@ export default function piWorkbenchExtension(
         `  Enabled: ${enabled ? "yes" : "no"}`,
         `  Proxy:   ${baseUrl} (${proxyAvailable === true ? "online" : proxyAvailable === false ? "offline" : "unknown"})`,
         `  Mode:    ${managedStr}`,
+        `  Config:  ${compressionStatus()}`,
         ``,
         `Session stats:`,
         `  Compressions: ${sessionTotals.calls}`,
@@ -735,32 +647,26 @@ export default function piWorkbenchExtension(
       }
       if (action === "status") {
         ctx.ui.notify(studyEnabled
-          ? `Study Mode is on. Built-ins: ${[...studyPermissions.builtInTools].join(", ") || "none"}; skills: ${[...studyPermissions.skills].join(", ") || "none"}; MCP: ${[...studyPermissions.mcpServers].join(", ") || "none"}.`
+          ? "Study Mode is on. Study guidance is active; tools and commands remain available."
           : "Study Mode is off.", "info");
         return;
       }
       if (action === "on") {
-        await refreshStudyPermissions(ctx);
         if (!studyEnabled) {
-          studySavedToolNames = pi.getActiveTools();
           studyEnabled = true;
           persistStudyState();
         }
-        applyStudyToolLoadout();
         setStudyStatus(ctx);
-        ctx.ui.notify("Study Mode enabled. Tutor-only guidance and hard read-only tool gate active.", "info");
+        ctx.ui.notify("Study Mode enabled. Guidance favors explanation and avoiding changes unless requested.", "info");
         return;
       }
 
       if (studyEnabled) {
         studyEnabled = false;
-        const saved = studySavedToolNames;
-        studySavedToolNames = undefined;
-        if (saved) pi.setActiveTools(saved);
         persistStudyState();
       }
       setStudyStatus(ctx);
-      ctx.ui.notify("Study Mode disabled. Original tool loadout restored.", "info");
+      ctx.ui.notify("Study Mode disabled.", "info");
     },
   });
 
@@ -787,15 +693,17 @@ export default function piWorkbenchExtension(
   // ─── /wb:headroom-memory command — project Memory lifecycle ────────
 
   pi.registerCommand("wb:headroom-memory", {
-    description: "Enable, delete, or show project Headroom Memory. Usage: /wb:headroom-memory [on|off|status]",
+    description: "Manage project Memory. Usage: /wb:headroom-memory [on|off|status|show|export|import --confirm-replace|merge]",
     handler: async (args, ctx) => {
       const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
       const action = tokens[0] ?? "status";
 
-      if (!["on", "off", "status"].includes(action)) {
-        ctx.ui.notify("Usage: /wb:headroom-memory [on|off|status]", "error");
+      if (!["on", "off", "status", "show", "export", "import", "merge"].includes(action)) {
+        ctx.ui.notify("Usage: /wb:headroom-memory [on|off|status|show|export|import --confirm-replace|merge]", "error");
         return;
       }
+      const manager = managerFor(ctx);
+      if (!manager) return;
 
       if (action === "on") {
         if (tokens.length > 1) {
@@ -804,13 +712,54 @@ export default function piWorkbenchExtension(
         }
         const enabledMemory = await startMemory(ctx, true);
         if (enabledMemory) {
+          const warning = await configureMemoryGit(manager.store.projectPath, manager.store.exportDirectory);
+          if (warning) ctx.ui.notify(warning, "warning");
           ctx.ui.notify("Headroom Memory enabled for this project", "info");
         }
         return;
       }
 
-      const manager = managerFor(ctx);
-      if (!manager) return;
+      if (["show", "export", "import", "merge"].includes(action)) {
+        const confirmReplace = tokens.length === 2 && tokens[1] === "--confirm-replace";
+        if ((action === "import" && tokens.length > 1 && !confirmReplace) || (action !== "import" && tokens.length > 1)) {
+          ctx.ui.notify(action === "import"
+            ? "Usage: /wb:headroom-memory import [--confirm-replace]"
+            : `Usage: /wb:headroom-memory ${action}`, "error");
+          return;
+        }
+        if (!manager.enabled) {
+          ctx.ui.notify("Headroom Memory is disabled for this project. Run /wb:headroom-memory on first.", "warning");
+          return;
+        }
+        if (action === "import" && !confirmReplace) {
+          if (!ctx.hasUI) {
+            ctx.ui.notify("Import replaces configured namespace. Run /wb:headroom-memory import --confirm-replace.", "warning");
+            return;
+          }
+          const confirmed = await ctx.ui.confirm(
+            "Replace Headroom Memory namespace?",
+            `Import replaces all ${manager.store.userId} Memory records from ${manager.store.exportDirectory}. A retained backup will be created.`,
+          );
+          if (!confirmed) {
+            ctx.ui.notify("Headroom Memory import cancelled", "info");
+            return;
+          }
+        }
+        try {
+          const result = await withMemoryStore(ctx, manager, async (python) => {
+            if (action === "show") return manager.showBundle(python);
+            if (action === "export") return manager.exportBundle(python);
+            if (action === "merge") return manager.mergeBundle(python);
+            const imported = await manager.importBundle(python);
+            return `${imported.result}\nbackup: ${imported.backupDirectory}`;
+          });
+          if (result !== null) ctx.ui.notify(`Headroom Memory ${action}: ${result}`, "info");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Headroom Memory ${action} failed: ${message}`, "error");
+        }
+        return;
+      }
 
       if (action === "off") {
         const confirmDelete = tokens.length === 2 && tokens[1] === "--confirm-delete";
@@ -891,6 +840,7 @@ export default function piWorkbenchExtension(
         const lines = [
           `Headroom proxy: online`,
           `  URL: ${baseUrl}`,
+          `  Config: ${compressionStatus()}`,
         ];
 
         if (proxyManager) {
