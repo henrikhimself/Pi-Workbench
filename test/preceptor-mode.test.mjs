@@ -82,7 +82,20 @@ test("Preceptor Mode: command persists state and mutates only its prompt section
   assert.equal(event.systemPromptOptions.sections[PRECEPTOR_PROMPT_SECTION], undefined);
   assert.equal(event.systemPromptOptions.sections.tool_guidance, "Keep this section");
 
+  await command.handler("on", ctx);
+  await commands.get("wb:study-mode").handler("on", ctx);
+  assert.deepEqual(entries.slice(-2), [
+    { customType: "pi-workbench-study-mode", data: { enabled: true } },
+    { customType: PRECEPTOR_ENTRY_TYPE, data: { enabled: false } },
+  ]);
+
+  await command.handler("on", ctx);
+  assert.deepEqual(entries.slice(-2), [
+    { customType: PRECEPTOR_ENTRY_TYPE, data: { enabled: true } },
+    { customType: "pi-workbench-study-mode", data: { enabled: false } },
+  ]);
+
   await command.handler("wat", ctx);
-  assert.equal(entries.length, 2);
+  assert.equal(entries.length, 7);
   assert.deepEqual(notifications.at(-1), { message: "Usage: /wb:preceptor-mode [on|off|status]", level: "error" });
 });

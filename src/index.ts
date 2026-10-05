@@ -626,9 +626,14 @@ export default function piWorkbenchExtension(
       preceptorEnabled = action === "on";
       persistPreceptorState();
       setPreceptorStatus(ctx);
+      if (preceptorEnabled && studyEnabled) {
+        studyEnabled = false;
+        persistStudyState();
+        setStudyStatus(ctx);
+      }
       ctx.ui.notify(
         preceptorEnabled
-          ? "Learning mode enabled for this session branch"
+          ? "Learning mode enabled for this session branch; Study Mode disabled."
           : "Learning mode disabled for this session branch",
         "info",
       );
@@ -657,7 +662,15 @@ export default function piWorkbenchExtension(
           persistStudyState();
         }
         setStudyStatus(ctx);
-        ctx.ui.notify("Study Mode enabled. Guidance favors explanation and avoiding changes unless requested.", "info");
+        if (preceptorEnabled) {
+          preceptorEnabled = false;
+          persistPreceptorState();
+          setPreceptorStatus(ctx);
+        }
+        ctx.ui.notify(
+          "Study Mode enabled; Learning mode disabled. Guidance favors explanation and avoiding changes unless requested.",
+          "info",
+        );
         return;
       }
 
