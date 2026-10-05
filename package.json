@@ -1,0 +1,41 @@
+{
+  "name": "pi-workbench",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Pi workbench with transparent Headroom context compression and Memory",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/henrikhimself/Pi-Workbench.git"
+  },
+  "bugs": {
+    "url": "https://github.com/henrikhimself/Pi-Workbench/issues"
+  },
+  "homepage": "https://github.com/henrikhimself/Pi-Workbench#readme",
+  "keywords": [
+    "pi-workbench"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "dependencies": {
+    "headroom-ai": "^0.39.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.2"
+  }
+}
