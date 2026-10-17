@@ -27,7 +27,7 @@
     ]
   },
   "dependencies": {
-    "headroom-ai": "^0.39.1"
+    "headroom-ai": "0.41.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",

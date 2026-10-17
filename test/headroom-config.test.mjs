@@ -79,14 +79,12 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
   }
 });
 
-test("Headroom config: loads JSON and detects ignored legacy environment variables", async () => {
+test("Headroom config: loads JSON", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-headroom-config-"));
   const configPath = join(directory, "headroom.json");
   try {
     await writeFile(configPath, JSON.stringify({ port: 9999, memoryNamespace: "tester" }));
     assert.deepEqual(await config.loadHeadroomConfig(configPath), { port: 9999, memoryNamespace: "tester" });
-    assert.equal(config.hasLegacyHeadroomEnvironment({ HEADROOM_URL: "http://ignored" }), true);
-    assert.equal(config.hasLegacyHeadroomEnvironment({ PI_MODEL: "test-only" }), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

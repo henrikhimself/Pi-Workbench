@@ -200,8 +200,3 @@ export function loadHeadroomConfigSync(configPath = WORKBENCH_PATHS.headroomConf
       : configError("could not be read.");
   }
 }
-
-/** Legacy environment variables are deliberately ignored by extension runtime. */
-export function hasLegacyHeadroomEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
-  return ["HEADROOM_URL", "HEADROOM_PORT", "HEADROOM_MEMORY_ROOT", "HEADROOM_MEMORY_USER"].some((key) => env[key] !== undefined);
-}

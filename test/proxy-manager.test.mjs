@@ -9,20 +9,20 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
-const { acquireStartupLock, findPython, ProxyManager } = await jiti.import("../src/proxy-manager.ts");
+const { acquireStartupLock, findPython, getHeadroomAiVersion, ProxyManager } = await jiti.import("../src/proxy-manager.ts");
 
-/** Start a mock proxy: answers 200 on GET /health. Resolves with the bound port. */
-async function startMockProxy() {
+/** Start a mock proxy: answers GET /health with a versioned JSON response. */
+async function startMockProxy(health = { status: "ok", version: "0.41.0" }) {
   const server = http.createServer((req, res) => {
     if (req.url === "/health") {
       res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ status: "ok" }));
+      res.end(JSON.stringify(health));
     } else {
       res.writeHead(404);
       res.end();
@@ -32,6 +32,15 @@ async function startMockProxy() {
   const port = server.address().port;
   return { server, port };
 }
+
+// ─── Version pin ──────────────────────────────────────────────────────
+
+test("managed proxy version pin matches the extension SDK dependency", async () => {
+  const packageJson = JSON.parse(
+    await readFile(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  assert.equal(await getHeadroomAiVersion(), packageJson.dependencies["headroom-ai"]);
+});
 
 // ─── findPython ───────────────────────────────────────────────────────
 
@@ -124,6 +133,19 @@ test("ensureRunning: detects already-running external proxy, does not take owner
     assert.equal(pm.isManaged, false); // external — extension must not kill it on shutdown
     // No spawn-related status updates expected on the fast path
     assert.ok(!statuses.some((s) => s.includes("Installing") || s.includes("venv")));
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test("ensureRunning: rejects version-mismatched external proxy without ownership", async () => {
+  const { server, port } = await startMockProxy({ status: "ok", version: "0.40.0" });
+  try {
+    const pm = new ProxyManager({ port });
+    const statuses = [];
+    assert.equal(await pm.ensureRunning((msg) => statuses.push(msg)), false);
+    assert.equal(pm.isManaged, false);
+    assert.ok(statuses.some((message) => message.includes("version mismatch")));
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }

@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { WORKBENCH_PATHS } from "./paths.js";
+import { checkHeadroomVersion, describeHeadroomVersionCheck } from "./headroom-health.js";
 
 const IS_WINDOWS = process.platform === "win32";
 const VENV_DIR = WORKBENCH_PATHS.headroomVenv;
@@ -23,6 +24,27 @@ const STARTUP_LOCK_DIR = WORKBENCH_PATHS.headroomVenvLock;
 const STARTUP_LOCK_TIMEOUT_MS = 240_000;
 const STARTUP_LOCK_RETRY_MS = 250;
 const STALE_LOCK_MS = 300_000;
+
+let headroomAiVersion: string | null | undefined;
+
+/** Read exact SDK version from this extension's package manifest. */
+export async function getHeadroomAiVersion(): Promise<string | null> {
+  if (headroomAiVersion !== undefined) return headroomAiVersion;
+
+  try {
+    const manifest = JSON.parse(
+      await readFile(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { dependencies?: Record<string, unknown> };
+    const version = manifest.dependencies?.["headroom-ai"];
+    headroomAiVersion = typeof version === "string" && /^\d+\.\d+\.\d+$/.test(version)
+      ? version
+      : null;
+  } catch {
+    headroomAiVersion = null;
+  }
+
+  return headroomAiVersion;
+}
 
 // ─── Python detection ─────────────────────────────────────────────────
 
@@ -56,29 +78,38 @@ async function getPythonVersion(
   return null;
 }
 
+/** Read installed headroom-ai distribution version from managed Python venv. */
+export async function getManagedHeadroomVersion(): Promise<string | null> {
+  try {
+    const version = await execAsync(
+      VENV_PYTHON,
+      ["-c", "from importlib.metadata import version; print(version('headroom-ai'))"],
+      10_000,
+    );
+    return version.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Venv + install ───────────────────────────────────────────────────
 
 /**
- * Ensure the headroom venv exists and headroom-ai[proxy] is installed.
- * Returns the path to the headroom CLI in the venv, or null on failure.
+ * Ensure the managed venv uses the exact Headroom version bundled with this
+ * extension. This check deliberately runs on every managed-proxy startup so a
+ * Pi-Workbench update upgrades an existing venv before it is used.
  */
 async function ensureVenv(
   onStatus: (msg: string) => void,
 ): Promise<string | null> {
-  // 1. If venv already has headroom, we're done
-  if (existsSync(VENV_HEADROOM)) {
-    return VENV_HEADROOM;
-  }
-
-  // 2. Find system Python
-  const python = await findPython();
-  if (!python) {
-    onStatus("Python >=3.10 not found — cannot install Headroom");
-    return null;
-  }
-
-  // 3. Create venv if it doesn't exist
+  // 1. Find system Python only when the managed venv does not exist.
   if (!existsSync(VENV_PYTHON)) {
+    const python = await findPython();
+    if (!python) {
+      onStatus("Python >=3.10 not found — cannot install Headroom");
+      return null;
+    }
+
     onStatus("Creating Headroom venv...");
     try {
       await execAsync(python, ["-m", "venv", VENV_DIR], 60_000);
@@ -89,21 +120,38 @@ async function ensureVenv(
     }
   }
 
-  // 4. Install headroom-ai[proxy] into the venv
-  onStatus("Installing headroom-ai (this may take a minute)...");
-  try {
-    await execAsync(
-      VENV_PYTHON,
-      ["-m", "pip", "install", "headroom-ai[proxy]", "--quiet", "--disable-pip-version-check"],
-      180_000, // 3 minute timeout — first install downloads many deps
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    onStatus(`pip install failed: ${msg}`);
+  // 2. Pin the Python proxy to exact SDK version declared by this extension.
+  const requiredVersion = await getHeadroomAiVersion();
+  if (!requiredVersion) {
+    onStatus("Cannot read exact headroom-ai version from package.json");
     return null;
   }
 
-  // 5. Verify
+  const installedVersion = await getManagedHeadroomVersion();
+  if (installedVersion !== requiredVersion) {
+    onStatus(
+      installedVersion
+        ? `Upgrading headroom-ai from ${installedVersion} to ${requiredVersion}...`
+        : `Installing headroom-ai ${requiredVersion} (this may take a minute)...`,
+    );
+    try {
+      await execAsync(
+        VENV_PYTHON,
+        ["-m", "pip", "install", "--upgrade", `headroom-ai[proxy]==${requiredVersion}`, "--quiet", "--disable-pip-version-check"],
+        180_000, // 3 minute timeout — first install downloads many deps
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onStatus(`pip install failed: ${msg}`);
+      return null;
+    }
+  }
+
+  // 3. Verify both the installed distribution and its CLI.
+  if (await getManagedHeadroomVersion() !== requiredVersion) {
+    onStatus(`headroom-ai ${requiredVersion} was not installed in managed venv`);
+    return null;
+  }
   if (existsSync(VENV_HEADROOM)) {
     return VENV_HEADROOM;
   }
@@ -136,12 +184,11 @@ export async function ensureManagedPython(
   if (!releaseLock) return null;
 
   try {
-    if (!existsSync(VENV_PYTHON)) {
-      await ensureVenv(onStatus);
-    }
-
-    if (!existsSync(VENV_PYTHON)) {
-      onStatus("Headroom Memory venv was not created");
+    // Also keeps Memory's shared managed environment on the extension's
+    // pinned Headroom version when Memory is started before compression.
+    const python = await ensureVenv(onStatus);
+    if (!python) {
+      onStatus("Headroom Memory managed venv is unavailable");
       return null;
     }
 
@@ -149,11 +196,17 @@ export async function ensureManagedPython(
       return VENV_PYTHON;
     }
 
+    const requiredVersion = await getHeadroomAiVersion();
+    if (!requiredVersion) {
+      onStatus("Cannot read exact headroom-ai version from package.json");
+      return null;
+    }
+
     onStatus("Installing Headroom Memory ONNX runtime...");
     try {
       await execAsync(
         VENV_PYTHON,
-        ["-m", "pip", "install", "headroom-ai[proxy]", "--quiet", "--disable-pip-version-check"],
+        ["-m", "pip", "install", "--upgrade", `headroom-ai[proxy]==${requiredVersion}`, "--quiet", "--disable-pip-version-check"],
         180_000,
       );
     } catch (err) {
@@ -174,24 +227,13 @@ export async function ensureManagedPython(
 }
 
 /**
- * Ensure headroom is available. Checks system PATH first, then venv.
- * Returns the invocation method: { cmd, args } to spawn the proxy,
- * or null if installation failed.
+ * Ensure the extension-managed, version-pinned headroom CLI is available.
+ * A system PATH command is intentionally never selected: it may not match the
+ * TypeScript SDK version bundled with Pi-Workbench.
  */
 export async function ensureInstalled(
   onStatus: (msg: string) => void,
 ): Promise<{ cmd: string; args: string[] } | null> {
-  // 1. Check if `headroom` CLI is already on system PATH
-  if (await isCommandAvailable("headroom", ["--help"])) {
-    return { cmd: "headroom", args: [] };
-  }
-
-  // 2. Check if venv already has headroom
-  if (existsSync(VENV_HEADROOM) && await isCommandAvailable(VENV_HEADROOM, ["--help"])) {
-    return { cmd: VENV_HEADROOM, args: [] };
-  }
-
-  // 3. Create venv and install
   const headroomPath = await ensureVenv(onStatus);
   if (headroomPath) {
     return { cmd: headroomPath, args: [] };
@@ -244,11 +286,11 @@ export class ProxyManager {
   async ensureRunning(onStatus: (msg: string) => void): Promise<boolean> {
     if (this.stopping) return false;
 
-    // 1. Already running? (external or our own)
+    // 1. Already running? Accept unowned proxy only with exact version parity.
     onStatus("Checking for running proxy...");
-    if (await this.healthCheck()) {
-      return true; // Don't touch it — someone else's proxy or our still-alive one
-    }
+    const existing = await this.checkExistingProxyVersion(onStatus);
+    if (existing.ok) return true;
+    if (existing.reason !== "unreachable") return false;
 
     // Serialize install and spawn across Pi processes sharing this venv and port.
     const releaseLock = await acquireStartupLock(STARTUP_LOCK_DIR, onStatus, () => this.stopping);
@@ -258,9 +300,9 @@ export class ProxyManager {
       if (this.stopping) return false;
 
       // Another session may have completed startup while this one waited.
-      if (await this.healthCheck()) {
-        return true;
-      }
+      const existingAfterLock = await this.checkExistingProxyVersion(onStatus);
+      if (existingAfterLock.ok) return true;
+      if (existingAfterLock.reason !== "unreachable") return false;
 
       // 2. Ensure headroom is installed (venv-based)
       const invocation = await ensureInstalled(onStatus);
@@ -299,6 +341,12 @@ export class ProxyManager {
   }
 
   // ── Health check ──────────────────────────────────────────────────
+
+  private async checkExistingProxyVersion(onStatus: (msg: string) => void) {
+    const result = await checkHeadroomVersion(this.baseUrl, await getHeadroomAiVersion(), 3_000);
+    if (!result.ok) onStatus(describeHeadroomVersionCheck(result));
+    return result;
+  }
 
   async healthCheck(): Promise<boolean> {
     try {

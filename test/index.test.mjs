@@ -12,12 +12,13 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 
 test("context: compression failure marks proxy offline instead of accepting an SDK fallback", async () => {
-  const priorUrl = process.env.HEADROOM_URL;
   const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-offline-config-"));
+  const configPath = join(tempDir, "headroom.json");
   let fetchCalls = 0;
 
   try {
-    process.env.HEADROOM_URL = "http://127.0.0.1:1";
+    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:1" }));
     globalThis.fetch = async () => {
       fetchCalls++;
       throw new Error("connection refused");
@@ -33,7 +34,7 @@ test("context: compression failure marks proxy offline instead of accepting an S
     };
 
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi);
+    mod.default(pi, { headroomConfigPath: configPath });
 
     const statuses = [];
     const statusKeys = [];
@@ -68,11 +69,52 @@ test("context: compression failure marks proxy offline instead of accepting an S
     assert.equal(fetchCalls, callsAfterFailure, "offline proxy should not be retried each turn");
   } finally {
     globalThis.fetch = originalFetch;
-    if (priorUrl === undefined) {
-      delete process.env.HEADROOM_URL;
-    } else {
-      process.env.HEADROOM_URL = priorUrl;
-    }
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("context: version-mismatched external proxy remains fail-open", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-mismatch-config-"));
+  const configPath = join(tempDir, "headroom.json");
+  let compressionRequests = 0;
+
+  try {
+    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("/health")) {
+        return new Response(JSON.stringify({ version: "0.40.0" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      compressionRequests++;
+      throw new Error("compression must not be requested");
+    };
+
+    const handlers = new Map();
+    const pi = {
+      on(event, handler) {
+        handlers.set(event, handler);
+        return () => {};
+      },
+      registerCommand() {},
+    };
+    const mod = await jiti.import("../src/index.ts");
+    mod.default(pi, { headroomConfigPath: configPath });
+    const notifications = [];
+    const result = await handlers.get("context")({ messages: [{ role: "user", content: "keep original", timestamp: 1 }] }, {
+      model: { id: "test-model" },
+      ui: {
+        theme: { fg: (_color, value) => value },
+        setStatus() {},
+        notify: (message, level) => notifications.push({ message, level }),
+      },
+    });
+
+    assert.equal(result, undefined);
+    assert.equal(compressionRequests, 0);
+    assert.ok(notifications.some(({ message }) => message.includes("version mismatch")));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 
@@ -94,7 +136,10 @@ test("context: forwards configured compression overrides to Headroom", async () 
         frozenMessageCount: 2,
       },
     }));
-    globalThis.fetch = async (_url, init) => {
+    globalThis.fetch = async (url, init) => {
+      if (String(url).endsWith("/health")) {
+        return new Response(JSON.stringify({ version: "0.41.0" }), { status: 200, headers: { "content-type": "application/json" } });
+      }
       requestBody = JSON.parse(String(init?.body));
       return new Response(JSON.stringify({
         messages: [{ role: "user", content: "compress me" }],
@@ -195,17 +240,18 @@ test("context: image safety fallback does not report unapplied compression savin
 });
 
 test("context: healthy proxy compression failure stays online", async () => {
-  const priorUrl = process.env.HEADROOM_URL;
   const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-healthy-config-"));
+  const configPath = join(tempDir, "headroom.json");
   let compressionRequests = 0;
   let healthChecks = 0;
 
   try {
-    process.env.HEADROOM_URL = "http://127.0.0.1:8787";
+    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
     globalThis.fetch = async (url) => {
       if (String(url).endsWith("/health")) {
         healthChecks++;
-        return { ok: true };
+        return new Response(JSON.stringify({ version: "0.41.0" }), { status: 200, headers: { "content-type": "application/json" } });
       }
       compressionRequests++;
       throw new Error("upstream compression rejected request");
@@ -220,7 +266,7 @@ test("context: healthy proxy compression failure stays online", async () => {
       registerCommand() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi);
+    mod.default(pi, { headroomConfigPath: configPath });
 
     const statuses = [];
     const notifications = [];
@@ -237,7 +283,7 @@ test("context: healthy proxy compression failure stays online", async () => {
 
     assert.equal(await contextHandler(event, ctx), undefined);
     assert.ok(compressionRequests >= 1, "expected Headroom client to attempt compression");
-    assert.equal(healthChecks, 1);
+    assert.equal(healthChecks, 2);
     const firstCompressionRequestCount = compressionRequests;
     assert.ok(
       notifications.some(({ message, level }) =>
@@ -252,8 +298,43 @@ test("context: healthy proxy compression failure stays online", async () => {
     assert.ok(compressionRequests > firstCompressionRequestCount, "healthy proxy should accept later compression attempts");
   } finally {
     globalThis.fetch = originalFetch;
-    if (priorUrl === undefined) delete process.env.HEADROOM_URL;
-    else process.env.HEADROOM_URL = priorUrl;
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("commands: external proxy status reports health version", async () => {
+  const originalFetch = globalThis.fetch;
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-status-config-"));
+  const configPath = join(tempDir, "headroom.json");
+
+  try {
+    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
+    globalThis.fetch = async () => new Response(JSON.stringify({ version: "0.41.0" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+    const commands = new Map();
+    const pi = {
+      on() {
+        return () => {};
+      },
+      registerCommand(name, options) {
+        commands.set(name, options);
+      },
+    };
+    const mod = await jiti.import("../src/index.ts");
+    mod.default(pi, { headroomConfigPath: configPath });
+    const notifications = [];
+    await commands.get("wb:headroom-proxy").handler("status", {
+      ui: { notify: (message, level) => notifications.push({ message, level }) },
+    });
+
+    assert.ok(notifications.some(({ message }) =>
+      message.includes("Version: 0.41.0 (external /health)") && message.includes("Expected: 0.41.0 (extension)"),
+    ));
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(tempDir, { recursive: true, force: true });
   }
 });
 

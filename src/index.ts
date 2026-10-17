@@ -19,11 +19,15 @@ import { Text } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
 import type { CompressResult } from "headroom-ai";
 import { piToOpenAI, openAIToPiWithOutcome } from "./format-bridge.js";
-import { ProxyManager } from "./proxy-manager.js";
+import { getHeadroomAiVersion, getManagedHeadroomVersion, ProxyManager } from "./proxy-manager.js";
+import {
+  checkHeadroomVersion,
+  describeHeadroomVersionCheck,
+  type HeadroomVersionCheck,
+} from "./headroom-health.js";
 import { DEFAULT_HEADROOM_PORT } from "./config.js";
 import {
   ensureHeadroomConfigFile,
-  hasLegacyHeadroomEnvironment,
   loadHeadroomConfigSync,
   type HeadroomConfig,
 } from "./headroom-config.js";
@@ -72,7 +76,6 @@ export default function piWorkbenchExtension(
   let preceptorEnabled = false;
   let studyEnabled = false;
   let legacyPathWarningShown = false;
-  let legacyEnvironmentWarningShown = false;
 
   // ─── Configuration ──────────────────────────────────────────────────
 
@@ -94,14 +97,14 @@ export default function piWorkbenchExtension(
   // which marks the proxy offline, attempts managed recovery, and fails open.
   const client = new HeadroomClient({ baseUrl, fallback: false, timeout: 15_000 });
 
-  /** Simple health check — the SDK doesn't expose one, so we hit the proxy directly. */
-  async function checkProxyHealth(): Promise<boolean> {
-    try {
-      const res = await fetch(`${baseUrl}/health`, { signal: AbortSignal.timeout(5_000) });
-      return res.ok;
-    } catch {
-      return false;
-    }
+  /** Validate external proxy version before sending it Pi context. */
+  async function checkExternalProxyVersion(): Promise<HeadroomVersionCheck> {
+    return checkHeadroomVersion(baseUrl, await getHeadroomAiVersion(), 5_000);
+  }
+
+  async function checkActiveProxy(): Promise<HeadroomVersionCheck | { ok: boolean }> {
+    if (proxyManager?.isManaged) return { ok: await proxyManager.healthCheck() };
+    return checkExternalProxyVersion();
   }
 
   function compressionStatus(): string {
@@ -282,10 +285,6 @@ export default function piWorkbenchExtension(
     } catch {
       ctx.ui.notify("Headroom configuration could not be created; using loaded defaults.", "warning");
     }
-    if (!legacyEnvironmentWarningShown && hasLegacyHeadroomEnvironment()) {
-      legacyEnvironmentWarningShown = true;
-      ctx.ui.notify("HEADROOM_* environment variables are ignored. Move settings to ~/.pi/pi-workbench/headroom.json.", "warning");
-    }
     if (!legacyPathWarningShown && [
       WORKBENCH_PATHS.legacyHeadroomVenv,
       WORKBENCH_PATHS.legacyHeadroomVenvLock,
@@ -336,9 +335,9 @@ export default function piWorkbenchExtension(
         );
       }
     } else {
-      // User-managed mode: just health-check
-      const healthy = await checkProxyHealth();
-      if (healthy) {
+      // User-managed mode: require exact SDK/proxy version parity.
+      const health = await checkExternalProxyVersion();
+      if (health.ok) {
         proxyAvailable = true;
         ctx.ui.setStatus(
           "headroom-proxy",
@@ -346,6 +345,7 @@ export default function piWorkbenchExtension(
         );
       } else {
         proxyAvailable = false;
+        ctx.ui.notify(`${describeHeadroomVersionCheck(health)}. Context compression disabled.`, "warning");
         ctx.ui.setStatus(
           "headroom-proxy",
           ctx.ui.theme.fg("warning", "⚠") + ctx.ui.theme.fg("dim", " Headroom offline"),
@@ -390,6 +390,22 @@ export default function piWorkbenchExtension(
 
   pi.on("context", async (event, ctx) => {
     if (!enabled || proxyAvailable === false) return;
+
+    // Pi normally emits session_start first. Keep direct/test invocation fail-open too:
+    // explicit external URLs cannot receive context until version validation succeeds.
+    if (userUrl && proxyAvailable !== true) {
+      const health = await checkExternalProxyVersion();
+      if (!health.ok) {
+        proxyAvailable = false;
+        ctx.ui.notify(`Headroom proxy unavailable: ${describeHeadroomVersionCheck(health)}`, "warning");
+        ctx.ui.setStatus(
+          "headroom-proxy",
+          ctx.ui.theme.fg("warning", "⚠") + ctx.ui.theme.fg("dim", " Headroom offline"),
+        );
+        return;
+      }
+      proxyAvailable = true;
+    }
 
     // Convert AgentMessage[] → Pi-AI Message[] → OpenAI format
     const piMessages = convertToLlm(event.messages);
@@ -452,9 +468,9 @@ export default function piWorkbenchExtension(
       return { messages: compressedPiMessages as any };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      const healthy = await checkProxyHealth();
+      const health = await checkActiveProxy();
 
-      if (healthy) {
+      if (health.ok) {
         proxyAvailable = true;
         if (!compressionWarningShown) {
           compressionWarningShown = true;
@@ -470,7 +486,8 @@ export default function piWorkbenchExtension(
       if (!proxyWarningShown) {
         proxyWarningShown = true;
         proxyAvailable = false;
-        ctx.ui.notify(`Headroom proxy unavailable: ${errMsg}`, "warning");
+        const diagnostic = "reason" in health ? describeHeadroomVersionCheck(health) : "Headroom proxy unavailable";
+        ctx.ui.notify(`${diagnostic}: ${errMsg}`, "warning");
         ctx.ui.setStatus(
           "headroom-proxy",
           ctx.ui.theme.fg("warning", "⚠") + ctx.ui.theme.fg("dim", " Headroom offline"),
@@ -544,9 +561,9 @@ export default function piWorkbenchExtension(
             );
           }
         } else {
-          // User-managed: just health-check
-          const ok2 = await checkProxyHealth();
-          if (ok2) {
+          // User-managed: require exact SDK/proxy version parity.
+          const health = await checkExternalProxyVersion();
+          if (health.ok) {
             proxyAvailable = true;
             ctx.ui.notify("Headroom compression enabled", "info");
             ctx.ui.setStatus(
@@ -555,7 +572,7 @@ export default function piWorkbenchExtension(
             );
           } else {
             proxyAvailable = false;
-            ctx.ui.notify("Headroom enabled but proxy is offline", "warning");
+            ctx.ui.notify(`Headroom enabled but unavailable: ${describeHeadroomVersionCheck(health)}`, "warning");
             ctx.ui.setStatus(
               "headroom-proxy",
               ctx.ui.theme.fg("warning", "⚠") + ctx.ui.theme.fg("dim", " Headroom offline"),
@@ -581,10 +598,18 @@ export default function piWorkbenchExtension(
             : "auto (external proxy detected)"
           : "manual (headroom.json url set)";
 
+      const usingManagedProxy = proxyManager?.isManaged === true;
+      const versionCheck = usingManagedProxy ? null : await checkExternalProxyVersion();
+      const headroomVersion = usingManagedProxy
+        ? await getManagedHeadroomVersion() ?? "unavailable"
+        : versionCheck?.reportedVersion ?? "unavailable";
+      const versionSource = usingManagedProxy ? "managed Python venv" : "external /health";
       const lines = [
         `Headroom Context Compression`,
         `  Enabled: ${enabled ? "yes" : "no"}`,
         `  Proxy:   ${baseUrl} (${proxyAvailable === true ? "online" : proxyAvailable === false ? "offline" : "unknown"})`,
+        `  Version: ${headroomVersion} (${versionSource})`,
+        ...(versionCheck ? [`  Expected: ${versionCheck.expectedVersion ?? "unavailable"} (extension)`] : []),
         `  Mode:    ${managedStr}`,
         `  Config:  ${compressionStatus()}`,
         ``,
@@ -592,6 +617,8 @@ export default function piWorkbenchExtension(
         `  Compressions: ${sessionTotals.calls}`,
         `  Tokens saved: ${sessionTotals.tokensSaved.toLocaleString()}`,
       ];
+
+      if (versionCheck && !versionCheck.ok) lines.push(`  Health:  ${describeHeadroomVersionCheck(versionCheck)}`);
 
       if (lastStats.tokensBefore > 0) {
         const pct = Math.round((1 - lastStats.ratio) * 100);
@@ -846,7 +873,9 @@ export default function piWorkbenchExtension(
 
       ctx.ui.notify(`Checking Headroom proxy at ${baseUrl}...`, "info");
 
-      const isHealthy = await checkProxyHealth();
+      const usingManagedProxy = proxyManager?.isManaged === true;
+      const versionCheck = usingManagedProxy ? null : await checkExternalProxyVersion();
+      const isHealthy = usingManagedProxy ? await proxyManager.healthCheck() : versionCheck?.ok === true;
       if (isHealthy) {
         proxyAvailable = true;
 
@@ -854,6 +883,12 @@ export default function piWorkbenchExtension(
           `Headroom proxy: online`,
           `  URL: ${baseUrl}`,
           `  Config: ${compressionStatus()}`,
+          ...(usingManagedProxy
+            ? [`  Version: ${await getManagedHeadroomVersion() ?? "unavailable"} (managed Python venv)`]
+            : [
+              `  Version: ${versionCheck?.reportedVersion ?? "unavailable"} (external /health)`,
+              `  Expected: ${versionCheck?.expectedVersion ?? "unavailable"} (extension)`,
+            ]),
         ];
 
         if (proxyManager) {
@@ -867,7 +902,9 @@ export default function piWorkbenchExtension(
         );
       } else {
         proxyAvailable = false;
-        const errMsg = "proxy did not respond";
+        const errMsg = versionCheck && !versionCheck.ok
+          ? describeHeadroomVersionCheck(versionCheck)
+          : "proxy did not respond";
         const helpLines = [
           `Headroom proxy offline`,
           `  URL: ${baseUrl}`,
