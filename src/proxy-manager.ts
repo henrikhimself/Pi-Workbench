@@ -267,6 +267,7 @@ export class ProxyManager {
   private host: string;
   /** Stored invocation method from ensureInstalled */
   private invocation: { cmd: string; args: string[] } | null = null;
+  private restartPromise: Promise<boolean> | null = null;
 
   constructor(options?: { port?: number; host?: string }) {
     this.port = options?.port ?? 8787;
@@ -406,6 +407,14 @@ export class ProxyManager {
    * Returns true if recovered.
    */
   async tryRestart(onStatus: (msg: string) => void): Promise<boolean> {
+    if (this.restartPromise) return this.restartPromise;
+    this.restartPromise = this.tryRestartOnce(onStatus).finally(() => {
+      this.restartPromise = null;
+    });
+    return this.restartPromise;
+  }
+
+  private async tryRestartOnce(onStatus: (msg: string) => void): Promise<boolean> {
     if (!this.managedByThisInstance) return false;
     if (this.proc && this.proc.exitCode === null) {
       // Exit event can race failed request/health handling. Never restart healthy child.

@@ -17,6 +17,7 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { HeadroomClient, compress } from "headroom-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { existsSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import type { CompressResult } from "headroom-ai";
 import { piToOpenAI, openAIToPiWithOutcome } from "./format-bridge.js";
 import { getHeadroomAiVersion, getManagedHeadroomVersion, ProxyManager } from "./proxy-manager.js";
@@ -31,8 +32,26 @@ import {
   loadHeadroomConfigSync,
   type HeadroomConfig,
 } from "./headroom-config.js";
-import { WORKBENCH_PATHS } from "./paths.js";
+import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import { MemoryManager, MEMORY_SERVER_NAME } from "./memory-manager.js";
+import {
+  CODE_GRAPH_GUIDANCE_MESSAGE,
+  CodeGraphManager,
+} from "./code-graph-manager.js";
+import {
+  CodeGraphInstaller,
+  detectCodeGraphPlatform,
+  discoverInstalled,
+  installedBinaryPath,
+  unsupportedPlatformMessage,
+} from "./code-graph-installer.js";
+import { getAsset } from "./code-graph-assets.js";
+import {
+  formatCodeGraphStatus,
+  resolveCodeGraphProject,
+  validateManagedProjectPath,
+  validateCodeGraphState,
+} from "./code-graph-config.js";
 import { configureMemoryGit } from "./memory-git.js";
 import { applyMemoryGuidance, resolveMemoryGuidanceMode } from "./memory-guidance.js";
 import {
@@ -50,10 +69,14 @@ import {
   restorePreceptorEnabled,
 } from "./preceptor-mode.js";
 
+const CODE_GRAPH_PROMPT_SECTION = "pi-workbench-code-graph";
+
 export default function piWorkbenchExtension(
   pi: ExtensionAPI,
-  options?: { headroomConfigPath?: string },
+  options?: { headroomConfigPath?: string; workbenchPaths?: WorkbenchPaths },
 ) {
+  // Test seam: production always uses the canonical WORKBENCH_PATHS.
+  const paths = options?.workbenchPaths ?? WORKBENCH_PATHS;
   // ─── State ──────────────────────────────────────────────────────────
 
   let enabled = true;
@@ -61,6 +84,8 @@ export default function piWorkbenchExtension(
   let proxyWarningShown = false;
   let compressionWarningShown = false;
   let restartAttempted = false;
+  let proxyWatchdog: ReturnType<typeof setInterval> | null = null;
+  let proxyWatchdogGeneration = 0;
 
   let lastStats: {
     tokensBefore: number;
@@ -73,6 +98,14 @@ export default function piWorkbenchExtension(
   let sessionTotals = { calls: 0, tokensSaved: 0 };
   let memoryRegistered = false;
   let memoryRootWarningShown = false;
+  let codeGraphManager: CodeGraphManager | null = null;
+  let codeGraphActivationQuiet = false;
+  let codeGraphGuidanceActive = false;
+
+  // Standalone codebase-memory-mcp lifecycle. Independent from the
+  // Headroom proxy and Memory; never modifies external services.
+  const codeGraphInstaller = new CodeGraphInstaller({ paths });
+  const CODE_GRAPH_STATUS_KEY = "code-graph";
   let preceptorEnabled = false;
   let studyEnabled = false;
   let legacyPathWarningShown = false;
@@ -105,6 +138,47 @@ export default function piWorkbenchExtension(
   async function checkActiveProxy(): Promise<HeadroomVersionCheck | { ok: boolean }> {
     if (proxyManager?.isManaged) return { ok: await proxyManager.healthCheck() };
     return checkExternalProxyVersion();
+  }
+
+  function stopProxyWatchdog(): void {
+    proxyWatchdogGeneration += 1;
+    if (proxyWatchdog) clearInterval(proxyWatchdog);
+    proxyWatchdog = null;
+  }
+
+  function startProxyWatchdog(ctx: ExtensionContext): void {
+    stopProxyWatchdog();
+    if (!proxyManager) return;
+    const generation = proxyWatchdogGeneration;
+    proxyWatchdog = setInterval(() => {
+      void (async () => {
+        // Only extension-owned children qualify. External proxies are never probed,
+        // restarted, stopped, or otherwise modified by this watchdog.
+        if (!proxyManager.isManaged || await proxyManager.healthCheck()) return;
+        // A shutdown, disable, or replacement session may have occurred while
+        // healthCheck awaited. Never restart after this watchdog was cancelled.
+        if (generation !== proxyWatchdogGeneration || !enabled) return;
+        proxyAvailable = false;
+        ctx.ui.setStatus("headroom-proxy", ctx.ui.theme.fg("dim", "⏳ Headroom restarting..."));
+        const recovered = await proxyManager.tryRestart((msg) => {
+          ctx.ui.setStatus("headroom-proxy", ctx.ui.theme.fg("dim", `⏳ ${msg}`));
+        });
+        if (recovered) {
+          proxyAvailable = true;
+          proxyWarningShown = false;
+          ctx.ui.setStatus(
+            "headroom-proxy",
+            ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Headroom"),
+          );
+        } else {
+          proxyAvailable = false;
+          ctx.ui.setStatus(
+            "headroom-proxy",
+            ctx.ui.theme.fg("warning", "⚠") + ctx.ui.theme.fg("dim", " Headroom offline"),
+          );
+        }
+      })().catch(() => {});
+    }, 30_000);
   }
 
   function compressionStatus(): string {
@@ -181,6 +255,8 @@ export default function piWorkbenchExtension(
       delete sections[STUDY_PROMPT_SECTION];
     }
     applyMemoryGuidance(sections, memoryGuidanceMode());
+    if (codeGraphGuidanceActive) sections[CODE_GRAPH_PROMPT_SECTION] = CODE_GRAPH_GUIDANCE_MESSAGE;
+    else delete sections[CODE_GRAPH_PROMPT_SECTION];
     return renderer.buildSystemPrompt({ ...options, sections });
   }
 
@@ -205,6 +281,69 @@ export default function piWorkbenchExtension(
       ctx.ui.notify(`Headroom Memory disabled: ${message}`, "error");
       setMemoryStatus(ctx, "offline");
       return null;
+    }
+  }
+
+  // ─── Code graph (standalone codebase-memory-mcp) ──────────────────
+
+  function codeGraphManagerFor(ctx: ExtensionContext): CodeGraphManager {
+    if (!codeGraphManager) {
+      codeGraphManager = new CodeGraphManager({
+        paths,
+        // Production path: packaged manifest only; no test-seam asset.
+        ensureInstalled: (onStatus) => codeGraphInstaller.ensureInstalled(onStatus),
+        onStatus: (message) => {
+          if (!codeGraphActivationQuiet) {
+            ctx.ui.setStatus(CODE_GRAPH_STATUS_KEY, ctx.ui.theme.fg("dim", `⏳ ${message}`));
+          }
+        },
+        registerMcp: (name, config) => pi.registerMcpServer(name, config),
+        unregisterMcp: (name) => pi.unregisterMcpServer(name),
+      });
+    }
+    return codeGraphManager;
+  }
+
+  function codeGraphProjectFor(ctx: ExtensionContext) {
+    return resolveCodeGraphProject(ctx.cwd ?? process.cwd(), paths);
+  }
+
+  function codeGraphStatusOn(ctx: ExtensionContext): void {
+    ctx.ui.setStatus(
+      CODE_GRAPH_STATUS_KEY,
+      ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Code Graph"),
+    );
+  }
+
+  function codeGraphStatusOff(ctx: ExtensionContext): void {
+    ctx.ui.setStatus(
+      CODE_GRAPH_STATUS_KEY,
+      ctx.ui.theme.fg("dim", "○ Code Graph off"),
+    );
+  }
+
+  /**
+   * Restore this workspace's code graph at session start. Independent of
+   * the Headroom proxy and Memory; callers use it fire-and-forget so it
+   * can never delay their startup. Fail-open: any problem leaves the
+   * feature off with a diagnostic.
+   */
+  async function restoreCodeGraph(ctx: ExtensionContext): Promise<void> {
+    try {
+      const manager = codeGraphManagerFor(ctx);
+      const result = await manager.restore(codeGraphProjectFor(ctx));
+      if (result.ok) {
+        codeGraphGuidanceActive = true;
+        codeGraphStatusOn(ctx);
+        return;
+      }
+      if (result.kind !== "off") {
+        codeGraphStatusOff(ctx);
+        ctx.ui.notify(`Code graph ${result.kind}: ${result.detail}`, "warning");
+      }
+    } catch (error) {
+      codeGraphStatusOff(ctx);
+      ctx.ui.notify(`Code graph restore failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
     }
   }
 
@@ -295,6 +434,7 @@ export default function piWorkbenchExtension(
     }
     restorePreceptorState(ctx);
     restoreStudyState(ctx);
+    codeGraphGuidanceActive = false;
     proxyWarningShown = false;
     compressionWarningShown = false;
     restartAttempted = false;
@@ -319,6 +459,7 @@ export default function piWorkbenchExtension(
 
       if (ok) {
         proxyAvailable = true;
+        startProxyWatchdog(ctx);
         ctx.ui.setStatus(
           "headroom-proxy",
           ctx.ui.theme.fg("success", "✓") + ctx.ui.theme.fg("dim", " Headroom"),
@@ -356,11 +497,19 @@ export default function piWorkbenchExtension(
     // Existing per-project memory.db is durable opt-in. It is independent from
     // compression proxy management, including headroom.json external-proxy mode.
     await startMemory(ctx, false);
+
+    // Code graph restore is also opt-in and independent. Never awaited:
+    // it must not delay Headroom proxy or Memory startup, and any failure
+    // is fail-open (feature stays off, diagnostics via /wb:code-graph status).
+    void restoreCodeGraph(ctx).catch(() => {});
   });
 
   // ─── Session shutdown: stop proxy if we started it ──────────────────
 
   pi.on("session_shutdown", async () => {
+    stopProxyWatchdog();
+    codeGraphManager?.shutdown();
+    codeGraphGuidanceActive = false;
     if (memoryRegistered) {
       pi.unregisterMcpServer(MEMORY_SERVER_NAME);
       memoryRegistered = false;
@@ -384,6 +533,8 @@ export default function piWorkbenchExtension(
       delete event.systemPromptOptions.sections[STUDY_PROMPT_SECTION];
     }
     applyMemoryGuidance(event.systemPromptOptions.sections, memoryGuidanceMode());
+    if (codeGraphGuidanceActive) event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION] = CODE_GRAPH_GUIDANCE_MESSAGE;
+    else delete event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION];
   });
 
   // ─── Core: compress context before every LLM call ───────────────────
@@ -547,6 +698,7 @@ export default function piWorkbenchExtension(
           });
           if (ok) {
             proxyAvailable = true;
+            startProxyWatchdog(ctx);
             ctx.ui.notify("Headroom compression enabled", "info");
             ctx.ui.setStatus(
               "headroom-proxy",
@@ -584,6 +736,7 @@ export default function piWorkbenchExtension(
 
       if (arg === "off") {
         enabled = false;
+        stopProxyWatchdog();
         ctx.ui.notify("Headroom compression disabled", "info");
         ctx.ui.setStatus("headroom-proxy", ctx.ui.theme.fg("dim", "○ Headroom off"));
         return;
@@ -853,6 +1006,211 @@ export default function piWorkbenchExtension(
         `  Store:   ${manager.store.identifier}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
+    },
+  });
+
+  // ─── /wb:code-graph command — standalone codebase-memory-mcp ────────
+
+  pi.registerCommand("wb:code-graph", {
+    description:
+      "Manage the extension-owned code graph (codebase-memory-mcp). Usage: /wb:code-graph [on|off|reindex|status]",
+    handler: async (args, ctx) => {
+      const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const action = tokens[0] ?? "status";
+      if (!["on", "off", "reindex", "status"].includes(action)) {
+        ctx.ui.notify("Usage: /wb:code-graph [on|off|reindex|status]", "error");
+        return;
+      }
+      const manager = codeGraphManagerFor(ctx);
+      const project = codeGraphProjectFor(ctx);
+      const platform = detectCodeGraphPlatform({ os: process.platform, arch: process.arch });
+
+      if (action === "reindex") {
+        if (tokens.length > 1) {
+          ctx.ui.notify("Usage: /wb:code-graph reindex", "error");
+          return;
+        }
+        codeGraphActivationQuiet = true;
+        try {
+          const result = await manager.reindex(project);
+          if (result.ok) {
+            codeGraphStatusOn(ctx);
+            ctx.ui.notify(`Code graph reindexed for ${project.identifier}`, "info");
+          } else {
+            ctx.ui.notify(`Code graph reindex failed (${result.kind}): ${result.detail}`, "error");
+          }
+        } catch (error) {
+          ctx.ui.notify(`Code graph reindex failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        } finally {
+          codeGraphActivationQuiet = false;
+        }
+        return;
+      }
+
+      if (action === "on") {
+        if (tokens.length > 1) {
+          ctx.ui.notify("Usage: /wb:code-graph on", "error");
+          return;
+        }
+        if (!platform) {
+          ctx.ui.notify(
+            unsupportedPlatformMessage(process.platform, process.arch),
+            "warning",
+          );
+          return;
+        }
+        const pathValidation = validateManagedProjectPath(project, paths);
+        if (!pathValidation.ok) {
+          ctx.ui.notify(`Code graph managed-path containment failure: ${pathValidation.detail}`, "error");
+          return;
+        }
+        const validation = validateCodeGraphState(project);
+        if (!validation.ok && validation.problem !== "missing") {
+          ctx.ui.notify(
+            `Code graph state is invalid (${validation.problem}): ${validation.detail} Run /wb:code-graph off to clear it, then /wb:code-graph on.`,
+            "error",
+          );
+          return;
+        }
+        codeGraphActivationQuiet = true;
+        try {
+          const result = await manager.activate(project);
+          if (result.ok) {
+            codeGraphGuidanceActive = true;
+            codeGraphStatusOn(ctx);
+            ctx.ui.notify(`Code graph enabled for ${project.identifier}`, "info");
+          } else {
+            codeGraphStatusOff(ctx);
+            ctx.ui.notify(`Code graph activation failed (${result.kind}): ${result.detail}`, "error");
+          }
+        } catch (error) {
+          codeGraphStatusOff(ctx);
+          ctx.ui.notify(`Code graph activation failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+        } finally {
+          codeGraphActivationQuiet = false;
+        }
+        return;
+      }
+
+      if (action === "off") {
+        const confirmDelete = tokens.length === 2 && tokens[1] === "--confirm-delete";
+        if (tokens.length > 1 && !confirmDelete) {
+          ctx.ui.notify("Usage: /wb:code-graph off [--confirm-delete]", "error");
+          return;
+        }
+        const pathValidation = validateManagedProjectPath(project, paths);
+        if (!pathValidation.ok) {
+          ctx.ui.notify(`Code graph deletion refused: ${pathValidation.detail}`, "error");
+          return;
+        }
+        let directoryExists = false;
+        try {
+          directoryExists = existsSync(project.directory);
+        } catch {
+          directoryExists = false;
+        }
+        if (!directoryExists) {
+          ctx.ui.notify("Code graph is already off for this workspace", "info");
+          return;
+        }
+        const validation = validateCodeGraphState(project);
+        let confirmed = confirmDelete;
+        if (!confirmed) {
+          if (!ctx.hasUI) {
+            ctx.ui.notify(
+              "Code graph deletion needs confirmation. Run /wb:code-graph off --confirm-delete.",
+              "warning",
+            );
+            return;
+          }
+          confirmed = await ctx.ui.confirm(
+            "Delete code graph data?",
+            [
+              "Permanently delete all codebase-memory-mcp data for this workspace:",
+              `  Target:   ${project.directory}`,
+              `  Includes: state.json, _config.db, and every index database for ${project.identifier}`,
+              `  Retained: shared binary (${paths.codeGraphBin}), downloads, other workspaces, Headroom Memory`,
+              ...(validation.ok ? [] : [`  Note: current state is invalid (${validation.problem}); deletion is the recovery path.`]),
+            ].join("\n"),
+          );
+        }
+        if (!confirmed) {
+          ctx.ui.notify("Code graph deletion cancelled", "info");
+          return;
+        }
+        // Off transaction order: (1) stop owned MCP first, (2) delete the
+        // matching project directory only, (3) verify the deletion.
+        try {
+          manager.stop(project);
+        } catch (error) {
+          ctx.ui.notify(
+            `Could not stop the owned code graph MCP server: ${error instanceof Error ? error.message : String(error)}. Data was not deleted.`,
+            "error",
+          );
+          return;
+        }
+        // Brief grace period so the owned child can exit before unlink.
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const preDeletePathValidation = validateManagedProjectPath(project, paths);
+        if (!preDeletePathValidation.ok) {
+          ctx.ui.notify(`Code graph deletion refused: ${preDeletePathValidation.detail}`, "error");
+          return;
+        }
+        try {
+          await rm(project.directory, { recursive: true, force: false });
+        } catch (error) {
+          ctx.ui.notify(
+            `Code graph deletion failed: ${error instanceof Error ? error.message : String(error)}. Data still present at ${project.directory}; retry /wb:code-graph off --confirm-delete.`,
+            "error",
+          );
+          return;
+        }
+        let stillExists = false;
+        try {
+          stillExists = existsSync(project.directory);
+        } catch {
+          stillExists = false;
+        }
+        if (stillExists) {
+          ctx.ui.notify(
+            `Code graph deletion incomplete: ${project.directory} still exists.`,
+            "error",
+          );
+          return;
+        }
+        codeGraphGuidanceActive = false;
+        codeGraphStatusOff(ctx);
+        ctx.ui.notify(`Code graph deleted for ${project.identifier}`, "info");
+        return;
+      }
+
+      // status
+      const manifest = platform ? getAsset(platform).asset : undefined;
+      const installed = platform
+        ? await discoverInstalled(codeGraphInstaller.binRoot, platform).catch(() => null)
+        : null;
+      const statusPathValidation = validateManagedProjectPath(project, paths);
+      const stateValidation = statusPathValidation.ok ? validateCodeGraphState(project) : null;
+      const binaryCompatible = stateValidation?.ok && installed
+        ? installed.version === stateValidation.state.version
+          && installed.resolvedUrl === stateValidation.state.resolvedUrl
+          && installed.sha256 === stateValidation.state.sha256
+        : undefined;
+      const report = await manager.buildStatusReport({
+        project,
+        platform: platform ?? unsupportedPlatformMessage(process.platform, process.arch),
+        manifestVersion: manifest?.version,
+        installedVersion: installed?.version,
+        binaryCompatible,
+      });
+      // Status is filesystem-only unless the workspace has valid enabled,
+      // state-compatible binary identity. Off/corrupt/upgrading workspaces
+      // must never start CBM.
+      if (installed && platform && report.kind === "enabled" && binaryCompatible === true) {
+        const binaryPath = installedBinaryPath(codeGraphInstaller.binRoot, installed.version, platform);
+        report.indexSummary = (await manager.fetchIndexSummary(project, binaryPath)) ?? undefined;
+      }
+      ctx.ui.notify(formatCodeGraphStatus(report).join("\n"), "info");
     },
   });
 

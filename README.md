@@ -84,19 +84,17 @@ The optional `compression` settings travel with every compression request. They 
 | `protectAnalysisContext` | Boolean | Leave analysis/reasoning context uncompressed. |
 | `frozenMessageCount` | Non-negative integer | Number of earliest messages left uncompressed. |
 
-Headroom selects content transforms automatically. `compression` does not select code, logs, JSON, or other transform types. `/wb:headroom-health` and `/wb:headroom-proxy status` show configured overrides.
+Headroom selects content transforms automatically.
 
 #### Troubleshoot editing failures
 
-If exact-match edits fail or source edits become unreliable, start with profile above: `lossless_then_lossy`, `targetRatio: 0.8`, `compressUserMessages: false`, `protectRecent: 8`, and `protectAnalysisContext: true`. Reload extensions, retry same edit workflow, then compare editing reliability against token savings. Omit `compression` to return to Headroom defaults.
+If exact-match edits fail or source edits become unreliable, start with profile above. Reload extensions, retry same edit workflow, then compare editing reliability against token savings.
 
 ### Headroom Memory
 
 Headroom Memory gives Pi durable, project-scoped context. Enable it with `/wb:headroom-memory on`; Pi can then search relevant prior project decisions and save facts only when requested or confirmed.
 
-Memory is independent from context compression. It works with both managed proxy `port` and external proxy `url` configurations.
-
-Optionally configure a namespace and export directory for sharing Memory through your repository:
+Optionally configure a namespace and export directory for sharing Memory through your repository as plain text files:
 
 ```json
 {
@@ -114,7 +112,11 @@ Optionally configure a namespace and export directory for sharing Memory through
 - `import` — replace configured namespace from export directory; requires confirmation.
 - `merge` — combine exported Memory with local Memory; exported version wins conflicts.
 
-Memory never syncs automatically. Enabling it prepares repository merge support for configured export directory, but never stages, commits, pulls, or pushes changes. Each clone needs Memory enabled separately.
+### Code Graph (standalone codebase-memory-mcp)
+
+Code Graph gives Pi structural code intelligence: symbol search, call paths, architecture overview, and impact queries over a local index of the current workspace.
+
+The feature is enabled using `/wb:code-graph on` in a workspace. Workspace data is under `~/.pi/pi-workbench/codebase-memory-mcp/`.
 
 ### Study Mode
 
@@ -127,6 +129,7 @@ Study Mode adds branch-scoped guidance favoring questions, evidence, explanation
 | `/wb:headroom-proxy [on\|off\|status]` | Control or inspect Headroom context compression. |
 | `/wb:headroom-health` | Show Headroom proxy diagnostics. |
 | `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Manage project-scoped persistent Memory. `show` lists current records. `export`, `import`, and `merge` require `memory.export`. `import` needs UI confirmation or `--confirm-replace`; `off` needs UI confirmation or `--confirm-delete`. |
+| `/wb:code-graph [on\|off\|reindex\|status]` | Enable, disable, reindex, or inspect the standalone `codebase-memory-mcp` code graph for the current workspace. `reindex` updates the index; `off` needs UI confirmation or `--confirm-delete` and deletes only this workspace's code-graph data. |
 | `/wb:preceptor-mode [on\|off\|status]` | Toggle branch-scoped Learning Mode. |
 | `/wb:study-mode [on\|off\|status]` | Toggle branch-scoped Study guidance. Tools and commands remain available. |
 | `/wb:show-system-prompt` | Preview active Pi system prompt additions. |

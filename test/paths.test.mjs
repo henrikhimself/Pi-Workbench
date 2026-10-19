@@ -18,6 +18,23 @@ test("resolveWorkbenchPaths: keeps all managed data below dedicated Workbench ro
   assert.equal(paths.headroomConfig, join(root, "headroom.json"));
 });
 
+test("resolveWorkbenchPaths: keeps all code graph data below the codebase-memory-mcp root", () => {
+  const home = "/tmp/pi-workbench-home";
+  const paths = resolveWorkbenchPaths(home);
+  const root = join(home, ".pi", "pi-workbench", "codebase-memory-mcp");
+
+  assert.equal(paths.codeGraphRoot, root);
+  assert.equal(paths.codeGraphBin, join(root, "bin"));
+  assert.equal(paths.codeGraphDownloads, join(root, "downloads"));
+  assert.equal(paths.codeGraphProjects, join(root, "projects"));
+  assert.equal(paths.codeGraphInstallLock, join(root, "install.lock"));
+  assert.equal(paths.codeGraphCurlShim, join(root, "deny-shims", "curl"));
+  for (const [key, value] of Object.entries(paths)) {
+    if (key.startsWith("legacy")) continue;
+    assert.ok(!value.startsWith(join(home, ".pi", "headroom-")), `managed path must not reuse legacy prefix: ${key}=${value}`);
+  }
+});
+
 test("resolveWorkbenchPaths: exposes legacy locations only outside active managed paths", () => {
   const home = "/tmp/pi-workbench-home";
   const paths = resolveWorkbenchPaths(home);
