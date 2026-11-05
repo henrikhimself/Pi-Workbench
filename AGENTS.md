@@ -39,7 +39,6 @@ curl -fsS http://127.0.0.1:8787/health
 - Do not stop external proxy. Shared managed startup stays under extension-owned lock and rechecks health after lock acquisition.
 - Memory uses managed Python plus `OnnxLocalEmbedder` CPU only. No PyTorch, MPS, CUDA, cloud, Ollama, or alternate embedding fallback.
 - Preserve Pi/OpenAI bridge semantics for text, tool calls/results, thinking, images, and count-changing compression output.
-- Learning Mode stays opt-in, branch-scoped, and must not obstruct direct implementation or urgent remediation. Never store learner profiles or assessments.
 - Study Mode stays opt-in and branch-scoped guidance. It favors questions, evidence, explanations, and avoiding changes, but is not a tool or command sandbox.
 - Explicit user requests may proceed while Study Mode is enabled. Recommend `/wb:study-mode off` or confirm intent before implementation work; do not claim actions are blocked.
 - Study Mode must not create learner profiles, assessments, or stored learner data.

@@ -61,13 +61,6 @@ import {
   STUDY_STATUS_KEY,
   restoreStudyModeState,
 } from "./study-mode.js";
-import {
-  PRECEPTOR_ENTRY_TYPE,
-  PRECEPTOR_GUIDANCE,
-  PRECEPTOR_PROMPT_SECTION,
-  PRECEPTOR_STATUS_KEY,
-  restorePreceptorEnabled,
-} from "./preceptor-mode.js";
 
 const CODE_GRAPH_PROMPT_SECTION = "pi-workbench-code-graph";
 
@@ -106,7 +99,6 @@ export default function piWorkbenchExtension(
   // Headroom proxy and Memory; never modifies external services.
   const codeGraphInstaller = new CodeGraphInstaller({ paths });
   const CODE_GRAPH_STATUS_KEY = "code-graph";
-  let preceptorEnabled = false;
   let studyEnabled = false;
   let legacyPathWarningShown = false;
 
@@ -206,22 +198,6 @@ export default function piWorkbenchExtension(
     ctx.ui.setStatus("headroom-memory", ctx.ui.theme.fg(color, label));
   }
 
-  function setPreceptorStatus(ctx: ExtensionContext): void {
-    ctx.ui.setStatus(
-      PRECEPTOR_STATUS_KEY,
-      preceptorEnabled ? ctx.ui.theme.fg("success", "✓ Learning") : undefined,
-    );
-  }
-
-  function restorePreceptorState(ctx: ExtensionContext): void {
-    preceptorEnabled = restorePreceptorEnabled(ctx.sessionManager.getBranch());
-    setPreceptorStatus(ctx);
-  }
-
-  function persistPreceptorState(): void {
-    pi.appendEntry(PRECEPTOR_ENTRY_TYPE, { enabled: preceptorEnabled });
-  }
-
   function setStudyStatus(ctx: ExtensionContext): void {
     ctx.ui.setStatus(STUDY_STATUS_KEY, studyEnabled ? ctx.ui.theme.fg("success", "✓ Study") : undefined);
   }
@@ -244,11 +220,6 @@ export default function piWorkbenchExtension(
     };
     const options = ctx.getSystemPromptOptions();
     const sections = { ...options.sections };
-    if (preceptorEnabled) {
-      sections[PRECEPTOR_PROMPT_SECTION] = PRECEPTOR_GUIDANCE;
-    } else {
-      delete sections[PRECEPTOR_PROMPT_SECTION];
-    }
     if (studyEnabled) {
       sections[STUDY_PROMPT_SECTION] = STUDY_GUIDANCE;
     } else {
@@ -432,7 +403,6 @@ export default function piWorkbenchExtension(
       legacyPathWarningShown = true;
       ctx.ui.notify("Legacy ~/.pi/headroom-* paths remain untouched. pi-workbench uses ~/.pi/pi-workbench; migrate or remove legacy data manually.", "info");
     }
-    restorePreceptorState(ctx);
     restoreStudyState(ctx);
     codeGraphGuidanceActive = false;
     proxyWarningShown = false;
@@ -519,14 +489,9 @@ export default function piWorkbenchExtension(
     }
   });
 
-  // ─── Learning guidance before every agent turn ──────────────────────
+  // ─── Prompt guidance before every agent run ────────────────────────
 
   pi.on("before_agent_start", (event) => {
-    if (preceptorEnabled) {
-      event.systemPromptOptions.sections[PRECEPTOR_PROMPT_SECTION] = PRECEPTOR_GUIDANCE;
-    } else {
-      delete event.systemPromptOptions.sections[PRECEPTOR_PROMPT_SECTION];
-    }
     if (studyEnabled) {
       event.systemPromptOptions.sections[STUDY_PROMPT_SECTION] = STUDY_GUIDANCE;
     } else {
@@ -787,39 +752,6 @@ export default function piWorkbenchExtension(
     },
   });
 
-  // ─── /wb:preceptor-mode command — Learning mode lifecycle ──────────
-
-  pi.registerCommand("wb:preceptor-mode", {
-    description: "Toggle Learning mode or show status. Usage: /wb:preceptor-mode [on|off|status]",
-    handler: async (args, ctx) => {
-      const action = args.trim().toLowerCase() || "status";
-      if (!["on", "off", "status"].includes(action)) {
-        ctx.ui.notify("Usage: /wb:preceptor-mode [on|off|status]", "error");
-        return;
-      }
-
-      if (action === "status") {
-        ctx.ui.notify(`Learning mode: ${preceptorEnabled ? "on" : "off"} (current session branch)`, "info");
-        return;
-      }
-
-      preceptorEnabled = action === "on";
-      persistPreceptorState();
-      setPreceptorStatus(ctx);
-      if (preceptorEnabled && studyEnabled) {
-        studyEnabled = false;
-        persistStudyState();
-        setStudyStatus(ctx);
-      }
-      ctx.ui.notify(
-        preceptorEnabled
-          ? "Learning mode enabled for this session branch; Study Mode disabled."
-          : "Learning mode disabled for this session branch",
-        "info",
-      );
-    },
-  });
-
   // ─── /wb:study-mode command — tutor-only lifecycle ───────────────
 
   pi.registerCommand("wb:study-mode", {
@@ -842,13 +774,8 @@ export default function piWorkbenchExtension(
           persistStudyState();
         }
         setStudyStatus(ctx);
-        if (preceptorEnabled) {
-          preceptorEnabled = false;
-          persistPreceptorState();
-          setPreceptorStatus(ctx);
-        }
         ctx.ui.notify(
-          "Study Mode enabled; Learning mode disabled. Guidance favors explanation and avoiding changes unless requested.",
+          "Study Mode enabled. Guidance favors explanation and avoiding changes unless requested.",
           "info",
         );
         return;
@@ -863,10 +790,10 @@ export default function piWorkbenchExtension(
     },
   });
 
-  // ─── /wb:show-system-prompt command — Learning mode diagnostics ────
+  // ─── /wb:show-system-prompt command — prompt diagnostics ────────────
 
   pi.registerCommand("wb:show-system-prompt", {
-    description: "Preview current system prompt, including Learning mode guidance",
+    description: "Preview current system prompt, including active Workbench guidance",
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) {
         ctx.ui.notify("System prompt preview requires an interactive Pi UI", "warning");

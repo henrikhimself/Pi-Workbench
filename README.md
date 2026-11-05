@@ -1,6 +1,6 @@
 # pi-workbench
 
-`pi-workbench` adds Headroom context compression, project Memory, Learning Mode, and Study Mode guidance to the [Pi coding agent](https://github.com/badlogic/pi-mono).
+`pi-workbench` adds Headroom context compression, project Memory, and Study Mode guidance to the [Pi coding agent](https://github.com/badlogic/pi-mono).
 
 ## Requirements
 
@@ -130,7 +130,6 @@ Study Mode adds branch-scoped guidance favoring questions, evidence, explanation
 | `/wb:headroom-health` | Show Headroom proxy diagnostics. |
 | `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Manage project-scoped persistent Memory. `show` lists current records. `export`, `import`, and `merge` require `memory.export`. `import` needs UI confirmation or `--confirm-replace`; `off` needs UI confirmation or `--confirm-delete`. |
 | `/wb:code-graph [on\|off\|reindex\|status]` | Enable, disable, reindex, or inspect the standalone `codebase-memory-mcp` code graph for the current workspace. `reindex` updates the index; `off` needs UI confirmation or `--confirm-delete` and deletes only this workspace's code-graph data. |
-| `/wb:preceptor-mode [on\|off\|status]` | Toggle branch-scoped Learning Mode. |
 | `/wb:study-mode [on\|off\|status]` | Toggle branch-scoped Study guidance. Tools and commands remain available. |
 | `/wb:show-system-prompt` | Preview active Pi system prompt additions. |
 

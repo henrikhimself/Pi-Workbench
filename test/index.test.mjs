@@ -338,7 +338,7 @@ test("commands: external proxy status reports health version", async () => {
   }
 });
 
-test("commands: registers wb proxy and Memory commands, not legacy namespaces", async () => {
+test("commands: registers only current Workbench commands", async () => {
   const commands = new Map();
   const pi = {
     on() {
@@ -354,13 +354,14 @@ test("commands: registers wb proxy and Memory commands, not legacy namespaces", 
   const mod = await jiti.import("../src/index.ts");
   mod.default(pi);
 
-  assert.ok(commands.has("wb:headroom-proxy"));
-  assert.ok(commands.has("wb:headroom-memory"));
-  assert.ok(commands.has("wb:headroom-health"));
-  assert.equal(commands.has("headroom"), false);
-  assert.equal(commands.has("headroom-health"), false);
-  assert.equal(commands.has("hj:headroom-proxy"), false);
-  assert.equal(commands.has("hj:headroom-memory"), false);
+  assert.deepEqual([...commands.keys()].sort(), [
+    "wb:code-graph",
+    "wb:headroom-health",
+    "wb:headroom-memory",
+    "wb:headroom-proxy",
+    "wb:show-system-prompt",
+    "wb:study-mode",
+  ]);
   assert.match(commands.get("wb:headroom-proxy").description, /\/wb:headroom-proxy/);
   assert.match(commands.get("wb:headroom-memory").description, /\/wb:headroom-memory/);
 });
@@ -487,7 +488,7 @@ test("session_start: invalid headroom.json compression disables compression with
         getBranch: () => [
           {
             type: "custom",
-            customType: "pi-workbench-preceptor-mode",
+            customType: "pi-workbench-study-mode",
             data: { enabled: true },
           },
         ],
@@ -501,7 +502,7 @@ test("session_start: invalid headroom.json compression disables compression with
 
     await handlers.get("session_start")({}, ctx);
     assert.ok(statuses.some((status) => status?.includes("Headroom offline")));
-    assert.ok(statuses.some((status) => status?.includes("Learning")));
+    assert.ok(statuses.some((status) => status?.includes("✓ Study")));
     assert.ok(
       notifications.some(({ message, level }) =>
         level === "error" && message.includes("headroom.json compression.mode must be ccr, lossy_inline, or lossless_then_lossy"),
