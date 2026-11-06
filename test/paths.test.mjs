@@ -16,7 +16,7 @@ test("Code Graph keeps distinct managed artifacts, projects and runtime namespac
   const paths = resolveWorkbenchPaths("/tmp/workbench-home");
   const root = join(paths.root, "codebase-memory-mcp");
   assert.equal(paths.codeGraphRoot, root);
-  assert.equal(paths.codeGraphIpc, join(paths.root, "g"));
+  assert.equal(paths.codeGraphIpc, join(paths.root, "run"));
   for (const [field, suffix] of [["codeGraphBin","bin"],["codeGraphDownloads","downloads"],["codeGraphProjects","projects"],["codeGraphRuntime","runtime"],["codeGraphInstallLock","coordination/install.lock"],["codeGraphCurlShim","deny-shims/curl"]]) {
     assert.equal(paths[field], join(root, suffix));
   }

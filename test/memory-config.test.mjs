@@ -69,10 +69,11 @@ test("Memory configuration: resolves project-contained export directory", async 
 });
 
 test("Memory configuration: validates root and namespace values", () => {
-  assert.throws(() => resolveMemoryRoot("relative-memory"), /headroom\.json memoryRoot must be an absolute path/);
+  assert.throws(() => resolveMemoryRoot("relative-memory"), /headroom\.json memory\.root must be an absolute path/);
+  assert.equal(resolveMemoryRoot("~/my-memory"), join(homedir(), "my-memory"));
   assert.equal(parseMemoryNamespace(undefined), "project");
-  assert.throws(() => parseMemoryNamespace(""), /headroom\.json memoryNamespace must be a non-empty single-line value/);
-  assert.throws(() => parseMemoryNamespace("line\nbreak"), /headroom\.json memoryNamespace must be a non-empty single-line value/);
+  assert.throws(() => parseMemoryNamespace(""), /headroom\.json memory\.namespace must be a non-empty single-line value/);
+  assert.throws(() => parseMemoryNamespace("line\nbreak"), /headroom\.json memory\.namespace must be a non-empty single-line value/);
   assert.equal(parseMemoryNamespace("test-namespace"), "test-namespace");
   assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom", "v1", "memory"));
 });

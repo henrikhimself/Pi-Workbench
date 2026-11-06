@@ -408,19 +408,26 @@ test("commands: registers only current Workbench commands", async () => {
   assert.match(commands.get("wb:headroom-memory").description, /\/wb:headroom-memory/);
 });
 
-test("Memory off: refuses noninteractive deletion without explicit confirmation", async () => {
+test("Memory off: refuses noninteractive deletion without explicit confirmation", async (t) => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-command-"));
   const root = join(tempDir, "memory-root");
   const configPath = join(tempDir, "headroom.json");
   const project = join(tempDir, "project");
 
   try {
-    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memoryRoot: root, memoryNamespace: "tester" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memory: { root, namespace: "tester" } }));
     await mkdir(project);
     const memoryConfig = await jiti.import("../src/memory-config.ts");
     const store = memoryConfig.resolveMemoryStore({ cwd: project, root, userId: "tester" });
     const { MemoryManager } = await jiti.import("../src/memory-manager.ts");
     await new MemoryManager({ cwd: project, root, userId: "tester", ensurePython: async () => "/fixture/python" }).createStore();
+    const deleteStore = MemoryManager.prototype.deleteStore;
+    let observedNamespace;
+    MemoryManager.prototype.deleteStore = async function () {
+      observedNamespace = this.store.userId;
+      return deleteStore.call(this);
+    };
+    t.after(() => { MemoryManager.prototype.deleteStore = deleteStore; });
 
     const commands = new Map();
     const notifications = [];
@@ -453,6 +460,7 @@ test("Memory off: refuses noninteractive deletion without explicit confirmation"
 
     await command.handler("off --confirm-delete", ctx);
     assert.equal(existsSync(store.directory), false);
+    assert.equal(observedNamespace, "tester", "extension must pass memory.namespace into MemoryManager");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -465,7 +473,7 @@ test("Memory status: warns once when configured Memory root resolves inside proj
   const configPath = join(tempDir, "headroom.json");
 
   try {
-    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memoryRoot: root }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memory: { root } }));
     await mkdir(project);
     const commands = new Map();
     const notifications = [];
@@ -495,7 +503,7 @@ test("Memory status: warns once when configured Memory root resolves inside proj
     await command.handler("status", ctx);
     await command.handler("status", ctx);
 
-    const rootWarnings = notifications.filter(({ message }) => message.includes("headroom.json memoryRoot resolves inside this project"));
+    const rootWarnings = notifications.filter(({ message }) => message.includes("headroom.json memory.root resolves inside this project"));
     assert.equal(rootWarnings.length, 1);
     assert.equal(rootWarnings[0].level, "warning");
   } finally {

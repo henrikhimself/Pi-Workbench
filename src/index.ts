@@ -219,7 +219,7 @@ export default function piWorkbenchExtension(
   }
 
   function setStudyStatus(ctx: ExtensionContext): void {
-    ctx.ui.setStatus(STUDY_STATUS_KEY, studyEnabled ? colorText(ctx, "success", "✓ Study") : undefined);
+    ctx.ui.setStatus(STUDY_STATUS_KEY, studyEnabled ? colorText(ctx, "success", "✓ Study") : colorText(ctx, "dim", "○ Study off"));
   }
 
   function restoreStudyState(ctx: ExtensionContext): void {
@@ -257,11 +257,11 @@ export default function piWorkbenchExtension(
     try {
       const manager = new MemoryManager({
         cwd: ctx.cwd ?? process.cwd(),
-        root: headroomConfig.memoryRoot,
+        root: headroomConfig.memory?.root,
         defaultRoot: paths.headroomMemory,
         runtime: headroomRuntime,
         signal: sessionAbort.signal,
-        userId: headroomConfig.memoryNamespace,
+        userId: headroomConfig.memory?.namespace,
         exportPath: headroomConfig.memory?.export,
       });
       if (memoryRegistered && memoryRegistrationDirectory !== manager.store.directory) {
@@ -270,7 +270,7 @@ export default function piWorkbenchExtension(
       if ((!passive || manager.enabled) && manager.store.rootConfigured && manager.store.rootInsideProject && !memoryRootWarningShown) {
         memoryRootWarningShown = true;
         ctx.ui.notify(
-          "headroom.json memoryRoot resolves inside this project. Memory SQLite data may enter repository tooling; Git LFS stores blobs but cannot merge database writes.",
+          "headroom.json memory.root resolves inside this project. Memory SQLite data may enter repository tooling; Git LFS stores blobs but cannot merge database writes.",
           "warning",
         );
       }
@@ -510,6 +510,10 @@ export default function piWorkbenchExtension(
     background(restoreCodeGraph(ctx), ctx, "Code Graph startup", generation);
   });
 
+  pi.on("session_tree", (_event, ctx) => {
+    restoreStudyState(ctx);
+  });
+
   pi.on("session_shutdown", async () => {
     sessionClosed = true; lifecycleGeneration++; sessionAbort.abort(); stopProxyWatchdog();
     codeGraphGuidanceActive = false;
@@ -727,17 +731,11 @@ export default function piWorkbenchExtension(
   // ─── /wb:study-mode command — tutor-only lifecycle ───────────────
 
   pi.registerCommand("wb:study-mode", {
-    description: "Toggle tutor-only Study Mode. Usage: /wb:study-mode [on|off|status]",
+    description: "Toggle tutor-only Study Mode. Usage: /wb:study-mode [on|off]",
     handler: async (args, ctx) => {
-      const action = args.trim() || "status";
-      if (action !== "on" && action !== "off" && action !== "status") {
-        ctx.ui.notify("Usage: /wb:study-mode [on|off|status]", "error");
-        return;
-      }
-      if (action === "status") {
-        ctx.ui.notify(studyEnabled
-          ? "Study Mode is on. Study guidance is active; tools and commands remain available."
-          : "Study Mode is off.", "info");
+      const action = args.trim();
+      if (action !== "on" && action !== "off") {
+        ctx.ui.notify("Usage: /wb:study-mode [on|off]", "error");
         return;
       }
       if (action === "on") {

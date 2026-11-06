@@ -11,7 +11,7 @@ const PROJECTS_DIRECTORY = "projects";
 export interface MemoryStore {
   root: string;
   projectPath: string;
-  /** True only when caller explicitly configured headroom.json memoryRoot/options.root. */
+  /** True only when caller explicitly configured headroom.json memory.root/options.root. */
   rootConfigured: boolean;
   /** Root resolves physically inside current project. Allowed, but caller must warn user. */
   rootInsideProject: boolean;
@@ -77,7 +77,7 @@ export function resolveMemoryRoot(value: string | undefined): string {
     : value;
 
   if (!isAbsolute(expanded)) {
-    throw new Error(`headroom.json memoryRoot must be an absolute path; received ${JSON.stringify(value)}`);
+    throw new Error(`headroom.json memory.root must be an absolute path; received ${JSON.stringify(value)}`);
   }
 
   return resolve(expanded);
@@ -105,7 +105,7 @@ export function resolveMemoryExportDirectory(projectPath: string, value: string)
 export function parseMemoryNamespace(value: string | undefined): string {
   const namespace = value ?? "project";
   if (namespace.length === 0 || /[\r\n\0]/.test(namespace)) {
-    throw new Error("headroom.json memoryNamespace must be a non-empty single-line value");
+    throw new Error("headroom.json memory.namespace must be a non-empty single-line value");
   }
   return namespace;
 }

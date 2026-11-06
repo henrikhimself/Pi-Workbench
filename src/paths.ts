@@ -23,7 +23,7 @@ export function resolveWorkbenchPaths(home: string = homedir()): WorkbenchPaths 
   return {
     root, headroomRoot, headroomMemory: join(headroomRoot, "memory"), headroomConfig: join(root, "headroom.json"),
     codeGraphRoot: graph, codeGraphBin: join(graph, "bin"), codeGraphDownloads: join(graph, "downloads"),
-    codeGraphProjects: join(graph, "projects"), codeGraphRuntime: join(graph, "runtime"), codeGraphIpc: join(root, "g"),
+    codeGraphProjects: join(graph, "projects"), codeGraphRuntime: join(graph, "runtime"), codeGraphIpc: join(root, "run"),
     codeGraphInstallLock: join(graph, "coordination", "install.lock"), codeGraphCurlShim: join(graph, "deny-shims", "curl"),
   };
 }

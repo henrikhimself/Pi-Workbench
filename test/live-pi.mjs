@@ -39,7 +39,7 @@ try {
   for (const dir of [userHome, agent, paths.root]) await mkdir(dir, { recursive: true, mode: 0o700 });
   const listener = createServer(); await new Promise(resolve => listener.listen(0, "127.0.0.1", resolve));
   const port = listener.address().port; await new Promise(resolve => listener.close(resolve));
-  await writeFile(paths.headroomConfig, JSON.stringify({ schemaVersion: 1, port, memoryNamespace: "fixture", compression: { mode: "lossless_then_lossy", protectAnalysisContext: true, protectRecent: 3 } }));
+  await writeFile(paths.headroomConfig, JSON.stringify({ schemaVersion: 1, port, memory: { namespace: "fixture" }, compression: { mode: "lossless_then_lossy", protectAnalysisContext: true, protectRecent: 3 } }));
   const definition = { id: modelId, reasoning: true, input: ["text"], contextWindow: loaded.context_length, maxTokens: 512,
     compat: { thinkingFormat: "qwen-chat-template", thinkingTokenBudgetField: "thinking_budget_tokens" } };
   await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { "llama.cpp": { baseUrl: base.replace(/\/$/, "") + "/v1", api: "openai-completions", apiKey: "${LLAMA_API_KEY}", models: [definition] } } }));

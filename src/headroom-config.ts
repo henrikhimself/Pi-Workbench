@@ -14,12 +14,12 @@ export interface HeadroomConfig {
   port?: number;
   /** Supported per-request compression overrides. */
   compression?: HeadroomCompressionConfig;
-  /** Absolute or ~/ path for project-scoped Memory data. */
-  memoryRoot?: string;
-  /** Logical namespace passed as Headroom Memory MCP user ID. Default: project. */
-  memoryNamespace?: string;
-  /** Project-relative directory containing versioned Memory bundle files. */
   memory?: {
+    /** Absolute or ~/ path for project-scoped Memory data. */
+    root?: string;
+    /** Logical namespace passed as Headroom Memory MCP user ID. Default: project. */
+    namespace?: string;
+    /** Project-relative directory containing versioned Memory bundle files. */
     export?: string;
   };
 }
@@ -46,16 +46,29 @@ function parseMemoryConfig(value: unknown): NonNullable<HeadroomConfig["memory"]
   }
   const source = value as Record<string, unknown>;
   for (const key of Object.keys(source)) {
-    if (key !== "export") throw configError(`memory.${key} is not supported.`);
+    if (key !== "root" && key !== "namespace" && key !== "export") throw configError(`memory.${key} is not supported.`);
   }
-  if (source.export === undefined) return {};
+  const memory: NonNullable<HeadroomConfig["memory"]> = {};
+  if (source.root !== undefined) {
+    if (typeof source.root !== "string" || source.root.length === 0) {
+      throw configError("memory.root must be a non-empty string when configured.");
+    }
+    memory.root = source.root;
+  }
+  if (source.namespace !== undefined) {
+    if (typeof source.namespace !== "string" || source.namespace.length === 0 || /[\r\n\0]/.test(source.namespace)) {
+      throw configError("memory.namespace must be a non-empty single-line string when configured.");
+    }
+    memory.namespace = source.namespace;
+  }
+  if (source.export === undefined) return memory;
   if (typeof source.export !== "string" || source.export.length === 0 || /[\r\n\0]/.test(source.export)) {
     throw configError("memory.export must be a non-empty single-line path.");
   }
   if (isAbsolute(source.export)) {
     throw configError("memory.export must be a project-relative path.");
   }
-  return { export: source.export };
+  return { ...memory, export: source.export };
 }
 
 function parseCompressionConfig(value: unknown): HeadroomCompressionConfig {
@@ -106,11 +119,11 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
   const source = value as Record<string, unknown>;
   if ("url" in source) throw configError("url is unsupported; only extension-managed Headroom is allowed.");
   if (source.schemaVersion !== 1) throw configError("requires fresh schemaVersion: 1 configuration. Existing file was not changed; replace it manually using documented fresh setup.");
-  const keys = ["schemaVersion", "port", "memoryRoot", "memoryNamespace", "memory", "compression"];
+  const keys = ["schemaVersion", "port", "memory", "compression"];
   for (const key of Object.keys(source)) if (!keys.includes(key)) throw configError(`${key} is not supported.`);
   const config: HeadroomConfig = { schemaVersion: 1 };
 
-  for (const key of ["port", "memoryRoot", "memoryNamespace", "memory", "compression"]) {
+  for (const key of ["port", "memory", "compression"]) {
     if (source[key] === undefined) continue;
     if (key === "port") {
       config.port = source.port as number;
@@ -124,14 +137,6 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
       config.memory = parseMemoryConfig(source.memory);
       continue;
     }
-    if (typeof source[key] !== "string" || source[key].length === 0) {
-      throw configError(`${key} must be a non-empty string when configured.`);
-    }
-    if (key === "memoryNamespace" && /[\r\n\0]/.test(source.memoryNamespace as string)) {
-      throw configError("memoryNamespace must be a non-empty single-line string when configured.");
-    }
-    if (key === "memoryRoot") config.memoryRoot = source.memoryRoot as string;
-    else if (key === "memoryNamespace") config.memoryNamespace = source.memoryNamespace as string;
   }
 
   config.port = parseHeadroomPort(config.port);
