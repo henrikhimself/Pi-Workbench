@@ -1,7 +1,7 @@
 /**
  * Regression tests for extension-level context behavior.
  */
-import { test } from "node:test";
+import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { mkdir, open, rm, mkdtemp, writeFile } from "node:fs/promises";
@@ -10,6 +10,47 @@ import { join } from "node:path";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
+const fixtureHomes = [], fixtureShutdowns = [];
+afterEach(async () => {
+  for (const shutdown of fixtureShutdowns.splice(0)) await shutdown();
+  for (const home of fixtureHomes.splice(0)) await rm(home, { recursive: true, force: true });
+});
+async function installExtension(mod, pi, options = {}) {
+  const home = await mkdtemp(join(tmpdir(), "wb-index-isolated-")); fixtureHomes.push(home);
+  const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
+  const paths = resolveWorkbenchPaths(home);
+  const { probeHealth = false, ...extensionOptions } = options;
+  const configPath = options.headroomConfigPath ?? paths.headroomConfig;
+  if (!options.headroomConfigPath) {
+    await mkdir(paths.root, { recursive: true, mode: 0o700 });
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
+  }
+  const proxyManager = {
+    isManaged: true, baseUrl: "http://127.0.0.1:8787",
+    resume() {}, stop: async () => {}, ensureRunning: async () => true, tryRestart: async () => false,
+    requestOwned: async (path, body, method) => {
+      const response = await globalThis.fetch("http://127.0.0.1:8787" + path, { method, body: JSON.stringify(body) });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
+    },
+    healthCheck: async () => {
+      if (!probeHealth) return true;
+      try {
+        const response = await globalThis.fetch("http://127.0.0.1:8787/health");
+        return response.ok && (await response.json()).version === "0.41.0";
+      } catch { return false; }
+    },
+  };
+  const commands = new Map(), handlers = new Map();
+  mod.default({ ...pi,
+    on: (name, handler) => { handlers.set(name, handler); return pi.on?.(name, handler); },
+    registerCommand: (name, command) => { commands.set(name, command); pi.registerCommand?.(name, command); },
+  }, { workbenchPaths: paths, headroomConfigPath: configPath, proxyManager, ...extensionOptions });
+  fixtureShutdowns.push(() => handlers.get("session_shutdown")());
+  // Compression-specific tests explicitly opt their isolated workspace in.
+  await commands.get("wb:headroom-proxy").handler("on", { cwd: home, ui: { setStatus() {}, notify() {} } });
+  return { commands, home, paths };
+}
 
 test("context: compression failure marks proxy offline instead of accepting an SDK fallback", async () => {
   const originalFetch = globalThis.fetch;
@@ -18,7 +59,7 @@ test("context: compression failure marks proxy offline instead of accepting an S
   let fetchCalls = 0;
 
   try {
-    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:1" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
     globalThis.fetch = async () => {
       fetchCalls++;
       throw new Error("connection refused");
@@ -34,7 +75,7 @@ test("context: compression failure marks proxy offline instead of accepting an S
     };
 
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath, probeHealth: true });
 
     const statuses = [];
     const statusKeys = [];
@@ -73,14 +114,14 @@ test("context: compression failure marks proxy offline instead of accepting an S
   }
 });
 
-test("context: version-mismatched external proxy remains fail-open", async () => {
+test("context: version-mismatched managed proxy remains fail-open", async () => {
   const originalFetch = globalThis.fetch;
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-mismatch-config-"));
   const configPath = join(tempDir, "headroom.json");
   let compressionRequests = 0;
 
   try {
-    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
     globalThis.fetch = async (url) => {
       if (String(url).endsWith("/health")) {
         return new Response(JSON.stringify({ version: "0.40.0" }), { status: 200, headers: { "content-type": "application/json" } });
@@ -98,7 +139,7 @@ test("context: version-mismatched external proxy remains fail-open", async () =>
       registerCommand() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath, probeHealth: true });
     const notifications = [];
     const result = await handlers.get("context")({ messages: [{ role: "user", content: "keep original", timestamp: 1 }] }, {
       model: { id: "test-model" },
@@ -111,7 +152,7 @@ test("context: version-mismatched external proxy remains fail-open", async () =>
 
     assert.equal(result, undefined);
     assert.equal(compressionRequests, 0);
-    assert.ok(notifications.some(({ message }) => message.includes("version mismatch")));
+    assert.ok(notifications.some(({ message }) => message.includes("unavailable")));
   } finally {
     globalThis.fetch = originalFetch;
     await rm(tempDir, { recursive: true, force: true });
@@ -126,7 +167,8 @@ test("context: forwards configured compression overrides to Headroom", async () 
 
   try {
     await writeFile(configPath, JSON.stringify({
-      url: "http://127.0.0.1:8787",
+      schemaVersion: 1,
+      port: 8787,
       compression: {
         mode: "lossless_then_lossy",
         targetRatio: 0.8,
@@ -162,7 +204,7 @@ test("context: forwards configured compression overrides to Headroom", async () 
       registerCommand() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath });
     await handlers.get("context")({ messages: [{ role: "user", content: "compress me", timestamp: 1 }] }, {
       model: { id: "test-model" },
       ui: {
@@ -209,7 +251,7 @@ test("context: image safety fallback does not report unapplied compression savin
       registerCommand() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi);
+    await installExtension(mod, pi);
 
     const statuses = [];
     const event = {
@@ -247,7 +289,7 @@ test("context: healthy proxy compression failure stays online", async () => {
   let healthChecks = 0;
 
   try {
-    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
     globalThis.fetch = async (url) => {
       if (String(url).endsWith("/health")) {
         healthChecks++;
@@ -266,7 +308,7 @@ test("context: healthy proxy compression failure stays online", async () => {
       registerCommand() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath, probeHealth: true });
 
     const statuses = [];
     const notifications = [];
@@ -302,13 +344,13 @@ test("context: healthy proxy compression failure stays online", async () => {
   }
 });
 
-test("commands: external proxy status reports health version", async () => {
+test("commands: managed proxy status reports attested health version", async () => {
   const originalFetch = globalThis.fetch;
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-status-config-"));
   const configPath = join(tempDir, "headroom.json");
 
   try {
-    await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:8787" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
     globalThis.fetch = async () => new Response(JSON.stringify({ version: "0.41.0" }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -323,14 +365,14 @@ test("commands: external proxy status reports health version", async () => {
       },
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath, probeHealth: true });
     const notifications = [];
     await commands.get("wb:headroom-proxy").handler("status", {
       ui: { notify: (message, level) => notifications.push({ message, level }) },
     });
 
     assert.ok(notifications.some(({ message }) =>
-      message.includes("Version: 0.41.0 (external /health)") && message.includes("Expected: 0.41.0 (extension)"),
+      message.includes("Version: 0.41.0 (managed /health)") && message.includes("Expected: 0.41.0 (extension)"),
     ));
   } finally {
     globalThis.fetch = originalFetch;
@@ -338,7 +380,7 @@ test("commands: external proxy status reports health version", async () => {
   }
 });
 
-test("commands: registers wb proxy and Memory commands, not legacy namespaces", async () => {
+test("commands: registers only current Workbench commands", async () => {
   const commands = new Map();
   const pi = {
     on() {
@@ -352,33 +394,40 @@ test("commands: registers wb proxy and Memory commands, not legacy namespaces", 
   };
 
   const mod = await jiti.import("../src/index.ts");
-  mod.default(pi);
+  await installExtension(mod, pi);
 
-  assert.ok(commands.has("wb:headroom-proxy"));
-  assert.ok(commands.has("wb:headroom-memory"));
-  assert.ok(commands.has("wb:headroom-health"));
-  assert.equal(commands.has("headroom"), false);
-  assert.equal(commands.has("headroom-health"), false);
-  assert.equal(commands.has("hj:headroom-proxy"), false);
-  assert.equal(commands.has("hj:headroom-memory"), false);
+  assert.deepEqual([...commands.keys()].sort(), [
+    "wb:code-graph",
+    "wb:headroom-health",
+    "wb:headroom-memory",
+    "wb:headroom-proxy",
+    "wb:show-system-prompt",
+    "wb:study-mode",
+  ]);
   assert.match(commands.get("wb:headroom-proxy").description, /\/wb:headroom-proxy/);
   assert.match(commands.get("wb:headroom-memory").description, /\/wb:headroom-memory/);
 });
 
-test("Memory off: refuses noninteractive deletion without explicit confirmation", async () => {
+test("Memory off: refuses noninteractive deletion without explicit confirmation", async (t) => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-command-"));
   const root = join(tempDir, "memory-root");
   const configPath = join(tempDir, "headroom.json");
   const project = join(tempDir, "project");
 
   try {
-    await writeFile(configPath, JSON.stringify({ memoryRoot: root, memoryNamespace: "tester" }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memory: { root, namespace: "tester" } }));
     await mkdir(project);
     const memoryConfig = await jiti.import("../src/memory-config.ts");
     const store = memoryConfig.resolveMemoryStore({ cwd: project, root, userId: "tester" });
-    await mkdir(store.directory, { recursive: true });
-    const handle = await open(store.databasePath, "a");
-    await handle.close();
+    const { MemoryManager } = await jiti.import("../src/memory-manager.ts");
+    await new MemoryManager({ cwd: project, root, userId: "tester", ensurePython: async () => "/fixture/python" }).createStore();
+    const deleteStore = MemoryManager.prototype.deleteStore;
+    let observedNamespace;
+    MemoryManager.prototype.deleteStore = async function () {
+      observedNamespace = this.store.userId;
+      return deleteStore.call(this);
+    };
+    t.after(() => { MemoryManager.prototype.deleteStore = deleteStore; });
 
     const commands = new Map();
     const notifications = [];
@@ -393,7 +442,7 @@ test("Memory off: refuses noninteractive deletion without explicit confirmation"
       unregisterMcpServer() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath });
 
     const ctx = {
       cwd: project,
@@ -411,6 +460,7 @@ test("Memory off: refuses noninteractive deletion without explicit confirmation"
 
     await command.handler("off --confirm-delete", ctx);
     assert.equal(existsSync(store.directory), false);
+    assert.equal(observedNamespace, "tester", "extension must pass memory.namespace into MemoryManager");
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -423,7 +473,7 @@ test("Memory status: warns once when configured Memory root resolves inside proj
   const configPath = join(tempDir, "headroom.json");
 
   try {
-    await writeFile(configPath, JSON.stringify({ memoryRoot: root }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, memory: { root } }));
     await mkdir(project);
     const commands = new Map();
     const notifications = [];
@@ -438,7 +488,7 @@ test("Memory status: warns once when configured Memory root resolves inside proj
       unregisterMcpServer() {},
     };
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    await installExtension(mod, pi, { headroomConfigPath: configPath });
     const ctx = {
       cwd: project,
       hasUI: false,
@@ -453,7 +503,7 @@ test("Memory status: warns once when configured Memory root resolves inside proj
     await command.handler("status", ctx);
     await command.handler("status", ctx);
 
-    const rootWarnings = notifications.filter(({ message }) => message.includes("headroom.json memoryRoot resolves inside this project"));
+    const rootWarnings = notifications.filter(({ message }) => message.includes("headroom.json memory.root resolves inside this project"));
     assert.equal(rootWarnings.length, 1);
     assert.equal(rootWarnings[0].level, "warning");
   } finally {
@@ -466,7 +516,7 @@ test("session_start: invalid headroom.json compression disables compression with
   const configPath = join(tempDir, "headroom.json");
 
   try {
-    await writeFile(configPath, JSON.stringify({ compression: { mode: "token" } }));
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, compression: { mode: "token" } }));
 
     const handlers = new Map();
     const pi = {
@@ -478,16 +528,17 @@ test("session_start: invalid headroom.json compression disables compression with
     };
 
     const mod = await jiti.import("../src/index.ts");
-    mod.default(pi, { headroomConfigPath: configPath });
+    const fixture = await installExtension(mod, pi, { headroomConfigPath: configPath });
 
     const statuses = [];
     const notifications = [];
     const ctx = {
+      cwd: fixture.home,
       sessionManager: {
         getBranch: () => [
           {
             type: "custom",
-            customType: "pi-workbench-preceptor-mode",
+            customType: "pi-workbench-study-mode",
             data: { enabled: true },
           },
         ],
@@ -500,8 +551,9 @@ test("session_start: invalid headroom.json compression disables compression with
     };
 
     await handlers.get("session_start")({}, ctx);
+    for (let attempt = 0; attempt < 100 && !notifications.length; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.ok(statuses.some((status) => status?.includes("Headroom offline")));
-    assert.ok(statuses.some((status) => status?.includes("Learning")));
+    assert.ok(statuses.some((status) => status?.includes("✓ Study")));
     assert.ok(
       notifications.some(({ message, level }) =>
         level === "error" && message.includes("headroom.json compression.mode must be ccr, lossy_inline, or lossless_then_lossy"),
@@ -510,4 +562,25 @@ test("session_start: invalid headroom.json compression disables compression with
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+
+test("context: unsupported URL config sends no context and never rewrites existing file", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "wb-config-clean-break-"));
+  const configPath = join(tempDir, "headroom.json");
+  const originalFetch = globalThis.fetch;
+  try {
+    const original = JSON.stringify({ url: "http://127.0.0.1:8787", memoryRoot: "/old-store" });
+    await writeFile(configPath, original);
+    let requests = 0; globalThis.fetch = async () => { requests++; throw new Error("must not contact URL"); };
+    const handlers = new Map(), notifications = [];
+    const mod = await jiti.import("../src/index.ts");
+    const fixture = await installExtension(mod, { on: (name, handler) => handlers.set(name, handler), registerCommand() {} }, { headroomConfigPath: configPath });
+    const ctx = { cwd: fixture.home, ui: { theme: { fg: (_color, text) => text }, setStatus() {}, notify: message => notifications.push(message) } };
+    await fixture.commands.get("wb:headroom-proxy").handler("on", ctx);
+    const result = await handlers.get("context")({ messages: [{ role: "user", content: "private synthetic context", timestamp: 1 }] }, ctx);
+    assert.equal(result, undefined); assert.equal(requests, 0);
+    assert.ok(notifications.some(message => message.includes("url is unsupported")));
+    assert.equal(await (await import("node:fs/promises")).readFile(configPath, "utf8"), original);
+  } finally { globalThis.fetch = originalFetch; await rm(tempDir, { recursive: true, force: true }); }
 });

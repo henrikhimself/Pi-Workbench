@@ -86,5 +86,7 @@ test("Headroom health: rejects malformed, missing-version, and failed responses"
     assert.deepEqual(await getHeadroomHealth(baseUrl, 1_000), { ok: false, reason: "http_error" });
   });
 
-  assert.deepEqual(await getHeadroomHealth("http://127.0.0.1:1", 1_000), { ok: false, reason: "unreachable" });
+  await withHealthServer(res => res.destroy(), async baseUrl => {
+    assert.deepEqual(await getHeadroomHealth(baseUrl, 1_000), { ok: false, reason: "unreachable" });
+  });
 });

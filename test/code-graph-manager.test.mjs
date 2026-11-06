@@ -28,7 +28,6 @@ const {
 const { detectCodeGraphPlatform, installedBinaryPath } = await jiti.import("../src/code-graph-installer.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 
-const REAL_CBM_BINARY = "/tmp/cbm-v081.cyG8Me/extracted/codebase-memory-mcp";
 
 
 async function writeFakeCbm(dir, name, config = {}) {
@@ -72,14 +71,14 @@ async function makeFixture() {
   };
 }
 
-async function writeValidState(project, paths, fakeDir, { version = "v0.8.1" } = {}) {
+async function writeValidState(project, paths, fakeDir, { version = "v0.12.1" } = {}) {
   const binary = await writeFakeCbm(fakeDir, `cbm-state-${version.replace(/\./g, "-")}.cjs`, {});
   await mkdir(project.directory, { recursive: true });
   await writeFile(join(project.directory, "_config.db"), "auto_index = true\n", "utf8");
   await writeFile(join(project.directory, "derived-project.db"), "INDEX", "utf8");
   const state = createCodeGraphState(project, {
     version,
-    resolvedUrl: "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
+    resolvedUrl: "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64.tar.gz",
     sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
   });
   await writeCodeGraphStateAtomic(project, state);
@@ -87,10 +86,10 @@ async function writeValidState(project, paths, fakeDir, { version = "v0.8.1" } =
 }
 
 const FAKE_SHA = "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091";
-const FAKE_URL = "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz";
+const FAKE_URL = "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64.tar.gz";
 
 function installResult(binaryPath) {
-  return { path: binaryPath, version: "v0.8.1", resolvedUrl: FAKE_URL, sha256: FAKE_SHA, reused: true };
+  return { path: binaryPath, version: "v0.12.1", resolvedUrl: FAKE_URL, sha256: FAKE_SHA, reused: true };
 }
 
 function okHandshake(overrides = {}) {
@@ -120,6 +119,18 @@ test("ensureCurlDenyShim creates an executable deny script atomically", async ()
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+});
+
+test("same-process concurrent deny shim publication cannot collide at identical clock tick", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cg-shim-race-")), clock = Date.now;
+  try {
+    Date.now = () => 1770000000000;
+    const shimPath = join(dir, "curl");
+    const results = await Promise.allSettled(Array.from({ length: 32 }, () => ensureCurlDenyShim(shimPath)));
+    assert.ok(results.every(result => result.status === "fulfilled"), JSON.stringify(results.filter(result => result.status === "rejected").map(result => String(result.reason))));
+    assert.equal(await readFile(shimPath, "utf8"), "#!/bin/sh\nexit 3\n");
+    assert.deepEqual(await readdir(dir), ["curl"]);
+  } finally { Date.now = clock; await rm(dir, { recursive: true, force: true }); }
 });
 
 test("curlShimDirectory returns the PATH entry to prepend", () => {
@@ -163,7 +174,7 @@ function probeEnv(cacheDir) {
 
 // ─── MCP handshake probe ──────────────────────────────────────────────
 
-test("handshake probe validates initialize + 14 tools and kills the probe", async () => {
+test("handshake probe validates initialize + 17 tools and kills the probe", async () => {
   const dir = await mkdtemp(join(tmpdir(), "cg-hs-"));
   const workspace = await mkdtemp(join(tmpdir(), "cg-hs-ws-"));
   let cleaned = false;
@@ -177,14 +188,14 @@ test("handshake probe validates initialize + 14 tools and kills the probe", asyn
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, true);
-    assert.equal(result.tools.length, 14);
-    assert.equal(result.tools[0], "tool_0");
+    assert.equal(result.tools.length, 17);
+    assert.equal(result.tools[0], "index_repository");
     await new Promise((r) => setTimeout(r, 150));
     const marker = await readFile(killedMarker, "utf8").catch(() => null);
-    assert.equal(marker, "killed");
+    assert.equal(marker, "closed");
   } finally {
     if (!cleaned) {
       await rm(dir, { recursive: true, force: true });
@@ -205,10 +216,10 @@ test("handshake probe rejects wrong tool count", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
-    assert.match(result.detail ?? "", /tool count mismatch: got 13, expected 14/);
+    assert.match(result.detail ?? "", /tool count mismatch: got 13, expected 17/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(workspace, { recursive: true, force: true });
@@ -227,7 +238,7 @@ test("handshake probe rejects noisy (non-JSON-RPC) stdout", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /non-JSON-RPC/);
@@ -249,7 +260,7 @@ test("handshake probe rejects protocol version mismatch", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /protocol mismatch/);
@@ -271,7 +282,7 @@ test("handshake probe times out on a hanging server", async () => {
       cwd: workspace,
       env,
       timeoutMs: 700,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /timed out/);
@@ -295,7 +306,7 @@ test("handshake probe reports early exit", async () => {
       cwd: workspace,
       env,
       timeoutMs: 10_000,
-      expectedToolCount: 14,
+      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /exited before handshake/);
@@ -325,8 +336,8 @@ test("activate: full transaction publishes state, registers MCP, reports tools",
     const result = await manager.activate(fx.project);
     assert.equal(result.ok, true);
     assert.equal(result.alreadyOn, false);
-    assert.equal(result.tools.length, 14);
-    assert.equal(result.state.version, "v0.8.1");
+    assert.equal(result.tools.length, 17);
+    assert.equal(result.state.version, "v0.12.1");
 
     // State + CBM data published below the project directory only.
     const stateCheck = validateCodeGraphState(fx.project);
@@ -342,8 +353,9 @@ test("activate: full transaction publishes state, registers MCP, reports tools",
     assert.equal(registered.length, 1);
     assert.equal(registered[0].name, CODE_GRAPH_MCP_SERVER_NAME);
     const config = registered[0].config;
-    assert.equal(config.command, binary);
-    assert.deepEqual(config.args, []);
+    assert.equal(config.command, process.execPath);
+    assert.equal(JSON.parse(config.args[1]).command, binary);
+    assert.deepEqual(JSON.parse(config.args[1]).args, ["--ui=false", "--quiet", "--repo-path", fx.project.projectPath]);
     assert.equal(config.cwd, fx.project.projectPath);
     assert.equal(config.exposure, "direct");
     assert.equal(config.env.CBM_CACHE_DIR, fx.project.directory);
@@ -406,17 +418,17 @@ test("activate: workspace path with spaces and shell metacharacters stays a JSON
           if (args[0] === "config" && args[1] === "get") {
             return { exitCode: 0, stdout: "true\n", stderr: "" };
           }
-          if (args[0] === "cli" && args[1] === "index_repository") {
-            const request = JSON.parse(args[2]);
-            assert.equal(request.repo_path, project.projectPath);
+          if (args[0] === "cli" && args[2] === "index_repository") {
+            assert.equal(args[3], "--repo-path");
+            assert.equal(args[4], project.projectPath);
             const projectName = project.projectPath.replace(/^\//, "").replace(/\//g, "-");
             await writeFile(join(options.env.CBM_CACHE_DIR, `${projectName}.db`), "INDEX");
             return { exitCode: 0, stdout: JSON.stringify({ project: projectName, status: "indexed" }) + "\n", stderr: "" };
           }
-          if (args[0] === "cli" && args[1] === "list_projects") {
+          if (args[0] === "cli" && args[2] === "list_projects") {
             return { exitCode: 0, stdout: JSON.stringify({ projects: ["p"] }) + "\n", stderr: "" };
           }
-          if (args[0] === "cli" && args[1] === "index_status") {
+          if (args[0] === "cli" && args[2] === "index_status") {
             return { exitCode: 0, stdout: JSON.stringify({ project: "p", status: "ready" }) + "\n", stderr: "" };
           }
           throw new Error(`unexpected args: ${JSON.stringify(args)}`);
@@ -427,9 +439,9 @@ test("activate: workspace path with spaces and shell metacharacters stays a JSON
     );
     const result = await manager.activate(project);
     assert.equal(result.ok, true);
-    const indexCall = recorded.find((call) => call.args[1] === "index_repository");
+    const indexCall = recorded.find((call) => call.args[2] === "index_repository");
     assert.ok(indexCall);
-    assert.deepEqual(JSON.parse(indexCall.args[2]), { repo_path: project.projectPath });
+    assert.equal(indexCall.args[4], project.projectPath);
     // Every owned call ran from the workspace root with the minimal env.
     for (const call of recorded) {
       assert.equal(call.cwd, project.projectPath);
@@ -581,7 +593,7 @@ test("restore: valid state restores registration with verified binary", async ()
     const result = await manager.restore(fx.project);
     assert.equal(result.ok, true);
     assert.equal(result.alreadyOn, true);
-    assert.equal(result.tools.length, 14);
+    assert.equal(result.tools.length, 17);
     assert.deepEqual(registered, [CODE_GRAPH_MCP_SERVER_NAME]);
   } finally {
     await fx.cleanup();
@@ -615,7 +627,7 @@ test("restore: _config.db without auto_index=true is corrupt, not auto-repaired"
   }
 });
 
-test("restore: packaged update failure falls back to prior verified binary", { skip: detectCodeGraphPlatform({ os: process.platform, arch: process.arch }) === null ? "host platform outside approved scope" : false }, async () => {
+test("restore: packaged update failure never executes prior binary", { skip: detectCodeGraphPlatform({ os: process.platform, arch: process.arch }) === null ? "host platform outside approved scope" : false }, async () => {
   const fx = await makeFixture();
   try {
     const { state } = await writeValidState(fx.project, fx.paths, fx.fakeDir);
@@ -644,10 +656,10 @@ test("restore: packaged update failure falls back to prior verified binary", { s
       }),
     );
     const result = await manager.restore(fx.project);
-    assert.equal(result.ok, true);
-    assert.equal(result.binaryPath, join(priorDir, "codebase-memory-mcp"));
-    assert.deepEqual(registered, [CODE_GRAPH_MCP_SERVER_NAME]);
-    assert.ok(statuses.some((message) => message.includes("retaining verified")));
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, "binary_missing");
+    assert.deepEqual(registered, []);
+    assert.ok(!statuses.some((message) => message.includes("retaining verified")));
   } finally {
     await fx.cleanup();
   }
@@ -693,10 +705,10 @@ test("stop is idempotent and only releases the owned registration", async () => 
     );
     const result = await manager.activate(fx.project);
     assert.equal(result.ok, true);
-    manager.stop(fx.project);
+    await manager.stop(fx.project);
     assert.equal(manager.isMcpRegistered, false);
-    manager.stop(fx.project); // idempotent
-    manager.shutdown(); // no-op after stop
+    await manager.stop(fx.project); // idempotent
+    await manager.shutdown(); // no-op after stop
     assert.deepEqual(unregistered, [CODE_GRAPH_MCP_SERVER_NAME]);
   } finally {
     await fx.cleanup();
@@ -716,7 +728,7 @@ test("shutdown releases the owned registration on session end", async () => {
       }),
     );
     await manager.activate(fx.project);
-    manager.shutdown();
+    await manager.shutdown();
     assert.deepEqual(unregistered, [CODE_GRAPH_MCP_SERVER_NAME]);
     assert.equal(manager.isMcpRegistered, false);
   } finally {
@@ -740,10 +752,10 @@ test("sibling workspace stop does not touch this registration", async () => {
         }),
       );
       await manager.activate(fx.project);
-      manager.stop(sibling); // different project: no-op
+      await manager.stop(sibling); // different project: no-op
       assert.equal(manager.isMcpRegistered, true);
       assert.deepEqual(unregistered, []);
-      manager.stop(fx.project);
+      await manager.stop(fx.project);
       assert.deepEqual(unregistered, [CODE_GRAPH_MCP_SERVER_NAME]);
     } finally {
       await rm(siblingWorkspace, { recursive: true, force: true });
@@ -760,7 +772,7 @@ test("buildStatusReport reflects state without side effects", async () => {
     const off = await manager.buildStatusReport({
       project: fx.project,
       platform: "linux-arm64",
-      manifestVersion: "v0.8.1",
+      manifestVersion: "v0.12.1",
     });
     assert.equal(off.kind, "off");
     assert.equal(off.recovery, "Run /wb:code-graph on to enable code graph for this workspace.");
@@ -769,8 +781,8 @@ test("buildStatusReport reflects state without side effects", async () => {
     const enabled = await manager.buildStatusReport({
       project: fx.project,
       platform: "linux-arm64",
-      manifestVersion: "v0.8.1",
-      installedVersion: "v0.8.1",
+      manifestVersion: "v0.12.1",
+      installedVersion: "v0.12.1",
       indexSummary: "project p: ready, 3 nodes, 2 edges",
     });
     assert.equal(enabled.kind, "enabled");
@@ -793,30 +805,7 @@ test("guidance message exists and mentions verification", () => {
 
 // ─── Real binary integration (gated on spike artifact) ────────────────
 
-test(
-  "handshake probe validates the real CBM v0.8.1 binary (14 tools, clean stdout)",
-  { skip: (await stat(REAL_CBM_BINARY).then(() => false, () => true)) ? "spike binary not present" : false, timeout: 60_000 },
-  async () => {
-    const dir = await mkdtemp(join(tmpdir(), "cg-hs-real-"));
-    const workspace = await mkdtemp(join(tmpdir(), "cg-hs-real-ws-"));
-    try {
-      const env = { PATH: "/usr/bin:/bin", HOME: "/tmp", LANG: "C.UTF-8", CBM_CACHE_DIR: dir, CBM_LOG_LEVEL: "error" };
-      const result = await defaultMcpHandshakeRunner()({
-        command: REAL_CBM_BINARY,
-        args: [],
-        cwd: workspace,
-        env,
-        timeoutMs: 45_000,
-        expectedToolCount: 14,
-      });
-      assert.equal(result.ok, true, result.detail);
-      assert.equal(result.tools.length, 14);
-    } finally {
-      await rm(dir, { recursive: true, force: true });
-      await rm(workspace, { recursive: true, force: true });
-    }
-  },
-);
+// Real artifacts belong in the explicit opt-in runtime harness.
 
 test("createCodeGraphManager builds a production-bound manager", async () => {
   const fx = await makeFixture();
@@ -835,9 +824,45 @@ test("createCodeGraphManager builds a production-bound manager", async () => {
     const result = await manager.activate(fx.project);
     assert.equal(result.ok, true);
     assert.equal(registered, true);
-    manager.shutdown();
+    await manager.shutdown();
     assert.equal(registered, true);
   } finally {
     await fx.cleanup();
   }
+});
+
+
+test("failed unregister retains intent lease and prevents data deletion until successful retry", async () => {
+  const fixture = await makeFixture(); let broken = true;
+  const { activeConsumers } = await jiti.import("../src/managed-lifecycle.ts");
+  const { binary } = await writeValidState(fixture.project, fixture.paths, fixture.fakeDir);
+  const manager = new CodeGraphManager(fixture.makeDeps({ ensureInstalled: async () => installResult(binary),
+    registerMcp: () => {}, unregisterMcp: () => { if (broken) throw new Error("injected unregister failure"); } }));
+  try {
+    assert.equal((await manager.restore(fixture.project)).ok, true);
+    const original = await readFile(fixture.project.statePath, "utf8");
+    await assert.rejects(manager.stop(fixture.project), /injected unregister/);
+    assert.equal(manager.isMcpRegistered, true);
+    assert.equal((await activeConsumers(join(fixture.paths.codeGraphRuntime, "consumers", fixture.project.identifier))).length, 1);
+    await assert.rejects(manager.removeProject(fixture.project), /Active workspace consumers/);
+    assert.equal(await readFile(fixture.project.statePath, "utf8"), original);
+    broken = false; await manager.stop(fixture.project); await manager.removeProject(fixture.project);
+  } finally { broken = false; await manager.shutdown(); await fixture.cleanup(); }
+});
+
+
+test("owned CBM environment isolates HOME and bounds canonical private IPC paths", async () => {
+  const fx = await makeFixture();
+  try {
+    const binary = await writeFakeCbm(fx.fakeDir, "fixture.cjs");
+    const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: () => {} }));
+    const env = manager.getMcpConfig(fx.project, binary).env;
+    assert.equal(env.HOME, join(fx.paths.codeGraphRuntime, "homes", fx.project.identifier));
+    assert.equal(env.XDG_CONFIG_HOME, join(env.HOME, "config"));
+    assert.ok(env.CBM_RUNTIME_DIR.startsWith(fx.paths.codeGraphIpc + "/"));
+    fx.paths.codeGraphIpc = join(fx.home, "overlong".repeat(25));
+    const failed = await manager.activate(fx.project);
+    assert.equal(failed.ok, false); assert.match(failed.detail, /Unix-socket limit/);
+    assert.equal(manager.isMcpRegistered, false); await manager.shutdown();
+  } finally { await fx.cleanup(); }
 });

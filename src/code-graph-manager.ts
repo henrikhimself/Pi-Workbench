@@ -1,14 +1,11 @@
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { watch as watchPath } from "node:fs";
 import { basename, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { chmod, lstat, mkdir, open, rm, rename as renamePath, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
 import {
-  detectCodeGraphPlatform,
-  installedBinaryPath,
-  readInstalledRecord,
-  verifyBinaryVersion,
   type InstalledBinary,
   type StatusReporter,
 } from "./code-graph-installer.js";
@@ -22,7 +19,11 @@ import {
   type CodeGraphState,
   type CodeGraphStatusReport,
 } from "./code-graph-config.js";
+import { createHash, randomUUID } from "node:crypto";
 import type { WorkbenchPaths } from "./paths.js";
+import { ensurePrivateDirectory, acquireManagedLock, createConsumerLease, type promoteDirectory, type ConsumerLease } from "./managed-lifecycle.js";
+import { stageCodeGraphUpgrade, assertCodeGraphQuiescent } from "./code-graph-upgrade.js";
+const MCP_LAUNCHER = fileURLToPath(new URL("./managed-mcp.mjs", import.meta.url));
 
 /**
  * Extension-owned lifecycle for the standalone codebase-memory-mcp (CBM)
@@ -52,7 +53,14 @@ export const CODE_GRAPH_MCP_TIMEOUT_SECONDS = 60;
  * `f0c9be19c5d74b84f418d807bfdce7b5d6a261ff`); a mismatch means the asset
  * is not what the manifest describes and activation must not proceed.
  */
-export const CODE_GRAPH_EXPECTED_TOOL_COUNT = 14;
+export const CODE_GRAPH_REQUIRED_VERSION = "v0.12.1";
+export const CODE_GRAPH_EXPECTED_TOOLS = [
+  "index_repository", "search_graph", "query_graph", "trace_path", "get_code_snippet",
+  "get_file_outline", "get_graph_schema", "compare_graphs", "get_architecture", "search_code",
+  "list_projects", "delete_project", "index_status", "check_index_coverage", "detect_changes",
+  "manage_adr", "ingest_traces",
+] as const;
+export const CODE_GRAPH_EXPECTED_TOOL_COUNT = CODE_GRAPH_EXPECTED_TOOLS.length;
 
 /** Timeout budgets for owned CBM child operations. */
 export const CODE_GRAPH_TIMEOUTS = {
@@ -69,8 +77,8 @@ export const CODE_GRAPH_TIMEOUTS = {
  */
 export const CODE_GRAPH_GUIDANCE_MESSAGE =
   "Code Graph is enabled for this workspace. Use the codebase-memory-mcp " +
-  "tools (search_graph, trace_path, get_architecture, get_code_context, " +
-  "get_impact, query_graph) for structural code questions — cross-file " +
+  "tools (search_graph, trace_path, get_architecture, get_code_snippet, " +
+  "get_file_outline, query_graph) for structural code questions — cross-file " +
   "relationships, call paths, blast radius, architecture overview. Verify " +
   "structural results against the actual source before relying on them for " +
   "edits. For exact literal matches use standard search instead.";
@@ -87,7 +95,7 @@ export interface ProcessResult {
 export type ProcessRunner = (
   command: string,
   args: string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; maxBuffer?: number },
+  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; maxBuffer?: number; signal?: AbortSignal },
 ) => Promise<ProcessResult>;
 
 export function defaultProcessRunner(): ProcessRunner {
@@ -99,6 +107,7 @@ export function defaultProcessRunner(): ProcessRunner {
         {
           cwd: options.cwd,
           env: options.env,
+          signal: options.signal,
           timeout: options.timeoutMs ?? 30_000,
           maxBuffer: options.maxBuffer ?? 4 * 1024 * 1024,
         },
@@ -129,6 +138,7 @@ export interface McpHandshakeOptions {
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   expectedToolCount: number;
+  signal?: AbortSignal;
   killGraceMs?: number;
 }
 
@@ -161,45 +171,27 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
       let stderrText = "";
       const pending = new Map<number, (response: JsonRpcResponse) => void>();
 
-      const kill = (): Promise<void> =>
-        new Promise((resolveKill) => {
-          const current = child;
-          if (!current || current.exitCode !== null || current.killed) {
-            resolveKill();
-            return;
-          }
-          let finished = false;
-          const finish = () => {
-            if (!finished) {
-              finished = true;
-              resolveKill();
-            }
-          };
-          const escalate = setTimeout(() => {
-            try {
-              current.kill("SIGKILL");
-            } catch {
-              finish();
-            }
-          }, options.killGraceMs ?? 5_000);
-          current.once("close", () => {
-            clearTimeout(escalate);
-            finish();
-          });
-          try {
-            current.kill("SIGTERM");
-          } catch {
-            clearTimeout(escalate);
-            finish();
-          }
-        });
+      const kill = (): Promise<void> => new Promise((resolveKill) => {
+        const current = child;
+        if (!current || current.exitCode !== null || current.signalCode !== null) { resolveKill(); return; }
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true; clearTimeout(terminate); clearTimeout(escalate); resolveKill();
+        };
+        const terminate = setTimeout(() => { try { current.kill("SIGTERM"); } catch { finish(); } }, options.killGraceMs ?? 500);
+        const escalate = setTimeout(() => { try { current.kill("SIGKILL"); } catch { finish(); } }, (options.killGraceMs ?? 500) + 2_000);
+        current.once("close", finish);
+        current.stdin.end();
+      });
 
       const settle = async (result: McpHandshakeResult) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
         await kill();
-        resolvePromise(result);
+        resolvePromise(result.ok && (!cleanStdout || buffer.trim())
+          ? { ok: false, detail: "MCP stdout contained non-JSON-RPC data" } : result);
       };
 
       const timer = setTimeout(() => {
@@ -210,7 +202,7 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
         child = spawn(options.command, options.args, {
           cwd: options.cwd,
           env: options.env,
-          stdio: ["pipe", "pipe", "pipe"],
+          stdio: ["pipe", "pipe", "pipe"], signal: options.signal,
         }) as ChildProcessWithoutNullStreams;
       } catch (error) {
         void settle({ ok: false, detail: `Failed to spawn MCP probe: ${error instanceof Error ? error.message : String(error)}` });
@@ -229,6 +221,7 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
 
       currentChild.stdout.on("data", (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
+        if (buffer.length > 2 * 1024 * 1024) { void settle({ ok: false, detail: "MCP stdout limit exceeded" }); return; }
         let newline: number;
         while ((newline = buffer.indexOf("\n")) >= 0) {
           const line = buffer.slice(0, newline);
@@ -242,12 +235,15 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
             cleanStdout = false;
             continue;
           }
+          if (!parsed || typeof parsed !== "object" || (parsed as { jsonrpc?: unknown }).jsonrpc !== "2.0") {
+            cleanStdout = false; continue;
+          }
           const message = parsed as { id?: unknown; result?: unknown; error?: { code?: number; message?: string } };
           if (typeof message.id === "number") respond(message.id, message);
         }
       });
       currentChild.stderr.on("data", (chunk: Buffer) => {
-        stderrText += chunk.toString("utf8");
+        stderrText = (stderrText + chunk.toString("utf8")).slice(-16_384);
       });
       // A dying child closes its stdin end; EPIPE must never crash the owner.
       currentChild.stdin.on("error", () => {});
@@ -287,7 +283,10 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
             });
             return;
           }
-          const init = initResponse.result as { protocolVersion?: unknown };
+          const init = initResponse.result as { protocolVersion?: unknown; serverInfo?: { version?: unknown } };
+          if (!init || init.serverInfo?.version !== CODE_GRAPH_REQUIRED_VERSION.slice(1)) {
+            void settle({ ok: false, detail: "MCP backend version mismatch" }); return;
+          }
           if (init.protocolVersion !== CODE_GRAPH_MCP_PROTOCOL_VERSION) {
             void settle({
               ok: false,
@@ -298,33 +297,31 @@ export function defaultMcpHandshakeRunner(): McpHandshakeRunner {
 
           // 2. notifications/initialized (MCP lifecycle), then tools/list.
           sendJsonrpc(currentChild, { jsonrpc: "2.0", method: "notifications/initialized" });
-          const toolsResponse = await new Promise<JsonRpcResponse>((resolveWaiter) => {
-            pending.set(2, (response) => resolveWaiter(response));
-            sendJsonrpc(currentChild, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
-          });
-          if (settled) return;
-          if (toolsResponse.error) {
-            void settle({
-              ok: false,
-              detail: `MCP tools/list failed: ${String(toolsResponse.error.code ?? "")} ${String(toolsResponse.error.message ?? "")}`.trim(),
+          const tools: string[] = [];
+          const cursors = new Set<string>();
+          let cursor: string | undefined;
+          for (let page = 0; ; page++) {
+            if (page >= 32) throw new Error("MCP tools/list pagination limit exceeded");
+            const response = await new Promise<JsonRpcResponse>((resolveWaiter) => {
+              const id = page + 2;
+              pending.set(id, resolveWaiter);
+              sendJsonrpc(currentChild, { jsonrpc: "2.0", id, method: "tools/list", params: cursor ? { cursor } : {} });
             });
-            return;
+            if (settled) return;
+            if (response.error) throw new Error("MCP tools/list failed: " + String(response.error.message));
+            const result = response.result as { tools?: Array<{ name?: unknown }>; nextCursor?: unknown } | undefined;
+            if (!Array.isArray(result?.tools)) throw new Error("Malformed MCP tools/list result");
+            for (const tool of result.tools) {
+              if (typeof tool?.name !== "string" || !tool.name || tools.includes(tool.name)) throw new Error("Invalid or duplicate MCP tool name");
+              tools.push(tool.name);
+            }
+            if (result.nextCursor === undefined) break;
+            if (typeof result.nextCursor !== "string" || !result.nextCursor || result.nextCursor.length > 512 || cursors.has(result.nextCursor)) throw new Error("Invalid or repeated MCP tool cursor");
+            cursors.add(result.nextCursor); cursor = result.nextCursor;
           }
-          if (!cleanStdout) {
-            void settle({ ok: false, detail: "MCP stdout contained non-JSON-RPC data; refusing to register a protocol-unsafe server" });
-            return;
-          }
-          const toolsResult = toolsResponse.result as { tools?: Array<{ name?: unknown }> } | undefined;
-          const tools = Array.isArray(toolsResult?.tools)
-            ? toolsResult.tools.map((tool) => (typeof tool.name === "string" ? tool.name : "")).filter((name) => name !== "")
-            : [];
-          if (tools.length !== options.expectedToolCount) {
-            void settle({
-              ok: false,
-              detail: `MCP tool count mismatch: got ${tools.length}, expected ${options.expectedToolCount}`,
-            });
-            return;
-          }
+          if (!cleanStdout) throw new Error("MCP stdout contained non-JSON-RPC data");
+          if (tools.length !== options.expectedToolCount) throw new Error(`MCP tool count mismatch: got ${tools.length}, expected ${options.expectedToolCount}`);
+          if (tools.length !== CODE_GRAPH_EXPECTED_TOOLS.length || CODE_GRAPH_EXPECTED_TOOLS.some((name) => !tools.includes(name))) throw new Error("MCP tool-name contract mismatch");
           void settle({ ok: true, tools });
         } catch (error) {
           void settle({ ok: false, detail: `MCP handshake sequence error: ${error instanceof Error ? error.message : String(error)}` });
@@ -347,16 +344,16 @@ const CURL_DENY_SHIM_SCRIPT = "#!/bin/sh\nexit 3\n";
  */
 export async function ensureCurlDenyShim(shimPath: string): Promise<void> {
   await mkdir(dirname(shimPath), { recursive: true });
-  const tempPath = `${shimPath}.${process.pid}-${Date.now().toString(36)}.tmp`;
-  const handle = await open(tempPath, "w");
+  const tempPath = `${shimPath}.${process.pid}-${randomUUID()}.tmp`;
   try {
-    await handle.writeFile(CURL_DENY_SHIM_SCRIPT, "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  await chmod(tempPath, 0o755).catch(() => {});
-  await renamePath(tempPath, shimPath);
+    const handle = await open(tempPath, "wx", 0o700);
+    try {
+      await handle.writeFile(CURL_DENY_SHIM_SCRIPT, "utf8");
+      await handle.sync();
+    } finally { await handle.close(); }
+    await chmod(tempPath, 0o755);
+    await renamePath(tempPath, shimPath);
+  } finally { await rm(tempPath, { force: true }); }
 }
 
 /** Directory that must be prepended to a CBM child PATH. */
@@ -372,14 +369,20 @@ export function curlShimDirectory(shimPath: string): string {
 export function createCbmEnvironment(options: {
   projectDirectory: string;
   shimPath: string;
+  runtimeDirectory?: string;
+  homeDirectory?: string;
+  workspacePath?: string;
   source?: NodeJS.ProcessEnv;
 }): Record<string, string> {
   const source = options.source ?? process.env;
   return {
     PATH: `${curlShimDirectory(options.shimPath)}:${source.PATH || "/usr/local/bin:/usr/bin:/bin"}`,
-    HOME: source.HOME || "/tmp",
+    HOME: options.homeDirectory ?? source.HOME ?? "/tmp",
+    ...(options.homeDirectory ? { XDG_CACHE_HOME: join(options.homeDirectory, "cache"), XDG_CONFIG_HOME: join(options.homeDirectory, "config") } : {}),
     LANG: "C.UTF-8",
     CBM_CACHE_DIR: options.projectDirectory,
+    CBM_RUNTIME_DIR: options.runtimeDirectory ?? join(dirname(options.projectDirectory), ".runtime", basename(options.projectDirectory)),
+    ...(options.workspacePath ? { CBM_ALLOWED_ROOT: options.workspacePath } : {}),
     CBM_LOG_LEVEL: "error",
   };
 }
@@ -410,6 +413,8 @@ function failureDetail(what: string, result: ProcessResult): Error {
 
 export interface CodeGraphManagerDeps {
   paths: WorkbenchPaths;
+  signal?: AbortSignal;
+  promoteUpgrade?: typeof promoteDirectory;
   /** Install/update decision for the managed binary (packaged asset only). */
   ensureInstalled: (onStatus: StatusReporter) => Promise<InstalledBinary>;
   onStatus?: StatusReporter;
@@ -436,10 +441,15 @@ export class CodeGraphManager {
   private registeredProject: string | null = null;
   private mcpRegistered = false;
   private lastError: string | null = null;
+  private installation: InstalledBinary | null = null;
+  private lease: ConsumerLease | null = null;
+  private closed = false;
+  private readonly cancellation = new AbortController();
 
   constructor(deps: CodeGraphManagerDeps) {
     this.deps = {
       ...deps,
+      signal: deps.signal ? AbortSignal.any([deps.signal, this.cancellation.signal]) : this.cancellation.signal,
       runProcess: deps.runProcess ?? defaultProcessRunner(),
       runMcpHandshake: deps.runMcpHandshake ?? defaultMcpHandshakeRunner(),
     };
@@ -463,12 +473,84 @@ export class CodeGraphManager {
     this.deps.onStatus?.(message);
   }
 
+  private coordinationRoot(): string { return join(this.deps.paths.codeGraphRuntime, "coordination"); }
+  private leaseRoot(project: CodeGraphProject): string { return join(this.deps.paths.codeGraphRuntime, "consumers", project.identifier); }
+  async removeProject(project: CodeGraphProject): Promise<void> {
+    this.assertProjectPathSafe(project);
+    const release = await acquireManagedLock(this.coordinationRoot(), project.identifier);
+    try {
+      await assertCodeGraphQuiescent(project, this.deps.paths);
+      await rm(project.directory, { recursive: true, force: false });
+    } finally { await release(); }
+  }
+  private async operate(project: CodeGraphProject, action: "activate" | "restore" | "reindex"): Promise<CodeGraphResult> {
+    if (this.closed || this.deps.signal?.aborted) return { ok: false, kind: "off", detail: "Session closed", registered: false };
+    const pending = join(this.coordinationRoot(), `${project.identifier}.pending.json`);
+    if (await lstat(pending).then(() => true, error => { if (error.code === "ENOENT") return false; throw error; })) {
+      return { ok: false, kind: "upgrade_pending", detail: `Incomplete publication; preserve recovery paths recorded in ${pending}`, registered: false };
+    }
+    const validation = validateCodeGraphState(project);
+    const run = () => action === "activate" ? this.activateUnlocked(project)
+      : action === "restore" ? this.restoreUnlocked(project) : this.reindexUnlocked(project);
+    if (!validateManagedProjectPath(project, this.deps.paths).ok || (!validation.ok && !(action === "activate" && validation.problem === "missing"))) return run();
+    let installed = false;
+    try {
+      this.installation = await this.deps.ensureInstalled((message) => this.report(message));
+      if (this.installation.version !== CODE_GRAPH_REQUIRED_VERSION) throw new Error("Managed backend does not match packaged pin");
+      installed = true;
+      const release = await acquireManagedLock(this.coordinationRoot(), project.identifier);
+      try { return await run(); } finally { await release(); }
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error);
+      return { ok: false, kind: installed ? "upgrade_pending" : "binary_missing", detail: this.lastError, registered: false };
+    }
+  }
+  async activate(project: CodeGraphProject): Promise<CodeGraphResult> { return this.operate(project, "activate"); }
+  async restore(project: CodeGraphProject): Promise<CodeGraphResult> { return this.operate(project, "restore"); }
+  async reindex(project: CodeGraphProject): Promise<CodeGraphResult> { return this.operate(project, "reindex"); }
+  private async upgrade(project: CodeGraphProject, state: CodeGraphState): Promise<CodeGraphResult> {
+    try {
+      this.report("Automatically staging pinned Code Graph upgrade; original data retained...");
+      const binary = this.installation!;
+      const backup = await stageCodeGraphUpgrade({
+        project, paths: this.deps.paths, state, binary, signal: this.deps.signal, promote: this.deps.promoteUpgrade,
+        validate: async (stage) => {
+          await ensureCurlDenyShim(this.deps.paths.codeGraphCurlShim);
+          await this.setAutoIndexEnabled(stage, binary.path);
+          const name = await this.runIndexRepository(stage, binary.path);
+          await this.validateIndex(stage, binary.path, name);
+          await this.validateHandshake(stage, binary.path);
+        },
+      });
+      this.report(`Automatic upgrade complete; retained backup: ${backup}`);
+      return await this.restoreUnlocked(project);
+    } catch (error) {
+      this.lastError = String(error);
+      return { ok: false, kind: "upgrade_pending", detail: this.lastError, registered: false };
+    }
+  }
+
   /** Minimal env + workspace CWD for all owned CBM child operations. */
   private createEnv(project: CodeGraphProject): Record<string, string> {
     return createCbmEnvironment({
       projectDirectory: project.directory,
       shimPath: this.deps.paths.codeGraphCurlShim,
+      runtimeDirectory: this.runtimeDirectory(project),
+      homeDirectory: join(this.deps.paths.codeGraphRuntime, "homes", project.identifier),
+      workspacePath: project.projectPath,
     });
+  }
+
+  private runtimeDirectory(project: CodeGraphProject): string {
+    return join(this.deps.paths.codeGraphIpc, createHash("sha256").update(project.directory).digest("hex").slice(0, 16));
+  }
+
+  private async prepareRuntime(project: CodeGraphProject): Promise<void> {
+    const directory = this.runtimeDirectory(project);
+    const socket = join(directory, `cbm-daemon-${process.getuid?.() ?? 0}`, `cbm-${"0".repeat(16)}.sock`);
+    if (Buffer.byteLength(socket) >= 108) throw new Error("Managed Code Graph IPC path exceeds Linux Unix-socket limit; no shared/global runtime fallback");
+    await ensurePrivateDirectory(this.deps.paths.codeGraphIpc, directory);
+    await ensurePrivateDirectory(this.deps.paths.codeGraphRuntime, join(this.deps.paths.codeGraphRuntime, "homes", project.identifier));
   }
 
   private assertProjectPathSafe(project: CodeGraphProject): void {
@@ -484,10 +566,11 @@ export class CodeGraphManager {
     what: string,
   ): Promise<ProcessResult> {
     this.assertProjectPathSafe(project);
+    await this.prepareRuntime(project);
     const result = await this.deps.runProcess(binaryPath, args, {
       cwd: project.projectPath,
       env: this.createEnv(project),
-      timeoutMs,
+      timeoutMs, signal: this.deps.signal,
     });
     if (result.exitCode !== 0) throw failureDetail(what, result);
     return result;
@@ -524,7 +607,7 @@ export class CodeGraphManager {
   private async runIndexRepository(project: CodeGraphProject, binaryPath: string): Promise<string> {
     // JSON.stringify is the only argument encoding; the workspace path is
     // always a JSON value, never shell syntax.
-    const args = ["cli", "index_repository", JSON.stringify({ repo_path: project.projectPath })];
+    const args = ["cli", "--quiet", "index_repository", "--repo-path", project.projectPath];
     const result = await this.runCbm(project, binaryPath, args, CODE_GRAPH_TIMEOUTS.index, "index_repository");
     const parsed = parseJsonOutput(result.stdout, "index_repository");
     if (parsed.status !== "indexed" || typeof parsed.project !== "string" || parsed.project.length === 0) {
@@ -567,15 +650,29 @@ export class CodeGraphManager {
     if (candidate) {
       await this.waitForIndexDatabase(project, candidate);
     } else {
-      const listResult = await this.runCbm(project, binaryPath, ["cli", "list_projects"], CODE_GRAPH_TIMEOUTS.status, "list_projects");
-      const list = parseJsonOutput(listResult.stdout, "list_projects");
-      candidate = Array.isArray(list.projects)
-        ? list.projects.find((value): value is string => typeof value === "string" && value.length > 0)
-        : undefined;
-      if (!candidate) throw new Error("index validation failed: list_projects returned no indexed project");
+      const matches: string[] = [];
+      let offset = 0;
+      for (let page = 0; page < 200; page++) {
+        const result = await this.runCbm(project, binaryPath,
+          ["cli", "--quiet", "list_projects", "--format", "json", "--offset", String(offset), "--limit", "50"],
+          CODE_GRAPH_TIMEOUTS.status, "list_projects");
+        const list = parseJsonOutput(result.stdout, "list_projects");
+        if (!Array.isArray(list.projects)) throw new Error("Malformed project listing");
+        for (const row of list.projects) {
+          if (!row || typeof row !== "object" || typeof row.name !== "string" || typeof row.root_path !== "string") throw new Error("Malformed project identity");
+          if (row.root_path === project.projectPath) matches.push(row.name);
+        }
+        if (list.has_more === false) break;
+        if (list.has_more !== true || list.projects.length === 0 || !Number.isInteger(list.offset) || list.offset !== offset) throw new Error("Invalid project pagination");
+        offset += list.projects.length;
+        if (page === 199) throw new Error("Project pagination limit exceeded");
+      }
+      if (matches.length !== 1) throw new Error("Expected one indexed project matching canonical workspace");
+      candidate = matches[0];
     }
+    if (!candidate || basename(candidate) !== candidate || candidate === "." || candidate === "..") throw new Error("Unsafe project name");
     const statusResult = await this.runCbm(
-      project, binaryPath, ["cli", "index_status", JSON.stringify({ project: candidate })], CODE_GRAPH_TIMEOUTS.status, "index_status",
+      project, binaryPath, ["cli", "--quiet", "index_status", "--project", candidate, "--format", "json"], CODE_GRAPH_TIMEOUTS.status, "index_status",
     );
     const status = parseJsonOutput(statusResult.stdout, "index_status");
     if (status.status !== "ready") throw new Error(`index_status reported ${String(status.status)} for ${candidate}`);
@@ -585,13 +682,14 @@ export class CodeGraphManager {
   /** Validate the MCP handshake/tool list on a throwaway probe child. */
   private async validateHandshake(project: CodeGraphProject, binaryPath: string): Promise<string[]> {
     this.assertProjectPathSafe(project);
+    await this.prepareRuntime(project);
     const result = await this.deps.runMcpHandshake({
       command: binaryPath,
-      args: [],
+      args: ["--ui=false", "--quiet", "--repo-path", project.projectPath],
       cwd: project.projectPath,
       env: this.createEnv(project),
       timeoutMs: CODE_GRAPH_TIMEOUTS.handshake,
-      expectedToolCount: CODE_GRAPH_EXPECTED_TOOL_COUNT,
+      expectedToolCount: CODE_GRAPH_EXPECTED_TOOL_COUNT, signal: this.deps.signal,
     });
     if (!result.ok || !result.tools) {
       throw new Error(`MCP handshake validation failed: ${result.detail ?? "unknown error"}`);
@@ -600,28 +698,31 @@ export class CodeGraphManager {
   }
 
   getMcpConfig(project: CodeGraphProject, binaryPath: string): McpServerConfig {
+    const spec = {
+      schema: 1, command: binaryPath, args: ["--ui=false", "--quiet", "--repo-path", project.projectPath],
+      cwd: project.projectPath, installRoot: this.deps.paths.codeGraphBin,
+      coordinationRoot: this.coordinationRoot(), lockName: project.identifier,
+      leaseRoot: this.leaseRoot(project), resource: project.directory, markerPath: project.statePath,
+      expectedMarker: { version: CODE_GRAPH_REQUIRED_VERSION, workspacePath: project.projectPath, identifier: project.identifier },
+    };
     return {
-      command: binaryPath,
-      args: [],
-      cwd: project.projectPath,
-      env: this.createEnv(project),
-      exposure: "direct",
-      timeout: CODE_GRAPH_MCP_TIMEOUT_SECONDS,
+      command: process.execPath, args: [MCP_LAUNCHER, JSON.stringify(spec)],
+      cwd: project.projectPath, env: this.createEnv(project), exposure: "direct", timeout: CODE_GRAPH_MCP_TIMEOUT_SECONDS,
       description: "Code graph structural queries for the current workspace (extension-owned codebase-memory-mcp).",
     };
   }
 
-  private registerMcp(project: CodeGraphProject, binaryPath: string): void {
+  private async registerMcp(project: CodeGraphProject, binaryPath: string): Promise<void> {
+    if (this.closed || this.deps.signal?.aborted) throw new Error("Session closed before MCP registration");
     this.assertProjectPathSafe(project);
-    if (!this.deps.registerMcp) {
-      throw new Error("MCP registration is not available in this context");
-    }
-    if (this.mcpRegistered) {
-      this.unregisterOwned();
-    }
-    this.deps.registerMcp(CODE_GRAPH_MCP_SERVER_NAME, this.getMcpConfig(project, binaryPath));
-    this.mcpRegistered = true;
-    this.registeredProject = project.directory;
+    if (!this.deps.registerMcp) throw new Error("MCP registration is not available in this context");
+    if (this.mcpRegistered) await this.unregisterOwned();
+    this.lease = await createConsumerLease(this.leaseRoot(project), project.directory);
+    try {
+      if (this.closed || this.deps.signal?.aborted) throw new Error("Session closed before MCP registration");
+      this.deps.registerMcp(CODE_GRAPH_MCP_SERVER_NAME, this.getMcpConfig(project, binaryPath));
+      this.mcpRegistered = true; this.registeredProject = project.directory;
+    } catch (error) { await this.lease.release(); this.lease = null; throw error; }
   }
 
   /**
@@ -629,34 +730,26 @@ export class CodeGraphManager {
    * Idempotent; only ever unregisters the server this manager registered.
    * Never kills external or unidentified CBM processes.
    */
-  stop(project: CodeGraphProject): void {
+  async stop(project: CodeGraphProject): Promise<void> {
     this.assertProjectPathSafe(project);
     if (!this.mcpRegistered || this.registeredProject !== project.directory) return;
     try {
-      this.unregisterOwned();
+      await this.unregisterOwned();
     } catch (error) {
       this.lastError = `MCP unregister failed: ${error instanceof Error ? error.message : String(error)}`;
       throw error;
     }
   }
 
-  private unregisterOwned(): void {
-    if (this.deps.unregisterMcp) {
-      this.deps.unregisterMcp(CODE_GRAPH_MCP_SERVER_NAME);
-    }
-    this.mcpRegistered = false;
-    this.registeredProject = null;
+  private async unregisterOwned(): Promise<void> {
+    this.deps.unregisterMcp?.(CODE_GRAPH_MCP_SERVER_NAME);
+    this.mcpRegistered = false; this.registeredProject = null;
+    await this.lease?.release(); this.lease = null;
   }
 
-  /** Drop the MCP registration on session shutdown (owned state only). */
-  shutdown(): void {
-    if (!this.mcpRegistered) return;
-    try {
-      this.deps.unregisterMcp?.(CODE_GRAPH_MCP_SERVER_NAME);
-    } finally {
-      this.mcpRegistered = false;
-      this.registeredProject = null;
-    }
+  async shutdown(): Promise<void> {
+    this.closed = true; this.cancellation.abort();
+    if (this.mcpRegistered) await this.unregisterOwned();
   }
 
   /**
@@ -669,7 +762,7 @@ export class CodeGraphManager {
    * Failures roll back the project directory created by this transaction
    * (never a pre-existing one) and leave the workspace off.
    */
-  async activate(project: CodeGraphProject): Promise<CodeGraphResult> {
+  private async activateUnlocked(project: CodeGraphProject): Promise<CodeGraphResult> {
     const pathValidation = validateManagedProjectPath(project, this.deps.paths);
     if (!pathValidation.ok) {
       this.lastError = pathValidation.detail;
@@ -681,7 +774,7 @@ export class CodeGraphManager {
       const resolution = await this.resolveBinary(validation.state);
       if (resolution.status === "failed") return resolution.result;
       const compatibility = this.requireStateCompatibility(validation.state, resolution);
-      if (compatibility) return compatibility;
+      if (compatibility) return this.upgrade(project, validation.state);
       let tools: string[] | null;
       try {
         tools = await this.validateHandshake(project, resolution.path);
@@ -692,7 +785,7 @@ export class CodeGraphManager {
       if (tools === null) {
         return { ok: false, kind: "mcp_failed", detail: this.lastError ?? "MCP handshake failed", registered: false };
       }
-      this.registerMcp(project, resolution.path);
+      await this.registerMcp(project, resolution.path);
       this.lastError = null;
       return { ok: true, state: validation.state, binaryPath: resolution.path, tools, alreadyOn: true };
     }
@@ -710,9 +803,10 @@ export class CodeGraphManager {
     try {
       directoryExistedBefore = await this.directoryExists(project.directory);
       this.report(`Installing/verifying codebase-memory-mcp binary for ${project.identifier}…`);
-      const install = await this.deps.ensureInstalled((message) => this.report(message));
+      const install = this.installation ?? await this.deps.ensureInstalled((message) => this.report(message));
+      if (install.version !== CODE_GRAPH_REQUIRED_VERSION) throw new Error("Managed backend does not match packaged pin");
       this.report(`Preparing project data directory ${project.directory}…`);
-      await mkdir(project.directory, { recursive: true });
+      await ensurePrivateDirectory(project.directory);
       this.assertProjectPathSafe(project);
       await ensureCurlDenyShim(this.deps.paths.codeGraphCurlShim);
       this.report("Enabling codebase-memory-mcp auto-index for this workspace…");
@@ -730,7 +824,7 @@ export class CodeGraphManager {
         sha256: install.sha256,
       });
       await writeCodeGraphStateAtomic(project, state);
-      this.registerMcp(project, install.path);
+      await this.registerMcp(project, install.path);
       this.lastError = null;
       this.report(`Code graph enabled for ${project.identifier} (project ${projectName}).`);
       return { ok: true, state, binaryPath: install.path, tools, alreadyOn: false };
@@ -746,7 +840,7 @@ export class CodeGraphManager {
   }
 
   /** Rebuild an already-enabled workspace index without deleting its state. */
-  async reindex(project: CodeGraphProject): Promise<CodeGraphResult> {
+  private async reindexUnlocked(project: CodeGraphProject): Promise<CodeGraphResult> {
     const pathValidation = validateManagedProjectPath(project, this.deps.paths);
     if (!pathValidation.ok) return { ok: false, kind: "corrupt", detail: pathValidation.detail, registered: false };
     const validation = validateCodeGraphState(project);
@@ -759,7 +853,7 @@ export class CodeGraphManager {
     const resolution = await this.resolveBinary(validation.state);
     if (resolution.status === "failed") return resolution.result;
     const compatibility = this.requireStateCompatibility(validation.state, resolution);
-    if (compatibility) return compatibility;
+    if (compatibility) return this.upgrade(project, validation.state);
     try {
       const indexedProjectName = await this.runIndexRepository(project, resolution.path);
       await this.validateIndex(project, resolution.path, indexedProjectName);
@@ -780,7 +874,7 @@ export class CodeGraphManager {
    *   binary), `_config.db` must prove `auto_index=true`, handshake,
    *   registration.
    */
-  async restore(project: CodeGraphProject): Promise<CodeGraphResult> {
+  private async restoreUnlocked(project: CodeGraphProject): Promise<CodeGraphResult> {
     const pathValidation = validateManagedProjectPath(project, this.deps.paths);
     if (!pathValidation.ok) {
       this.lastError = pathValidation.detail;
@@ -807,7 +901,7 @@ export class CodeGraphManager {
     const resolution = await this.resolveBinary(validation.state);
     if (resolution.status === "failed") return resolution.result;
     const compatibility = this.requireStateCompatibility(validation.state, resolution);
-    if (compatibility) return compatibility;
+    if (compatibility) return this.upgrade(project, validation.state);
 
     let autoIndex = false;
     try {
@@ -835,7 +929,7 @@ export class CodeGraphManager {
     if (tools === null) {
       return { ok: false, kind: "mcp_failed", detail: this.lastError ?? "MCP handshake failed", registered: false };
     }
-    this.registerMcp(project, resolution.path);
+    await this.registerMcp(project, resolution.path);
     this.lastError = null;
     this.report(`Code graph restored for ${project.identifier}.`);
     return { ok: true, state: validation.state, binaryPath: resolution.path, tools, alreadyOn: true };
@@ -862,59 +956,18 @@ export class CodeGraphManager {
     state: CodeGraphState,
   ): Promise<{ status: "resolved"; path: string; version: string; resolvedUrl: string; sha256: string } | { status: "failed"; result: Extract<CodeGraphResult, { ok: false }> }> {
     try {
-      const install = await this.deps.ensureInstalled((message) => this.report(message));
+      const install = this.installation ?? await this.deps.ensureInstalled((message) => this.report(message));
+      if (install.version !== CODE_GRAPH_REQUIRED_VERSION) throw new Error("Managed backend does not match packaged pin");
       return { status: "resolved", path: install.path, version: install.version, resolvedUrl: install.resolvedUrl, sha256: install.sha256 };
     } catch (error) {
-      const fallback = await this.discoverPriorBinary(state.version);
-      if (fallback && fallback.resolvedUrl === state.resolvedUrl && fallback.sha256 === state.sha256) {
-        this.report(
-          `Managed binary update failed (${error instanceof Error ? error.message : String(error)}); retaining verified ${fallback.version} binary.`,
-        );
-        return {
-          status: "resolved",
-          path: fallback.path,
-          version: fallback.version,
-          resolvedUrl: fallback.resolvedUrl,
-          sha256: fallback.sha256,
-        };
-      }
       this.lastError = error instanceof Error ? error.message : String(error);
       return { status: "failed", result: { ok: false, kind: "binary_missing", detail: this.lastError, registered: false } };
     }
   }
 
-  /** Locate and re-verify a prior fallback before it is ever executed. */
-  private async discoverPriorBinary(version: string): Promise<{ path: string; version: string; resolvedUrl: string; sha256: string } | null> {
-    const platform = detectCodeGraphPlatform({ os: process.platform, arch: process.arch });
-    if (!platform) return null;
-    const path = installedBinaryPath(this.deps.paths.codeGraphBin, version, platform);
-    try {
-      const info = await lstat(path);
-      if (!info.isFile() || info.isSymbolicLink() || (info.mode & 0o111) === 0) return null;
-      const record = await readInstalledRecord(this.deps.paths.codeGraphBin, version, platform);
-      if (!record || record.version !== version) return null;
-      const verified = await verifyBinaryVersion(
-        path,
-        version,
-        async (command, args, options) => {
-          const result = await this.deps.runProcess(command, args, options);
-          return { code: result.exitCode, stdout: result.stdout, stderr: result.stderr };
-        },
-        { cwd: this.deps.paths.codeGraphRoot },
-      );
-      if (!verified.ok) return null;
-      return { path, version, resolvedUrl: record.resolvedUrl, sha256: record.sha256 };
-    } catch {
-      return null;
-    }
-  }
 
   private async directoryExists(path: string): Promise<boolean> {
-    try {
-      return (await stat(path)).isDirectory();
-    } catch {
-      return false;
-    }
+    try { return (await stat(path)).isDirectory(); } catch { return false; }
   }
 
   /**

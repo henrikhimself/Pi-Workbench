@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
+import { HEADROOM_STORE_MARKER } from "./headroom-state.js";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WORKBENCH_PATHS } from "./paths.js";
@@ -10,7 +11,7 @@ const PROJECTS_DIRECTORY = "projects";
 export interface MemoryStore {
   root: string;
   projectPath: string;
-  /** True only when caller explicitly configured headroom.json memoryRoot/options.root. */
+  /** True only when caller explicitly configured headroom.json memory.root/options.root. */
   rootConfigured: boolean;
   /** Root resolves physically inside current project. Allowed, but caller must warn user. */
   rootInsideProject: boolean;
@@ -30,13 +31,16 @@ export interface MemoryStore {
 export function resolveMemoryStore(options?: {
   cwd?: string;
   root?: string | undefined;
+  defaultRoot?: string | undefined;
   userId?: string | undefined;
   exportPath?: string | undefined;
 }): MemoryStore {
   const projectPath = canonicalPath(options?.cwd ?? process.cwd());
   const configuredRoot = options?.root;
   const rootConfigured = configuredRoot !== undefined && configuredRoot !== "";
-  const root = resolveMemoryRoot(configuredRoot);
+  // Explicit roots are bases, never aliases for pre-refactor physical stores.
+  const root = rootConfigured ? join(resolveMemoryRoot(configuredRoot), "workbench-memory-v1")
+    : options?.defaultRoot ?? DEFAULT_MEMORY_ROOT;
   const rootInsideProject = isWithin(canonicalPath(root), projectPath);
   const userId = parseMemoryNamespace(options?.userId);
   const exportDirectory = options?.exportPath === undefined
@@ -62,7 +66,7 @@ export function resolveMemoryStore(options?: {
 }
 
 export function hasMemoryStore(store: Pick<MemoryStore, "databasePath">): boolean {
-  return existsSync(store.databasePath);
+  return existsSync(store.databasePath) && existsSync(join(dirname(store.databasePath), HEADROOM_STORE_MARKER));
 }
 
 export function resolveMemoryRoot(value: string | undefined): string {
@@ -73,7 +77,7 @@ export function resolveMemoryRoot(value: string | undefined): string {
     : value;
 
   if (!isAbsolute(expanded)) {
-    throw new Error(`headroom.json memoryRoot must be an absolute path; received ${JSON.stringify(value)}`);
+    throw new Error(`headroom.json memory.root must be an absolute path; received ${JSON.stringify(value)}`);
   }
 
   return resolve(expanded);
@@ -101,7 +105,7 @@ export function resolveMemoryExportDirectory(projectPath: string, value: string)
 export function parseMemoryNamespace(value: string | undefined): string {
   const namespace = value ?? "project";
   if (namespace.length === 0 || /[\r\n\0]/.test(namespace)) {
-    throw new Error("headroom.json memoryNamespace must be a non-empty single-line value");
+    throw new Error("headroom.json memory.namespace must be a non-empty single-line value");
   }
   return namespace;
 }

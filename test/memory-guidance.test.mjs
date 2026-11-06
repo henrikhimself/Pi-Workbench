@@ -24,6 +24,13 @@ test("Memory guidance: normal policy requires registered search and save tools",
   assert.equal(mode({ activeToolNames: [MEMORY_SAVE] }), "off");
 });
 
+test("Memory guidance names match actual Pi normalized MCP tools", () => {
+  const actual = ["mcp__headroom_memory__memory_search", "mcp__headroom_memory__memory_save"];
+  assert.equal(mode({ activeToolNames: actual }), "normal");
+  assert.ok(actual.every(name => guidance.MEMORY_GUIDANCE.includes(name)));
+  assert.doesNotMatch(guidance.MEMORY_GUIDANCE, /mcp__headroom-memory__/);
+});
+
 test("Memory guidance: Study Mode does not restrict available Memory tools", () => {
   assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH] }), "study");
   assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE] }), "normal");

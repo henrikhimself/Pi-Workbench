@@ -1,69 +1,55 @@
 # pi-workbench
 
-`pi-workbench` adds Headroom context compression, project Memory, Learning Mode, and Study Mode guidance to the [Pi coding agent](https://github.com/badlogic/pi-mono).
+Headroom context compression, project-scoped Memory, Code Graph, and optional Study Mode for [Pi](https://pi.dev).
 
-## Requirements
+## Requirements and verified scope
 
 - Pi 1.0+
-- Python 3.10+
+- Node.js 22+.
+- Python 3.10+ with venv/pip
 
-## Install from GitHub
-
-Repository: <https://github.com/henrikhimself/Pi-Workbench>
+## Install, update, remove
 
 ```bash
-# Install for current user
 pi install git:github.com/henrikhimself/Pi-Workbench
-
-# Install for current project
+# Or project-local:
 pi install --local git:github.com/henrikhimself/Pi-Workbench
-
-# Try once without saving package settings
+# Try without saving package settings:
 pi -e git:github.com/henrikhimself/Pi-Workbench
-```
 
-Update installed extensions:
-
-```bash
 pi update --extensions
-```
-
-Remove extension:
-
-```bash
 pi remove git:github.com/henrikhimself/Pi-Workbench
 ```
 
-## Configuration
+## Headroom configuration
 
-On first session start, pi-workbench creates `headroom.json` under `~/.pi/pi-workbench/` and never overwrites user edits.
+Installs and manages a Headroom process using configuration loaded from `~/.pi/pi-workbench/headroom.json`.
 
-### `headroom.json`
+- `/wb:headroom-health` — managed process ownership/runtime diagnostics.
 
 ```json
 {
-  "port": 8787
+  "schemaVersion": 1
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `url` | External Headroom proxy URL. Disables extension proxy management. Mutually exclusive with `port`. |
-| `port` | Managed localhost proxy port. Default: `8787`. Specifying `port` implies `http://127.0.0.1:<port>` and extension management. Mutually exclusive with `url`. |
-| `memoryRoot` | Absolute or `~/` root for project Memory stores. Default: `~/.pi/pi-workbench/headroom-memory`. |
-| `memoryNamespace` | Logical Headroom Memory namespace. Default: `project`. |
-| `memory.export` | Optional project-relative canonical Memory export directory, such as `.headroom-memory`. Must remain below project root. Required for export, import, and merge. |
-| `compression` | Optional per-request Headroom compression overrides. Omit to preserve Headroom defaults. See below. |
+| `schemaVersion` | Required format identity: `1`. |
+| `port` | Default `8787`. |
+| `memory` | Optional project memory. |
+| `compression` | Optional per-request tuning |
 
-Use exactly one proxy setting. `url` connects compression to external Headroom and never starts or installs its proxy. `port` selects extension-managed localhost Headroom. Configuring both is rejected.
+### Headroom Proxy
 
-### Compression tuning
+Headroom Proxy attempts to save tokens by compressing requests before they are sent.
 
-The optional `compression` settings travel with every compression request. They work with both managed `port` proxy and external `url` proxy; pi-workbench does not change or restart proxy service configuration.
+- `/wb:headroom-proxy on` — saves this project's compression opt-in, then attempts managed activation.
+- `/wb:headroom-proxy off` — disables this session and removes the project's compression opt-in.
+- `/wb:headroom-proxy status` — reports both this session's state and the project's saved startup choice.
 
 ```json
 {
-  "port": 8787,
   "compression": {
     "mode": "lossless_then_lossy",
     "targetRatio": 0.8,
@@ -77,14 +63,12 @@ The optional `compression` settings travel with every compression request. They 
 
 | Field | Valid values | Meaning |
 |---|---|---|
-| `mode` | `ccr`, `lossy_inline`, `lossless_then_lossy` | Compression pipeline. `ccr` and `lossless_then_lossy` better fit recovery-sensitive workflows. |
+| `mode` | `lossy_inline`, `lossless_then_lossy` | Compression pipeline method. |
 | `targetRatio` | Number `0`–`1` | Requested retained fraction for lossy compression. Lower = more aggressive compression. |
 | `compressUserMessages` | Boolean | Allow compression of user-role messages. |
 | `protectRecent` | Non-negative integer | Number of newest messages left uncompressed. |
 | `protectAnalysisContext` | Boolean | Leave analysis/reasoning context uncompressed. |
 | `frozenMessageCount` | Non-negative integer | Number of earliest messages left uncompressed. |
-
-Headroom selects content transforms automatically.
 
 #### Troubleshoot editing failures
 
@@ -92,47 +76,52 @@ If exact-match edits fail or source edits become unreliable, start with profile 
 
 ### Headroom Memory
 
-Headroom Memory gives Pi durable, project-scoped context. Enable it with `/wb:headroom-memory on`; Pi can then search relevant prior project decisions and save facts only when requested or confirmed.
+Headroom Memory gives Pi durable, project-scoped context. Pi can then search relevant prior project decisions.
 
-Optionally configure a namespace and export directory for sharing Memory through your repository as plain text files:
+- `/wb:headroom-memory on` —  saves this project's Memory opt-in, then attempts managed activation.
+- `/wb:headroom-memory off` — delete this workspace's Memory after confirmation.
+- `/wb:headroom-memory show` — list current records in configured namespace.
+- `/wb:headroom-memory export` — write Memory data into export directory.
+- `/wb:headroom-memory import` — replace configured namespace from export directory; requires confirmation.
+- `/wb:headroom-memory merge` — combine exported Memory with local Memory; exported version wins conflicts.
 
 ```json
 {
-  "memoryNamespace": "project",
   "memory": {
+    "root": "~/",
+    "namespace": "project",
     "export": ".headroom-memory"
   }
 }
 ```
 
-`memory.export` must be a project-relative directory. It enables these commands:
+| Field | Meaning |
+|---|---|
+| `memory.root`  | Optional absolute or `~/` Memory base path for storing memory in a sqlite database. |
+| `memory.namespace` | Logical Memory namespace; default `project`. |
+| `memory.export` | Project-relative bundle directory for export/import memory as plain text files. Must remain inside the project. |
 
-- `show` — list current records in configured namespace.
-- `export` — write Memory data into export directory.
-- `import` — replace configured namespace from export directory; requires confirmation.
-- `merge` — combine exported Memory with local Memory; exported version wins conflicts.
-
-### Code Graph (standalone codebase-memory-mcp)
+## Code Graph
 
 Code Graph gives Pi structural code intelligence: symbol search, call paths, architecture overview, and impact queries over a local index of the current workspace.
 
-The feature is enabled using `/wb:code-graph on` in a workspace. Workspace data is under `~/.pi/pi-workbench/codebase-memory-mcp/`.
+- `/wb:code-graph on` — saves this project's Code-Graph opt-in, then attempts managed activation.
+- `/wb:code-graph off` — delete this workspace's Code-Graph after confirmation.
+- `/wb:code-graph reindex` — reindexes code.
+- `/wb:code-graph status` — reports the status of the Code-Graph.
 
 ### Study Mode
 
-Study Mode adds branch-scoped guidance favoring questions, evidence, explanations, and avoiding changes. It is not a sandbox: tools, commands, Memory, proxy lifecycle, and session behavior remain available. For implementation, it recommends `/wb:study-mode off` or confirming intent; explicit requests can still proceed while enabled.
+Study Mode adds guidance favoring questions, evidence, explanations, and avoiding changes. It is not a sandbox: tools, commands, Memory, proxy lifecycle, and session behavior remain available. For implementation, it recommends `/wb:study-mode off` or confirming intent; explicit requests can still proceed while enabled.
 
-## Commands
+- `/wb:study-mode on` — enables study guidance.
+- `/wb:study-mode off` — disables study guidance.
 
-| Command | Purpose |
-|---|---|
-| `/wb:headroom-proxy [on\|off\|status]` | Control or inspect Headroom context compression. |
-| `/wb:headroom-health` | Show Headroom proxy diagnostics. |
-| `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Manage project-scoped persistent Memory. `show` lists current records. `export`, `import`, and `merge` require `memory.export`. `import` needs UI confirmation or `--confirm-replace`; `off` needs UI confirmation or `--confirm-delete`. |
-| `/wb:code-graph [on\|off\|reindex\|status]` | Enable, disable, reindex, or inspect the standalone `codebase-memory-mcp` code graph for the current workspace. `reindex` updates the index; `off` needs UI confirmation or `--confirm-delete` and deletes only this workspace's code-graph data. |
-| `/wb:preceptor-mode [on\|off\|status]` | Toggle branch-scoped Learning Mode. |
-| `/wb:study-mode [on\|off\|status]` | Toggle branch-scoped Study guidance. Tools and commands remain available. |
-| `/wb:show-system-prompt` | Preview active Pi system prompt additions. |
+### System Prompt
+
+Displays the system prompt which models usually will refuse to do when asked. Even when asked nicely.
+
+- `/wb:show-system-prompt` — Preview assembled prompt guidance.
 
 ## License
 
