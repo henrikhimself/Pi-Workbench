@@ -46,9 +46,11 @@ try {
   await writeFile(join(agent, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" } }));
   const runtime = new ManagedHeadroomRuntime({ paths }); assert.ok(await runtime.ensure(message => console.error(message)));
   const installer = new CodeGraphInstaller({ paths });
+  const { resolveCompressionProject, setCompressionOptIn } = await jiti.import("../src/headroom-project.ts");
   for (const name of ["a", "b"]) {
     const cwd = join(home, name); await mkdir(cwd); await run("git", ["init", "--quiet"], { cwd });
     await writeFile(join(cwd, "fixture.ts"), "export function liveSentinel() { return 978163; }\n");
+    await setCompressionOptIn(resolveCompressionProject(cwd, paths), true);
     const memory = new MemoryManager({ cwd, defaultRoot: paths.headroomMemory, runtime, userId: "fixture" });
     assert.ok(await memory.prepare(message => console.error(message))); await memory.createStore();
     const graph = new CodeGraphManager({ paths, ensureInstalled: cb => installer.ensureInstalled(cb), registerMcp: () => {}, unregisterMcp: () => {} });

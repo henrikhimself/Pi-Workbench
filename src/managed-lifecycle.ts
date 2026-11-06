@@ -51,7 +51,7 @@ export async function ensurePrivateDirectory(root: string, target = root): Promi
   }
 }
 
-async function syncDirectory(directory: string): Promise<void> {
+export async function syncDirectory(directory: string): Promise<void> {
   // Windows does not support opening a directory for fsync.
   if (process.platform === "win32") return;
   const handle = await open(directory, "r");

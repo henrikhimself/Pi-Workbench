@@ -173,7 +173,7 @@ export async function loadHeadroomConfig(configPath = WORKBENCH_PATHS.headroomCo
   }
 }
 
-/** Factory-safe synchronous load. File creation remains deferred to session_start. */
+/** Factory-safe synchronous load. File creation is deferred until opted-in feature use. */
 export function loadHeadroomConfigSync(configPath = WORKBENCH_PATHS.headroomConfig): HeadroomConfig {
   try {
     return parseHeadroomConfigText(readFileSync(configPath, "utf8"));

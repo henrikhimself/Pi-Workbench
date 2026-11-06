@@ -2,13 +2,13 @@
 
 ## Authorization and limits
 
-Assistant owns implementation/testing under approved TODO.md. No staging, commits, publication, production-store changes or real managed-installation changes performed. Tests use owned disposable roots and synthetic facts/code. ARM64 execution and real-user/production-size canaries remain external acceptance.
+Assistant owns baseline implementation/testing under approved TODO.md. User owns host/live acceptance for the subsequent project-opt-in change; assistant runs required offline development checks. No staging, commits, publication, production-store changes or real managed-installation changes performed. Tests use owned disposable roots and synthetic facts/code. ARM64 execution and real-user/production-size canaries remain external acceptance.
 
 ## Available passing evidence
 
-- **256 offline tests, zero failures/skips**, three consecutive isolated full runs on final source (`/tmp/workbench-handoff-offline-{1,2,3}.log`).
+- **274 offline tests, zero failures/skips** after project-opt-in changes (`/tmp/workbench-project-optin-final.log`). Earlier 256-test baseline passed three consecutive isolated runs (`/tmp/workbench-handoff-offline-{1,2,3}.log`).
 - `npm run typecheck` and `git diff --check` pass.
-- **Thirteen** deliberate defects in disposable source copies fail intended assertions: artifact digest, backend version, tool names, namespace, health proof, authored-data loss, MCP registration, SDK transport bypass, plaintext context leakage, headless theme fallback, same-process shim publication, log-handle cleanup and native normalized Memory names. No setup/timeout substitute.
+- **Sixteen** deliberate defects in disposable source copies fail intended assertions: artifact digest, backend version, tool names, namespace, health proof, authored-data loss, MCP registration, SDK transport bypass, plaintext context leakage, headless theme fallback, same-process shim publication, log-handle cleanup, native normalized Memory names, Memory startup gating, compression startup gating and project intent persistence. No setup/timeout substitute.
 - Default test runner isolates HOME/Pi/XDG and removes credentials; policy failures cannot be swallowed by fail-open code.
 - Shipped Python and optional JS harnesses receive syntax validation; runtime client catches bad exit/trailing/truncated stdout.
 - Git staged diff remains empty. No owned native test backends remain after cleanup audit. No generated `__pycache__`/`.pyc` under source/tests.
@@ -29,7 +29,7 @@ Assistant owns implementation/testing under approved TODO.md. No staging, commit
 | Manual downgrade pairing and old AMD64-off outcome | native fixture pair; archived f0f549b ARM-only mapping; user ARM64 handoff |
 | Guidance, Study, bridge semantics | wiring/index/Study/format tests; actual SDK compression fixture preserves tool calls/results and final messages |
 
-## Actual AMD64 native runs
+## Earlier AMD64 native runs
 
 ```bash
 WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs --keep --old-fixture --debian11
@@ -55,7 +55,7 @@ Legacy observations: v0.8.1 artifact CLI says 0.8.1 but MCP metadata reports 0.1
 - Actual SDK helper E2E exposed `compressRaw`-only hook mismatch; version-pinned SDK transport now seals actual `compress()` path and disables unsealed/provider fetch.
 - Guidance follows actually active compatible direct MCP tools, not pending registration intent.
 
-## Actual isolated live Pi acceptance
+## Earlier isolated live Pi acceptance (before project-opt-in follow-up)
 
 ```bash
 WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep
@@ -72,7 +72,15 @@ Fresh passing fixture: `/tmp/wl-w7rCaL`; sanitized report `/tmp/workbench-live-p
 - First Pi startup automatically staged controlled old-pin metadata on disposable current-format graph data, retained a backup, deferred a contending peer, then one normal later activation succeeded. This is a startup-wiring fixture, **not** substitute evidence for real v0.8.1 migration, which passed separately in the native harness.
 - Headless-theme absence, native tool-name normalization, identical-clock shim publication and callback-failure log cleanup received fixes plus focused regressions/negative controls. `session.systemPrompt` is the base getter; actual turn system sections, not that getter, verified injected guidance.
 
-Final mutation report: `/tmp/workbench-handoff-negative.json`, 13 caught defects; retained mutation copies/logs `/tmp/wb-test-quality-fu3S8R`. Typecheck/whitespace checks passed after final source/test changes. Exact credential scan of diff, new files and retained live logs/config was clean; Git index remained empty and no owned live fixture processes remained.
+Baseline mutation report: `/tmp/workbench-handoff-negative.json`, 13 caught defects; retained mutation copies/logs `/tmp/wb-test-quality-fu3S8R`. Typecheck/whitespace checks passed after final source/test changes. Exact credential scan of diff, new files and retained live logs/config was clean; Git index remained empty and no owned live fixture processes remained.
+
+## Project-opt-in follow-up
+
+User approved persistent compression on/off per project and owns acceptance testing. Implementation moves Memory opt-in ahead of root preparation, gates compression restore on explicit canonical-workspace intent, makes config creation lazy, and fences late startup/context work after off. Off preserves active peers/Memory; failed on retains intent and unsaved off reports its persistence failure. Symlink/ownership guards remain unchanged.
+
+Added 18 focused regressions covering absent/symlinked roots, independent Memory restoration, persisted on/off/restart/other-workspace behavior, peer preservation, failed activation/opt-out, corrupt/foreign/unsafe preferences, cancellation and pending startup/context races. Current suite: 274 pass, zero failures/skips; typecheck and whitespace pass. All 16 mutation controls caught intended assertions (`/tmp/workbench-project-optin-negative.json`; retained logs `/tmp/wb-test-quality-hn1g9S`).
+
+No new native/live inference, real host startup or symlinked production-store tests were performed. Earlier native/live evidence above must not be presented as acceptance of the changed startup behavior. The live harness now seeds explicit intent in disposable projects. User procedure: TEST-PROJECT-OPT-IN.md.
 
 ## Remaining external acceptance
 

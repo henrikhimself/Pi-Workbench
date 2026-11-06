@@ -26,7 +26,7 @@ Read [RELEASE-NOTES.md](RELEASE-NOTES.md) before this release: **Headroom makes 
 
 ## Fresh managed Headroom configuration
 
-Canonical file: `~/.pi/pi-workbench/headroom.json`. A missing file is created on session start. An existing incompatible file is rejected **without rewriting it**. Supply a fresh configuration manually and reload/restart Pi.
+Canonical file: `~/.pi/pi-workbench/headroom.json`. A missing file is created only when an opted-in Headroom feature is activated, not for an opted-out project. An existing incompatible file is rejected **without rewriting it**. Supply a fresh configuration manually and reload/restart Pi.
 
 ```json
 {
@@ -80,6 +80,20 @@ Headroom selects content transforms automatically.
 
 If exact-match edits fail or source edits become unreliable, start with profile above. Reload extensions, retry same edit workflow, then compare editing reliability against token savings.
 
+### Project startup opt-in
+
+**Compression and Memory are independently opt-in per project.** Projects without compression opt-in start with compression off—even if a proxy is already running or global compression tuning exists.
+
+- `/wb:headroom-proxy on` saves this project's compression opt-in, then attempts managed activation. Failed activation retains intent for a later startup/retry.
+- `/wb:headroom-proxy off` disables this session and removes the project's compression opt-in. Future sessions start off; already-active peers and Memory remain unchanged.
+- `/wb:headroom-proxy status` reports both this session's state and the project's saved startup choice. If opt-out cannot be saved, this session still stops compression and reports that future startup may retry.
+- Compression intent lives at `~/.pi/pi-workbench/headroom/v1/compression/projects/<workspace-id>/opt-in.json`. Missing marker means off. No old configuration, running service, or existing database implicitly opts compression in.
+- Memory restores only an existing fresh project store/identity marker. Without that opt-in, startup skips Memory root preparation and runtime setup.
+
+Project identity uses the canonical workspace path, matching Memory and Code Graph. Off startup creates no Headroom roots/configuration and emits no disabled-feature root/setup warnings. Symlink/ownership checks remain enforced when a feature is explicitly enabled or restored; this does not authorize symlinked managed storage.
+
+User-owned follow-up acceptance: [TEST-PROJECT-OPT-IN.md](TEST-PROJECT-OPT-IN.md).
+
 ### Headroom Memory
 
 Headroom Memory gives Pi durable, project-scoped context. Enable it with `/wb:headroom-memory on`; Pi can then search relevant prior project decisions and save facts only when requested or confirmed.
@@ -117,7 +131,7 @@ Study Mode adds guidance favoring questions, evidence, explanations, and avoidin
 
 | Command | Purpose |
 |---|---|
-| `/wb:headroom-proxy [on\|off\|status]` | Activate/retry, disable session compression, inspect state. |
+| `/wb:headroom-proxy [on\|off\|status]` | Persist project compression opt-in/out, activate/retry, inspect session/startup state. |
 | `/wb:headroom-health` | Managed ownership/runtime diagnostics. |
 | `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Project Memory. Destructive `off` needs UI confirmation or `--confirm-delete`; `import` needs confirmation or `--confirm-replace`. |
 | `/wb:code-graph [on\|off\|reindex\|status]` | Workspace graph. `off` **deletes** its store after confirmation or `--confirm-delete`; binaries, backups, other workspaces and Memory remain. |

@@ -4,6 +4,10 @@ Status: implementation authorized by user. Execute dependency-ordered tasks belo
 
 Scope: complete the managed Headroom and Code Graph work in `PLAN.md`, validate implementation, then validate the tests themselves. Assistant owns testing. No staging, commits, publication or production-data changes authorized. Installation/service changes are limited to isolated owned test environments.
 
+## Follow-up authority: project startup opt-in
+
+User approved Memory-aware startup and persistent per-project compression on/off. User owns host/live acceptance; assistant runs required offline development checks. Missing compression intent means off, including projects that previously auto-started without explicit intent. TEST-PROJECT-OPT-IN.md records acceptance steps; no follow-up host/live success is claimed.
+
 ## Decisions settled before unattended execution
 
 These decisions supersede conflicting proposals in `PLAN.md`; task 1 reconciles that document before coding.
@@ -14,7 +18,7 @@ These decisions supersede conflicting proposals in `PLAN.md`; task 1 reconciles 
 - **Pins:** Headroom SDK/Python 0.41.0; Code Graph v0.12.1. Use reviewed portable Linux ARM64/AMD64 assets and hashes. Archive/member caps: 64,000,000 / 400,000,000 bytes. Keep all integrity checks.
 - **Isolation:** protected per-workspace Code Graph runtime/cache domains; no shared global cache. Code Graph UI remains disabled. Unknown Headroom port occupants are never contacted with Pi context, adopted, terminated, or bypassed by silent endpoint substitution.
 - **Technical discretion:** choose helper boundaries, explicit new schema/layout identifiers, protected paths, lease/lock records and tested bounded timeouts within approved invariants. Retain new-format port/compression/Memory options and default managed port 8787. No extra user-facing features/commands.
-- **Lifetime:** compression off affects the requesting session, not Memory or peers. Creator exit cannot terminate a peer's managed service. Last-consumer release permits owned-service shutdown. Failed components do not disable unrelated healthy features.
+- **Lifetime:** compression off disables the requesting session and opts that project out of future startup; already-active peers and Memory remain unchanged. Creator exit cannot terminate a peer's managed service. Last-consumer release permits owned-service shutdown. Failed components do not disable unrelated healthy features.
 - **Backups:** retain until explicit manual cleanup; no expiration, pruning, overwrite, fixed aggregate quota, or cleanup command. Estimate candidate/staging/backup space with a tested margin; refuse an upgrade if safe capacity cannot be established. Document quiescent manual cleanup.
 - **Testing authority for future execution:** verified downloads, disposable containers, temporary venv/model installs, isolated owned services, and synthetic live Pi/compression tests are permitted. Never use real user stores or arbitrary running Headroom/Code Graph services.
 - **Local inference only:** use `llama.cpp/Ornith-1.5-35B-A3B-q5-mtp0` through the configured router, currently `http://192.168.2.48:8000`. Never use paid/cloud-provider fallback. User keeps the model ready; tests must not load/unload models, restart/reconfigure the router, or change global defaults. Use bounded requests/timeouts and synthetic data only.
@@ -204,3 +208,14 @@ Depends on: 15, 16, 17.
 - [x] Report completed work, exact passing/failing/unrun checks, `TEST-ARM64.md`, retained backups and blockers. Do not stage, commit, publish or call ARM64 verified.
 
 Done: permitted AMD64 live acceptance passed with exact already-loaded local model, actual SDK/RPC/TUI, controlled startup upgrade/deferral/retry, native tools, sealed context compression and clean peer shutdown. IMPLEMENTATION-REPORT.md records scope and retained evidence. Final suite: 256 pass, zero failures/skips, three runs; 13 intended mutation assertions caught. Native ARM64/production-size/real-user canaries remain external, not claimed. No staging, commit or publication performed.
+
+### 19. Make Headroom startup project-opt-in aware
+
+- [x] Check existing Memory opt-in before root/config/runtime preparation.
+- [x] Default compression off without explicit canonical-workspace intent.
+- [x] Persist existing compression on/off commands per project; restore on restart without affecting active peers/Memory.
+- [x] Keep symlink/ownership guards and original-context fail-open behavior; fence pending startup/context work after off.
+- [x] Update isolated live fixtures, docs and user test procedure; pass 274 offline regressions, typecheck/whitespace and all 16 mutation controls.
+- [ ] User verifies original symlinked setup, safe isolated persistence/peer behavior and optional live Pi acceptance using TEST-PROJECT-OPT-IN.md.
+
+Implementation and offline checks complete. Host/live acceptance remains user-owned and unverified for this follow-up; prior AMD64 live evidence predates the new startup behavior.

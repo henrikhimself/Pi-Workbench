@@ -38,6 +38,8 @@ curl -fsS http://127.0.0.1:8787/health
 
 ## Development rules
 
+- Compression startup is project-opt-in; existing on/off commands persist project intent. Missing marker means off. Do not prepare Headroom roots/config/runtime for opted-out features.
+- Memory startup checks existing fresh project-store opt-in before managed-root preparation. Preserve symlink/ownership guards for actual activation.
 - Keep compression fail-open. Proxy or request failure must leave original Pi context usable.
 - After compression failure, mark proxy offline or restart managed proxy only when health check also fails. Healthy proxy requests retry on later turns.
 - Run `npm test` and `npm run typecheck` after source or test changes. Do not run live E2E unless requested.

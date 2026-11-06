@@ -6,7 +6,9 @@ Choosing this extension upgrade authorizes its pinned backend upgrades. Eligible
 
 Active peers, unverifiable/insufficient space, incompatible identities, and validation failures defer the affected feature. Original Pi context stays usable. Correct the condition, close peers normally where appropriate, and retry normal activation. There is no forced shutdown or unbounded restart/upgrade loop.
 
-The release does not opt Memory or Code Graph in merely to upgrade them. Compression remains session-local; Memory and peer lifetimes stay independent.
+This release does not opt compression, Memory or Code Graph in merely to upgrade them. Compression now requires explicit per-project startup opt-in: `/wb:headroom-proxy on` persists intent; `off` removes it and disables the requesting session. Existing projects without that marker now start compression off. Global tuning or a running proxy is not opt-in. Already-active peers and Memory remain independent.
+
+Memory startup checks project opt-in before preparing its managed root. When both Headroom features are off, startup creates no Headroom roots/configuration and emits no disabled-feature root/setup warnings. Symlink safety is unchanged: explicit activation or opted-in restore can still reject unsafe paths. Compression intent is saved before activation, retained through backend failure, and validated under managed-path/identity guards. Unknown state is not rewritten. User-owned follow-up acceptance: TEST-PROJECT-OPT-IN.md.
 
 ## Headroom: intentional first-release clean break
 
@@ -97,10 +99,12 @@ Available AMD64 gates exercised actual managed installer/manager paths, two work
 
 Fresh Headroom runtime acceptance exercised sealed compression, public content-route denial, owned SQLite CCR retrieval/TTL, creator exit/crash recovery, CPU Memory save/search, native relationship bundle preservation, backups, model/store-validation failure independence, and Memory-only operation.
 
-Offline tests use isolated HOME/Pi/XDG roots and enforced network/installer/service policy. Thirteen deliberate source defects fail the intended assertions in disposable copies. Syntax checks cover shipped Python and opt-in JS adapters; runtime clients reject nonzero exits, protocol garbage, and truncated frames.
+Offline tests use isolated HOME/Pi/XDG roots and enforced network/installer/service policy. Sixteen deliberate source defects fail the intended assertions in disposable copies. Syntax checks cover shipped Python and opt-in JS adapters; runtime clients reject nonzero exits, protocol garbage, and truncated frames.
 
-Isolated AMD64 live Pi acceptance also passed actual SDK peers, separate RPC and interactive PTY processes, exact already-loaded local-model Memory tool calls, direct-tool removal, normalized prompt guidance, Study Mode commands and last-consumer shutdown. Pi's context hook saved 4,070 tokens on explicitly synthetic historical tool-output input. Fresh startup automatically upgraded a controlled old-pin fixture with retained backup and safely deferred/retried a contending peer. Real v0.8.1 data migration is covered separately by the native harness, not inferred from that controlled fixture.
+Before the project-opt-in follow-up, isolated AMD64 live Pi acceptance passed actual SDK peers, separate RPC and interactive PTY processes, exact already-loaded local-model Memory tool calls, direct-tool removal, normalized prompt guidance, Study Mode commands and last-consumer shutdown. Pi's context hook saved 4,070 tokens on explicitly synthetic historical tool-output input. Fresh startup automatically upgraded a controlled old-pin fixture with retained backup and safely deferred/retried a contending peer. Real v0.8.1 data migration is covered separately by the native harness, not inferred from that controlled fixture.
 
 Live gates found and fixed absent headless UI themes, normalized Memory tool names, same-process curl-shim temporary-name collisions and log-handle cleanup on callback failure. With `--no-extensions`, add `-e builtin:mcp` explicitly; startup progress alone does not prove direct tools are connected.
+
+The opt-in follow-up has 274 passing offline regressions and 16 caught mutation controls; its host/live acceptance remains user-owned and has not been rerun by the assistant. The live harness now explicitly seeds compression opt-in in its disposable workspaces.
 
 These are synthetic, disposable tests—not native ARM64 execution, production-size upgrade evidence, or a real-user canary. ARM64 final acceptance belongs to the user. No shared router/model controls, paid/default inference or real user stores were used.

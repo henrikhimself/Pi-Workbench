@@ -134,7 +134,7 @@ export class MemoryManager {
     } finally { await acquired?.lease.release(); }
   }
 
-  /** Ensure configured/default Memory root exists even before project opt-in. */
+  /** Prepare configured/default Memory root for explicit use or opted-in restore. */
   async ensureRoot(): Promise<void> {
     await ensurePrivateDirectory(this.store.root);
     if (this.recoveryPending) throw new Error(`Incomplete Memory publication; preserve recovery paths in ${this.pendingPath}`);

@@ -112,7 +112,7 @@ try {
   assert.equal(await proxy.healthCheck(), true, "separate CLI process exit preserves SDK peers");
   await b.session.prompt("/wb:headroom-proxy off"); assert.ok(named(b.session, "memory_search"));
   assert.equal(await proxy.healthCheck(), true, "different-workspace peer still consumes proxy");
-  checks.push("session compression off/creator disposal preserve Memory and proxy peers");
+  checks.push("persisted project compression off/creator disposal preserve already-active Memory and proxy peers");
   await b.dispose(); await c.dispose();
   await wait(async () => !await proxy.healthCheck(), "last consumer shutdown", 15000);
   checks.push("last real Pi consumers release owned proxy");

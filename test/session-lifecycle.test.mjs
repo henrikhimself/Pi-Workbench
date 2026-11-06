@@ -7,6 +7,7 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const { default: extension } = await jiti.import("../src/index.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
+const { resolveCompressionProject, setCompressionOptIn } = await jiti.import("../src/headroom-project.ts");
 
 // A deliberately unresolved bootstrap proves session_start does not await it.
 test("SDK without UI theme stays non-blocking; shutdown fences late readiness and preserves original context", { timeout: 5000 }, async () => {
@@ -24,8 +25,10 @@ test("SDK without UI theme stays non-blocking; shutdown fences late readiness an
   try {
     await mkdir(paths.root, { recursive: true, mode: 0o700 });
     await writeFile(paths.headroomConfig, JSON.stringify({ schemaVersion: 1 }));
+    await setCompressionOptIn(resolveCompressionProject(home, paths), true);
     extension(pi, { workbenchPaths: paths, proxyManager: proxy });
-    await handlers.get("session_start")({}, ctx);
+    await assert.doesNotReject(handlers.get("session_start")({}, ctx), "missing theme must not interrupt actual progress callback");
+    for (let attempt = 0; attempt < 100 && !started; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.equal(started, true);
     assert.ok(statuses.some(([, text]) => text === "fixture proxy starting"), "missing theme must not interrupt actual progress callback");
     const event = { messages: [{ role: "user", content: "keep original", timestamp: 1 }] };

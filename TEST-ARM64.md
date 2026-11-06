@@ -46,7 +46,7 @@ git diff --check
 node test/test-quality.mjs --keep > arm64-test-quality.json 2> arm64-test-quality.log
 ```
 
-`npm test` isolates HOME/Pi/XDG and credentials. It must finish with no unexplained failures/skips. Policy self-tests deliberately reject external/default-proxy access, DNS, installers and shell execution. Syntax checks include opt-in adapters. The mutation report must contain **thirteen caught deliberate defects** with intended assertions, not setup/timeout errors.
+`npm test` isolates HOME/Pi/XDG and credentials. It must finish with no unexplained failures/skips. Policy self-tests deliberately reject external/default-proxy access, DNS, installers and shell execution. Syntax checks include opt-in adapters. The mutation report must contain **sixteen caught deliberate defects** with intended assertions, not setup/timeout errors.
 
 ## 3. Actual native Code Graph, old-data upgrade and recovery
 
@@ -144,11 +144,11 @@ pi --no-extensions -e builtin:mcp -e "$SRC" --model llama.cpp/Ornith-1.5-35B-A3B
 
 Then test:
 
-1. `/wb:headroom-health`, `/wb:headroom-proxy status`, `/wb:headroom-memory on`, `/wb:code-graph on`. Wait for actual direct MCP tools, not only a progress label.
+1. On fresh workspace A, `/wb:headroom-proxy status` must show session/startup off, without Headroom root/setup warnings. Run `/wb:headroom-proxy on`, then `/wb:headroom-health`, `/wb:headroom-memory on` and `/wb:code-graph on`. Wait for actual direct MCP tools, not only a progress label. Restart and confirm saved compression opt-in restores; off then restart must remain off.
 2. Ask the exact local model to save/search a clearly labeled synthetic Memory sentinel and query a synthetic code symbol. Inspect tool-call evidence.
 3. `/wb:show-system-prompt` before/after Study Mode and Code Graph off; unavailable/disabled guidance must disappear. Study Mode is guidance, not an action sandbox.
 4. Open a second Pi peer with the same scratch home/workspace. Compression off or creator exit must not stop the peer or Memory. Close the last peer and verify owned drain.
-5. Open workspace B with the same scratch runtime and verify separate Memory/graph stores and IPC domains.
+5. Open fresh workspace B with the same scratch runtime: compression/Memory must start off independently of A. Explicitly enable features there before checking separate Memory/graph stores and IPC domains. See TEST-PROJECT-OPT-IN.md for opt-out/peer/symlink acceptance.
 6. Exercise status/reindex and synthetic destructive off confirmations; busy peers must preserve data and report deferral. Retry after normal peer closure.
 7. With an unknown occupant on the scratch configured proxy port, compression fails open and sends no plaintext context; never kill that process to obtain success.
 

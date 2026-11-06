@@ -1,6 +1,6 @@
 # Managed services: implemented architecture and acceptance record
 
-Implementation authorized; testing owned by assistant. `TODO.md` records dependency-ordered execution. No staging, commits, publication, production-data changes, or real managed-installation changes are authorized. Runtime tests use disposable owned homes/stores/services only.
+Implementation authorized. Baseline testing owned by assistant; project-opt-in follow-up host/live acceptance is user-owned (TEST-PROJECT-OPT-IN.md). `TODO.md` records dependency-ordered execution. No staging, commits, publication, production-data changes, or real managed-installation changes are authorized. Runtime tests use disposable owned homes/stores/services only.
 
 This document supersedes the pre-implementation proposals with implemented contracts. Product decisions remain those approved in `TODO.md`; native ARM64 and real-user canaries are external acceptance, not implied by AMD64 tests.
 
@@ -90,6 +90,10 @@ Custom Memory bases add `workbench-memory-v1` before project stores/coordination
 
 ## 4. Headroom contracts
 
+### Project startup choices
+
+Compression defaults off without a validated per-workspace marker in `headroom/v1/compression/projects/<workspace-id>/opt-in.json`. Existing on/off commands persist project intent; on retains intent through activation failure, off preserves Memory and already-active peers. Passive missing-marker checks create no managed directories. Memory checks existing fresh-store opt-in before root/config preparation. Global config creation is deferred until opted-in use. Preference publication/removal is locked and durable; unsafe/unknown existing markers fail closed unchanged. Startup and context callbacks are fenced against later commands/session transitions.
+
 ### Fresh configuration
 
 `schemaVersion:1`; optional managed port, compression, fresh Memory base/namespace/bundle settings. Missing configuration is created; incompatible existing files/URL fields are rejected without value conversion or rewriting. No legacy probing or setting reuse.
@@ -144,7 +148,7 @@ Format bridge regressions cover text, tool calls/results, thinking, images, chan
 
 - `npm test` isolates HOME/Pi/XDG and removes credentials. Enforced entry-point policy rejects external/default-proxy network, DNS, native service/package commands and shell execution; swallowed fail-open errors still fail worker exit.
 - Current offline suite is green with zero unexplained skips/failures; typecheck and whitespace checks pass.
-- Thirteen disposable-source mutations fail intended assertions: digest, backend version, tool-name set, namespace propagation, health proof, authored-data loss, direct MCP registration, SDK transport bypass, plaintext context leak, absent headless theme, concurrent shim publication, log-handle leak and normalized Memory tool names. No working-tree mutation or setup/timeout substitute.
+- Sixteen disposable-source mutations fail intended assertions: digest, backend version, tool-name set, namespace propagation, health proof, authored-data loss, direct MCP registration, SDK transport bypass, plaintext context leak, absent headless theme, concurrent shim publication, log-handle leak, normalized Memory tool names, Memory startup gating, compression startup gating and persistent compression intent. No working-tree mutation or setup/timeout substitute.
 - Syntax checks include shipped Python and opt-in JS adapters. Runtime MCP helper rejects nonzero exit, malformed/truncated protocol stdout.
 
 ### Actual AMD64 runtime
@@ -157,7 +161,9 @@ The v0.12.1 portable artifact CLI/MCP passed a network-disabled Debian 11/glibc 
 
 Legacy v0.8.1 CLI identifies 0.8.1 while its MCP metadata reports 0.10.0. Legacy fixture evidence records this quirk; production v0.12.1 checks stay strict.
 
-### Actual isolated live Pi
+### Earlier isolated live Pi (before project-opt-in follow-up)
+
+The follow-up live harness explicitly seeds per-project compression intent. New host/live acceptance is user-owned and not yet verified; see TEST-PROJECT-OPT-IN.md.
 
 `WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep` passed fresh AMD64 setup, three actual SDK sessions, a separate RPC process and an interactive PTY. Exact already-loaded authorized local model completed native Memory tool turns in SDK and RPC. Actual Pi context compression saved 4,070 tokens on explicit synthetic historical tool-output input; fixture history was not model-generated. Turn system sections contained normalized Memory guidance. Peer/workspace isolation, tool removal, busy-data preservation, creator exit, last-consumer shutdown, Study Mode commands and normal retry after startup contention passed. Automatic startup upgrade used controlled old-pin metadata on disposable current-format data; real v0.8.1 artifact/data preservation remains separately evidenced by the native harness.
 

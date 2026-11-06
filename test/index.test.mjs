@@ -10,8 +10,11 @@ import { join } from "node:path";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
-const fixtureHomes = [];
-afterEach(async () => { for (const home of fixtureHomes.splice(0)) await rm(home, { recursive: true, force: true }); });
+const fixtureHomes = [], fixtureShutdowns = [];
+afterEach(async () => {
+  for (const shutdown of fixtureShutdowns.splice(0)) await shutdown();
+  for (const home of fixtureHomes.splice(0)) await rm(home, { recursive: true, force: true });
+});
 async function installExtension(mod, pi, options = {}) {
   const home = await mkdtemp(join(tmpdir(), "wb-index-isolated-")); fixtureHomes.push(home);
   const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
@@ -19,7 +22,7 @@ async function installExtension(mod, pi, options = {}) {
   const { probeHealth = false, ...extensionOptions } = options;
   const configPath = options.headroomConfigPath ?? paths.headroomConfig;
   if (!options.headroomConfigPath) {
-    await mkdir(paths.root, { recursive: true });
+    await mkdir(paths.root, { recursive: true, mode: 0o700 });
     await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
   }
   const proxyManager = {
@@ -38,7 +41,15 @@ async function installExtension(mod, pi, options = {}) {
       } catch { return false; }
     },
   };
-  mod.default(pi, { workbenchPaths: paths, headroomConfigPath: configPath, proxyManager, ...extensionOptions });
+  const commands = new Map(), handlers = new Map();
+  mod.default({ ...pi,
+    on: (name, handler) => { handlers.set(name, handler); return pi.on?.(name, handler); },
+    registerCommand: (name, command) => { commands.set(name, command); pi.registerCommand?.(name, command); },
+  }, { workbenchPaths: paths, headroomConfigPath: configPath, proxyManager, ...extensionOptions });
+  fixtureShutdowns.push(() => handlers.get("session_shutdown")());
+  // Compression-specific tests explicitly opt their isolated workspace in.
+  await commands.get("wb:headroom-proxy").handler("on", { cwd: home, ui: { setStatus() {}, notify() {} } });
+  return { commands, home, paths };
 }
 
 test("context: compression failure marks proxy offline instead of accepting an SDK fallback", async () => {
@@ -509,11 +520,12 @@ test("session_start: invalid headroom.json compression disables compression with
     };
 
     const mod = await jiti.import("../src/index.ts");
-    await installExtension(mod, pi, { headroomConfigPath: configPath });
+    const fixture = await installExtension(mod, pi, { headroomConfigPath: configPath });
 
     const statuses = [];
     const notifications = [];
     const ctx = {
+      cwd: fixture.home,
       sessionManager: {
         getBranch: () => [
           {
@@ -531,6 +543,7 @@ test("session_start: invalid headroom.json compression disables compression with
     };
 
     await handlers.get("session_start")({}, ctx);
+    for (let attempt = 0; attempt < 100 && !notifications.length; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
     assert.ok(statuses.some((status) => status?.includes("Headroom offline")));
     assert.ok(statuses.some((status) => status?.includes("✓ Study")));
     assert.ok(
@@ -554,10 +567,10 @@ test("context: unsupported URL config sends no context and never rewrites existi
     let requests = 0; globalThis.fetch = async () => { requests++; throw new Error("must not contact URL"); };
     const handlers = new Map(), notifications = [];
     const mod = await jiti.import("../src/index.ts");
-    await installExtension(mod, { on: (name, handler) => handlers.set(name, handler), registerCommand() {} }, { headroomConfigPath: configPath });
-    const result = await handlers.get("context")({ messages: [{ role: "user", content: "private synthetic context", timestamp: 1 }] }, {
-      ui: { theme: { fg: (_color, text) => text }, setStatus() {}, notify: message => notifications.push(message) },
-    });
+    const fixture = await installExtension(mod, { on: (name, handler) => handlers.set(name, handler), registerCommand() {} }, { headroomConfigPath: configPath });
+    const ctx = { cwd: fixture.home, ui: { theme: { fg: (_color, text) => text }, setStatus() {}, notify: message => notifications.push(message) } };
+    await fixture.commands.get("wb:headroom-proxy").handler("on", ctx);
+    const result = await handlers.get("context")({ messages: [{ role: "user", content: "private synthetic context", timestamp: 1 }] }, ctx);
     assert.equal(result, undefined); assert.equal(requests, 0);
     assert.ok(notifications.some(message => message.includes("url is unsupported")));
     assert.equal(await (await import("node:fs/promises")).readFile(configPath, "utf8"), original);

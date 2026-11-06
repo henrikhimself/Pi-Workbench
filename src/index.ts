@@ -2,7 +2,7 @@
  * pi-workbench — Transparent LLM context compression for Pi using Headroom.
  *
  * Hooks into Pi's `context` event to compress messages before every LLM call.
- * Automatically installs and manages the Headroom proxy (zero-config).
+ * Restores explicit project compression opt-in and manages its Headroom proxy.
  *
  * Configure proxy and Memory through ~/.pi/pi-workbench/headroom.json.
  */
@@ -31,6 +31,8 @@ import {
 } from "./headroom-config.js";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import { MemoryManager, MEMORY_SERVER_NAME } from "./memory-manager.js";
+import { compressionOptedIn, resolveCompressionProject, setCompressionOptIn } from "./headroom-project.js";
+import { assertNoSymlink } from "./managed-lifecycle.js";
 import {
   CODE_GRAPH_GUIDANCE_MESSAGE,
   CodeGraphManager,
@@ -78,7 +80,9 @@ export default function piWorkbenchExtension(
   }
   // ─── State ──────────────────────────────────────────────────────────
 
-  let enabled = true;
+  let enabled = false;
+  let compressionGeneration = 0;
+  let compressionPreferenceWork: Promise<void> = Promise.resolve();
   let proxyAvailable: boolean | null = null;
   let proxyWarningShown = false;
   let compressionWarningShown = false;
@@ -247,7 +251,7 @@ export default function piWorkbenchExtension(
     return renderer.buildSystemPrompt({ ...options, sections });
   }
 
-  function managerFor(ctx: ExtensionContext): MemoryManager | null {
+  function managerFor(ctx: ExtensionContext, passive = false): MemoryManager | null {
     if (portConfigError) { setMemoryStatus(ctx, "off"); return null; }
     try {
       const manager = new MemoryManager({
@@ -262,7 +266,7 @@ export default function piWorkbenchExtension(
       if (memoryRegistered && memoryRegistrationDirectory !== manager.store.directory) {
         pi.unregisterMcpServer(MEMORY_SERVER_NAME); memoryRegistered = false; memoryRegistrationDirectory = null;
       }
-      if (manager.store.rootConfigured && manager.store.rootInsideProject && !memoryRootWarningShown) {
+      if ((!passive || manager.enabled) && manager.store.rootConfigured && manager.store.rootInsideProject && !memoryRootWarningShown) {
         memoryRootWarningShown = true;
         ctx.ui.notify(
           "headroom.json memoryRoot resolves inside this project. Memory SQLite data may enter repository tooling; Git LFS stores blobs but cannot merge database writes.",
@@ -272,8 +276,8 @@ export default function piWorkbenchExtension(
       return manager;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Headroom Memory disabled: ${message}`, "error");
-      setMemoryStatus(ctx, "offline");
+      if (!passive) ctx.ui.notify(`Headroom Memory disabled: ${message}`, "error");
+      setMemoryStatus(ctx, passive ? "off" : "offline");
       return null;
     }
   }
@@ -355,22 +359,23 @@ export default function piWorkbenchExtension(
   /** Prepare and register project Memory. Missing store is intentionally a no-op. */
   async function startMemory(ctx: ExtensionContext, createStore: boolean): Promise<boolean> {
     const generation = lifecycleGeneration;
-    const manager = managerFor(ctx);
+    const manager = managerFor(ctx, !createStore);
     if (!manager) return false;
+    if (!createStore && !manager.enabled) {
+      setMemoryStatus(ctx, "off");
+      return false;
+    }
 
     try {
       await manager.ensureRoot();
+      if (!currentGeneration(generation)) return false;
+      await ensureConfiguration(ctx);
       if (!currentGeneration(generation)) return false;
     } catch (error) {
       if (!currentGeneration(generation)) return false;
       const message = error instanceof Error ? error.message : String(error);
       setMemoryStatus(ctx, "offline");
       ctx.ui.notify(`Headroom Memory root unavailable: ${message}`, "warning");
-      return false;
-    }
-
-    if (!createStore && !manager.enabled) {
-      setMemoryStatus(ctx, "off");
       return false;
     }
 
@@ -429,43 +434,73 @@ export default function piWorkbenchExtension(
     }
   }
 
-  // ─── Session start: install/start proxy or health-check ─────────────
+  /** Only opted-in features create configuration or prepare managed storage. */
+  async function ensureConfiguration(ctx: ExtensionContext): Promise<void> {
+    await assertNoSymlink(headroomConfigPath);
+    if (await ensureHeadroomConfigFile(headroomConfigPath)) ctx.ui.notify("Created fresh managed Headroom configuration.", "info");
+  }
+
+  const compressionCurrent = (generation: number, epoch: number) =>
+    currentGeneration(generation) && epoch === compressionGeneration;
+
+  async function activateCompression(ctx: ExtensionContext, generation: number, epoch: number): Promise<boolean> {
+    if (!compressionCurrent(generation, epoch)) return false;
+    if (portConfigError || !proxyManager) {
+      enabled = false; proxyAvailable = false;
+      ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
+      ctx.ui.notify(`Headroom compression disabled: ${portConfigError}`, "error");
+      return false;
+    }
+    await ensureConfiguration(ctx);
+    if (!compressionCurrent(generation, epoch)) return false;
+    enabled = true; proxyAvailable = false;
+    await proxyManager.resume();
+    if (!compressionCurrent(generation, epoch) || !enabled) return false;
+    const ok = await proxyManager.ensureRunning(message => {
+      if (compressionCurrent(generation, epoch) && enabled) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", message));
+    });
+    if (!compressionCurrent(generation, epoch) || !enabled) return false;
+    proxyAvailable = ok;
+    if (ok) startProxyWatchdog(ctx);
+    ctx.ui.setStatus("headroom-proxy", colorText(ctx, ok ? "success" : "warning", ok ? "✓ Headroom" : "⚠ Headroom offline"));
+    return ok;
+  }
+
+  // ─── Session start: restore explicit per-project choices ───────────
 
   pi.on("session_start", async (_event, ctx) => {
     sessionAbort.abort(); sessionAbort = new AbortController();
     sessionClosed = false; const generation = ++lifecycleGeneration;
+    const epoch = ++compressionGeneration;
     headroomRuntime.setSignal(sessionAbort.signal); codeGraphInstaller.setSignal(sessionAbort.signal);
     stopProxyWatchdog();
+    const previousCompression = enabled;
+    enabled = false; proxyAvailable = false;
+    if (previousCompression && proxyManager) background(proxyManager.stop(), ctx, "Previous managed proxy stop", generation);
     const previousGraph = codeGraphManager; codeGraphManager = null;
     if (previousGraph) background(previousGraph.shutdown(), ctx, "Previous graph shutdown", generation);
     if (memoryRegistered) pi.unregisterMcpServer(MEMORY_SERVER_NAME);
     memoryRegistered = false; memoryRegistrationDirectory = null;
-    try {
-      if (await ensureHeadroomConfigFile(headroomConfigPath)) ctx.ui.notify("Created fresh managed Headroom configuration.", "info");
-    } catch { ctx.ui.notify("Headroom configuration could not be created; existing files were not changed.", "warning"); }
     restoreStudyState(ctx); codeGraphGuidanceActive = false;
     proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false;
     memoryRootWarningShown = false; sessionTotals = { calls: 0, tokensSaved: 0 };
+    ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
     const proxyJob = async () => {
-      if (portConfigError || !proxyManager) {
+      try {
+        const optedIn = await compressionOptedIn(resolveCompressionProject(ctx.cwd ?? process.cwd(), paths));
+        if (!compressionCurrent(generation, epoch) || !optedIn) return;
+        const ok = await activateCompression(ctx, generation, epoch);
+        if (!ok && compressionCurrent(generation, epoch) && !portConfigError) {
+          ctx.ui.notify("Managed Headroom unavailable; original context remains usable. Project opt-in retained; retry /wb:headroom-proxy on.", "warning");
+        }
+      } catch (error) {
+        if (!compressionCurrent(generation, epoch)) return;
         enabled = false; proxyAvailable = false;
         ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
-        ctx.ui.notify(`Headroom compression disabled: ${portConfigError}`, "error"); return;
+        ctx.ui.notify(`Project Headroom compression unavailable: ${String(error)}`, "warning");
       }
-      enabled = true; proxyAvailable = null;
-      await proxyManager.resume();
-      if (!currentGeneration(generation)) return;
-      const ok = await proxyManager.ensureRunning(message => {
-        if (currentGeneration(generation)) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", message));
-      });
-      if (!currentGeneration(generation) || !enabled) return;
-      proxyAvailable = ok;
-      if (ok) startProxyWatchdog(ctx);
-      ctx.ui.setStatus("headroom-proxy", colorText(ctx, ok ? "success" : "warning", ok ? "✓ Headroom" : "⚠ Headroom offline"));
-      if (!ok) ctx.ui.notify("Managed Headroom unavailable; original context remains usable. Retry /wb:headroom-proxy on.", "warning");
     };
-    // Startup work is independent and non-blocking: package/model preparation
-    // must not obstruct ordinary Pi tools or delay other healthy components.
+    // Passive off checks never create roots/config or start backend preparation.
     background(proxyJob(), ctx, "Managed proxy startup", generation);
     background(startMemory(ctx, false), ctx, "Memory startup", generation);
     background(restoreCodeGraph(ctx), ctx, "Code Graph startup", generation);
@@ -499,11 +534,14 @@ export default function piWorkbenchExtension(
   // ─── Core: compress context before every LLM call ───────────────────
 
   pi.on("context", async (event, ctx) => {
-    const generation = lifecycleGeneration;
-    if (sessionClosed || !enabled || proxyAvailable === false) return;
+    const generation = lifecycleGeneration, epoch = compressionGeneration;
+    const active = () => compressionCurrent(generation, epoch) && enabled;
+    if (!active() || proxyAvailable === false) return;
 
     // Never send context without a current managed consumer lease and attested health.
-    if (portConfigError || !(await checkActiveProxy()).ok) {
+    const health = portConfigError ? { ok: false } : await checkActiveProxy();
+    if (!active()) return;
+    if (!health.ok) {
       proxyAvailable = false;
       ctx.ui.notify(`Headroom proxy unavailable: ${portConfigError ?? "managed ownership/health could not be verified"}`, "warning");
       ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
@@ -525,7 +563,7 @@ export default function piWorkbenchExtension(
         ...(headroomConfig.compression ? { config: headroomConfig.compression } : {}),
       });
 
-      if (!currentGeneration(generation)) return;
+      if (!active()) return;
       compressionWarningShown = false;
 
       if (!result.compressed || result.tokensSaved <= 0) {
@@ -571,9 +609,10 @@ export default function piWorkbenchExtension(
 
       return { messages: compressedPiMessages as any };
     } catch (error) {
-      if (!currentGeneration(generation)) return;
+      if (!active()) return;
       const errMsg = error instanceof Error ? error.message : String(error);
       const health = await checkActiveProxy();
+      if (!active()) return;
 
       if (health.ok) {
         proxyAvailable = true;
@@ -603,9 +642,9 @@ export default function piWorkbenchExtension(
       if (proxyManager && !restartAttempted) {
         restartAttempted = true;
         const recovered = await proxyManager.tryRestart((msg) => {
-          if (currentGeneration(generation)) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", `⏳ ${msg}`));
+          if (active()) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", `⏳ ${msg}`));
         });
-        if (!currentGeneration(generation) || !enabled) return;
+        if (!active()) return;
         if (recovered) {
           proxyAvailable = true;
           proxyWarningShown = false;
@@ -624,30 +663,54 @@ export default function piWorkbenchExtension(
   // ─── /wb:headroom-proxy command — toggle and status ────────────────
 
   pi.registerCommand("wb:headroom-proxy", {
-    description: "Toggle managed Headroom compression. Usage: /wb:headroom-proxy [on|off|status]",
+    description: "Persist project compression on/off, or show status. Usage: /wb:headroom-proxy [on|off|status]",
     handler: async (args, ctx) => {
       const action = args.trim().toLowerCase();
-      if (action === "off") {
+      if (action === "off" || action === "on") {
+        const generation = lifecycleGeneration, epoch = ++compressionGeneration;
+        const signal = sessionAbort.signal;
         enabled = false; proxyAvailable = false; stopProxyWatchdog();
-        if (proxyManager) background(proxyManager.stop(), ctx, "Managed proxy stop");
-        ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
-        ctx.ui.notify("Headroom compression disabled for this session; Memory and peers are unchanged", "info");
+        if (action === "off") {
+          if (proxyManager) background(proxyManager.stop(), ctx, "Managed proxy stop");
+          ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
+        }
+        // Serialize commands in this session; the managed lock coordinates peers.
+        const update = compressionPreferenceWork.then(async () => {
+          if (!compressionCurrent(generation, epoch)) return false;
+          await setCompressionOptIn(resolveCompressionProject(ctx.cwd ?? process.cwd(), paths), action === "on", signal);
+          return true;
+        });
+        compressionPreferenceWork = update.then(() => {}, () => {});
+        try {
+          if (!await update || !compressionCurrent(generation, epoch)) return;
+          if (action === "off") {
+            ctx.ui.notify("Headroom compression disabled for this project and session; Memory and active peers are unchanged", "info");
+            return;
+          }
+          proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false;
+          const ok = await activateCompression(ctx, generation, epoch);
+          if (!compressionCurrent(generation, epoch)) return;
+          ctx.ui.notify(ok ? "Headroom compression enabled for this project" : "Managed Headroom unavailable; project opt-in retained and context remains usable",
+            ok ? "info" : "warning");
+        } catch (error) {
+          if (!compressionCurrent(generation, epoch)) return;
+          enabled = false; proxyAvailable = false;
+          ctx.ui.setStatus("headroom-proxy", colorText(ctx, action === "off" ? "dim" : "warning", action === "off" ? "○ Headroom off" : "⚠ Headroom offline"));
+          ctx.ui.notify(action === "off"
+            ? `Compression disabled for this session, but project opt-out could not be saved; startup may retry. ${String(error)}`
+            : `Project compression opt-in/activation failed; context remains usable. ${String(error)}`, "warning");
+        }
         return;
       }
-      if (action === "on") {
-        if (portConfigError || !proxyManager) { ctx.ui.notify(`Headroom configuration error: ${portConfigError}`, "error"); return; }
-        enabled = true; proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false;
-        await proxyManager.resume();
-        proxyAvailable = await proxyManager.ensureRunning((message) => ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", message)));
-        if (proxyAvailable) startProxyWatchdog(ctx);
-        ctx.ui.setStatus("headroom-proxy", colorText(ctx, proxyAvailable ? "success" : "warning", proxyAvailable ? "✓ Headroom" : "⚠ Headroom offline"));
-        ctx.ui.notify(proxyAvailable ? "Headroom compression enabled" : "Managed Headroom unavailable; context remains usable", proxyAvailable ? "info" : "warning");
-        return;
-      }
+      let projectStartup: string;
+      try { projectStartup = await compressionOptedIn(resolveCompressionProject(ctx.cwd ?? process.cwd(), paths)) ? "on" : "off"; }
+      catch (error) { projectStartup = `unavailable (${String(error)})`; }
       const healthy = (await checkActiveProxy()).ok;
       const expected = await getHeadroomAiVersion();
       ctx.ui.notify([
-        `Headroom compression: ${enabled ? "on" : "off"}`,
+        `Headroom compression: ${enabled ? "on" : "off"} (this session)`,
+        `Project startup: ${projectStartup}`,
+        "On/off persists for this project. Active peers keep their current session state.",
         "Mode: extension-managed only", `URL: ${baseUrl}`,
         `Version: ${healthy ? expected : "unavailable"} (managed /health)`, `Expected: ${expected} (extension)`,
         `Config: ${compressionStatus()}`, `Compressed calls: ${sessionTotals.calls}`,
