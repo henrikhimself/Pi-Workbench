@@ -1,9 +1,9 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
-import { hostname } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
+import { assertNoSymlink, assertWithin, acquireManagedLock, requireDiskSpace } from "./managed-lifecycle.js";
+import { basename, delimiter, dirname, join, resolve } from "node:path";
 import https from "node:https";
 import type { WorkbenchPaths } from "./paths.js";
 import {
@@ -31,10 +31,10 @@ import {
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-/** ~1.1x the approved v0.8.1 archive size (36,458,830 bytes). */
-export const MAX_DOWNLOAD_BYTES = 40_000_000;
+/** Finite reviewed headroom for both portable v0.12.1 archives. */
+export const MAX_DOWNLOAD_BYTES = 64_000_000;
 /** Hard cap for a single extracted archive member. */
-export const MAX_MEMBER_BYTES = 300_000_000;
+export const MAX_MEMBER_BYTES = 400_000_000;
 export const DEFAULT_MAX_REDIRECTS = 3;
 export const SOCKET_TIMEOUT_MS = 30_000;
 export const VERSION_TIMEOUT_MS = 15_000;
@@ -50,6 +50,8 @@ export interface InstalledAssetRecord {
   version: string;
   resolvedUrl: string;
   sha256: string;
+  /** Digest of extracted bytes, bound to the verified archive at installation. */
+  binarySha256?: string;
 }
 
 export interface InstalledBinary {
@@ -61,8 +63,8 @@ export interface InstalledBinary {
 }
 
 export type BinaryAction =
-  | { action: "reuse"; reason: "verified" | "downgrade_refused" }
-  | { action: "install"; reason: "missing" | "update" | "integrity" }
+  | { action: "reuse"; reason: "verified" }
+  | { action: "install"; reason: "missing" | "update" | "integrity" | "pin" }
   | { action: "invalid_manifest"; detail: string };
 
 export type StatusReporter = (message: string) => void;
@@ -76,7 +78,7 @@ export interface ProcessResult {
 export type ProcessRunner = (
   command: string,
   args: string[],
-  options: { env: NodeJS.ProcessEnv; timeoutMs: number; cwd: string },
+  options: { env: NodeJS.ProcessEnv; timeoutMs: number; cwd: string; signal?: AbortSignal },
 ) => Promise<ProcessResult>;
 
 export interface DownloadResponse {
@@ -95,6 +97,7 @@ export interface InstallerDeps {
   extract?: (archivePath: string, stagingDir: string, tarPath: string) => Promise<{ binaryPath: string }>;
   runProcess?: ProcessRunner;
   fetchResponse?: ArchiveFetcher;
+  signal?: AbortSignal;
   sleep?: (ms: number) => Promise<void>;
 }
 
@@ -102,13 +105,14 @@ export interface InstallerDeps {
 
 export function detectCodeGraphPlatform(env: { os: string; arch: string }): CodeGraphPlatform | null {
   if (env.os === "linux" && env.arch === "arm64") return "linux-arm64";
+  if (env.os === "linux" && env.arch === "x64") return "linux-amd64";
   return null;
 }
 
 export function unsupportedPlatformMessage(os: string, arch: string): string {
   return (
     `code graph is not supported on ${os}/${arch}. ` +
-    `The only approved platform is linux/arm64 (codebase-memory-mcp ${CODE_GRAPH_ASSETS["linux-arm64"].version}). ` +
+    `Approved platforms are linux/arm64 and linux/x64 (codebase-memory-mcp ${CODE_GRAPH_ASSETS["linux-arm64"].version}). ` +
     `Other platforms require product approval and verified compatibility first.`
   );
 }
@@ -120,7 +124,7 @@ export function unsupportedPlatformMessage(os: string, arch: string): string {
  *
  * - Same version, resolved URL, and SHA-256 → reuse.
  * - Packaged version greater → install the update.
- * - Packaged version lower → keep installed (no automatic downgrade).
+ * - Any other installed version → install/select the exact packaged pin.
  * - Same version but different resolved URL or SHA-256 → the package
  *   manifest is invalid; never silently replace a release identity.
  */
@@ -143,96 +147,26 @@ export function decideBinaryAction(
   if (compareAssetVersions(installed.version, packaged.version) < 0) {
     return { action: "install", reason: "update" };
   }
-  return { action: "reuse", reason: "downgrade_refused" };
+  return { action: "install", reason: "pin" };
 }
 
 // ─── Install lock ─────────────────────────────────────────────────────
-// Same atomic-mkdir algorithm as the Headroom startup lock (owner.json pid,
-// abandoned/stale lock removal, deadline) with code-graph diagnostics.
-
-function isAlreadyExists(error: unknown): boolean {
-  return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "EEXIST";
-}
-
-function isProcessRunning(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return typeof error === "object" && error !== null && (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function removeAbandonedInstallLock(lockDir: string): Promise<boolean> {
-  try {
-    const owner = JSON.parse(await readFile(join(lockDir, "owner.json"), "utf8")) as { pid?: unknown };
-    if (typeof owner.pid === "number" && owner.pid > 0 && !isProcessRunning(owner.pid)) {
-      await rm(lockDir, { recursive: true, force: true });
-      return true;
-    }
-    return false;
-  } catch {
-    try {
-      const lockStat = await stat(lockDir);
-      if (Date.now() - lockStat.mtimeMs > INSTALL_LOCK_STALE_MS) {
-        await rm(lockDir, { recursive: true, force: true });
-        return true;
-      }
-    } catch {
-      // Another process released the lock; retry acquisition.
-    }
-    return false;
-  }
-}
-
 export async function acquireInstallLock(
-  lockDir: string,
-  onStatus: StatusReporter,
-  sleep: (ms: number) => Promise<void>,
-  timeoutMs: number = INSTALL_LOCK_TIMEOUT_MS,
+  lockDir: string, onStatus: StatusReporter, _sleep: (ms: number) => Promise<void>,
+  timeoutMs = INSTALL_LOCK_TIMEOUT_MS, signal?: AbortSignal,
 ): Promise<(() => Promise<void>) | null> {
-  const deadline = Date.now() + timeoutMs;
-  let waitingReported = false;
-
-  while (Date.now() < deadline) {
-    try {
-      await mkdir(dirname(lockDir), { recursive: true });
-      await mkdir(lockDir);
-      await writeFile(
-        join(lockDir, "owner.json"),
-        JSON.stringify({ pid: process.pid, host: hostname(), startedAt: new Date().toISOString() }),
-      );
-      return async () => {
-        await rm(lockDir, { recursive: true, force: true });
-      };
-    } catch (error) {
-      if (!isAlreadyExists(error)) {
-        const message = error instanceof Error ? error.message : String(error);
-        onStatus(`Failed to acquire code graph install lock: ${message}`);
-        return null;
-      }
-    }
-
-    if (await removeAbandonedInstallLock(lockDir)) continue;
-
-    if (!waitingReported) {
-      waitingReported = true;
-      onStatus("Waiting for another Pi session to install the code graph binary...");
-    }
-    await sleep(INSTALL_LOCK_RETRY_MS);
-  }
-
-  onStatus("Timed out waiting for another Pi session to install the code graph binary");
-  return null;
+  try {
+    return await acquireManagedLock(dirname(lockDir), (basename(lockDir).endsWith(".lock") ? basename(lockDir).slice(0, -5) : basename(lockDir)), { timeoutMs, signal });
+  } catch (error) { onStatus(String(error)); return null; }
 }
 
 // ─── Download ─────────────────────────────────────────────────────────
 
-function defaultFetchResponse(url: string): Promise<DownloadResponse> {
+function defaultFetchResponse(url: string, signal?: AbortSignal): Promise<DownloadResponse> {
   return new Promise((resolve, reject) => {
     const request = https.get(
       url,
-      { timeout: SOCKET_TIMEOUT_MS, headers: { "user-agent": "pi-workbench-code-graph-installer" } },
+      { timeout: SOCKET_TIMEOUT_MS, signal, headers: { "user-agent": "pi-workbench-code-graph-installer" } },
       (response) => {
         const statusCode = response.statusCode ?? 0;
         resolve({
@@ -262,11 +196,12 @@ export async function downloadArchive(
     maxBytes?: number;
     maxRedirects?: number;
     fetchResponse?: ArchiveFetcher;
+  signal?: AbortSignal;
   } = {},
 ): Promise<void> {
   const maxBytes = options.maxBytes ?? MAX_DOWNLOAD_BYTES;
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
-  const fetchResponse = options.fetchResponse ?? defaultFetchResponse;
+  const fetchResponse = options.fetchResponse ?? ((current: string) => defaultFetchResponse(current, options.signal));
   await mkdir(dirname(destination), { recursive: true });
   const partPath = `${destination}.${process.pid}-${Date.now().toString(36)}.part`;
 
@@ -277,9 +212,11 @@ export async function downloadArchive(
       if (hop > maxRedirects) throw new Error(`Too many redirects (limit ${String(maxRedirects)}) while downloading ${url}`);
       const parsed = new URL(current);
       if (parsed.protocol !== "https:") throw new Error(`Refusing non-HTTPS download URL: ${current}`);
+      options.signal?.throwIfAborted();
       response = await fetchResponse(current);
       if (response.statusCode >= 300 && response.statusCode < 400) {
         if (!response.location) throw new Error(`Redirect ${String(response.statusCode)} without Location from ${current}`);
+        response.body.resume?.();
         current = new URL(response.location, current).toString();
         continue;
       }
@@ -297,6 +234,7 @@ export async function downloadArchive(
     let received = 0;
     try {
       for await (const chunk of response.body as unknown as AsyncIterable<Buffer>) {
+        options.signal?.throwIfAborted();
         received += chunk.length;
         if (received > maxBytes) {
           response.body.resume?.();
@@ -428,7 +366,7 @@ export function defaultProcessRunner(): ProcessRunner {
       execFile(
         command,
         args,
-        { env: options.env, timeout: options.timeoutMs, cwd: options.cwd, maxBuffer: 4 * 1024 * 1024 },
+        { env: options.env, timeout: options.timeoutMs, cwd: options.cwd, signal: options.signal, maxBuffer: 4 * 1024 * 1024 },
         (error, stdout, stderr) => {
           let code = 0;
           if (error) {
@@ -455,7 +393,7 @@ export async function verifyBinaryVersion(
   binaryPath: string,
   expectedVersion: string,
   runProcess: ProcessRunner,
-  options: { cwd: string },
+  options: { cwd: string; signal?: AbortSignal },
 ): Promise<{ ok: true; version: string } | { ok: false; detail: string }> {
   if (!parseAssetVersion(expectedVersion)) {
     return { ok: false, detail: `Expected version ${expectedVersion} is not vMAJOR.MINOR.PATCH` };
@@ -463,9 +401,9 @@ export async function verifyBinaryVersion(
   let result: ProcessResult;
   try {
     result = await runProcess(binaryPath, ["--version"], {
-      env: createVerificationEnvironment(),
+      env: { ...createVerificationEnvironment(), HOME: options.cwd },
       timeoutMs: VERSION_TIMEOUT_MS,
-      cwd: options.cwd,
+      cwd: options.cwd, signal: options.signal,
     });
   } catch (error) {
     return { ok: false, detail: `Failed to run ${binaryPath} --version: ${error instanceof Error ? error.message : String(error)}` };
@@ -507,7 +445,8 @@ export async function readInstalledRecord(
     }
     if (!parseAssetVersion(record.version)) return null;
     if (record.version !== version) return null;
-    return { version: record.version, resolvedUrl: record.resolvedUrl, sha256: record.sha256 };
+    return { version: record.version, resolvedUrl: record.resolvedUrl, sha256: record.sha256,
+      ...(typeof record.binarySha256 === "string" ? { binarySha256: record.binarySha256 } : {}) };
   } catch {
     return null;
   }
@@ -545,8 +484,11 @@ export class CodeGraphInstaller {
   private readonly extract: (archivePath: string, stagingDir: string, tarPath: string) => Promise<{ binaryPath: string }>;
   private readonly runProcess: ProcessRunner;
   private readonly sleep: (ms: number) => Promise<void>;
+  private cancellation?: AbortSignal;
+  setSignal(signal: AbortSignal): void { this.cancellation = signal; }
 
   constructor(deps: Partial<InstallerDeps> = {}) {
+    this.cancellation = deps.signal;
     this.paths =
       deps.paths ?? {
         codeGraphRoot: "",
@@ -554,9 +496,10 @@ export class CodeGraphInstaller {
         codeGraphDownloads: "",
       };
     this.platformSource = deps.platform ?? (() => ({ os: process.platform, arch: process.arch }));
-    this.download = deps.download ?? ((url, destination, onStatus) => downloadArchive(url, destination, onStatus, { fetchResponse: deps.fetchResponse }));
+    this.download = deps.download ?? ((url, destination, onStatus) => downloadArchive(url, destination, onStatus, { fetchResponse: deps.fetchResponse, signal: this.cancellation }));
     this.extract = deps.extract ?? extractCodeGraphArchive;
-    this.runProcess = deps.runProcess ?? defaultProcessRunner();
+    const runner = deps.runProcess ?? defaultProcessRunner();
+    this.runProcess = (command, args, options) => runner(command, args, { ...options, signal: this.cancellation });
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
@@ -568,6 +511,18 @@ export class CodeGraphInstaller {
     return detectCodeGraphPlatform(this.platformSource());
   }
 
+  /** Read-only exact-pin inspection. Never discover/execute a higher or older backend. */
+  async inspectInstalled(): Promise<InstalledBinary | null> {
+    const platform = this.detectPlatform(); if (!platform) return null;
+    const asset = getAsset(platform).asset, resolvedUrl = resolveAssetUrl(asset);
+    const record = await readInstalledRecord(this.binRoot, asset.version, platform);
+    if (!record || record.resolvedUrl !== resolvedUrl || record.sha256 !== asset.sha256 ||
+        !await this.verifyInstalledBytes(record, platform)) return null;
+    const path = installedBinaryPath(this.binRoot, asset.version, platform);
+    if (!(await verifyBinaryVersion(path, asset.version, this.runProcess, { cwd: this.paths.codeGraphRoot, signal: this.cancellation })).ok) return null;
+    return { path, version: asset.version, resolvedUrl, sha256: asset.sha256, reused: true };
+  }
+
   /**
    * Ensure the packaged binary for the current platform is installed and
    * verified. Downloads only when the update policy requires it.
@@ -576,6 +531,7 @@ export class CodeGraphInstaller {
    * the packaged manifest remains the only accepted asset source.
    */
   async ensureInstalled(onStatus: StatusReporter, options: { asset?: CodeGraphAsset } = {}): Promise<InstalledBinary> {
+    this.cancellation?.throwIfAborted();
     const env = this.platformSource();
     const platform = detectCodeGraphPlatform(env);
     if (!platform) throw new Error(unsupportedPlatformMessage(env.os, env.arch));
@@ -583,15 +539,18 @@ export class CodeGraphInstaller {
     const problems = validateAsset(platform, asset);
     if (problems.length > 0) throw new Error(problems.join("; "));
     const resolvedUrl = resolveAssetUrl(asset);
+    for (const path of [this.paths.codeGraphBin, this.paths.codeGraphDownloads]) assertWithin(this.paths.codeGraphRoot, path);
+    await assertNoSymlink(this.paths.codeGraphRoot);
+    await assertNoSymlink(join(this.binRoot, asset.version, platform));
 
-    const installed = await discoverInstalled(this.binRoot, platform);
+    const installed = await readInstalledRecord(this.binRoot, asset.version, platform);
     const action = decideBinaryAction(installed, { version: asset.version, resolvedUrl, sha256: asset.sha256 });
     if (action.action === "invalid_manifest") throw new Error(action.detail);
 
-    if (action.action === "reuse" && installed) {
+    if (action.action === "reuse" && installed && await this.verifyInstalledBytes(installed, platform)) {
       const binaryPath = installedBinaryPath(this.binRoot, installed.version, platform);
       const verified = await verifyBinaryVersion(binaryPath, installed.version, this.runProcess, {
-        cwd: this.paths.codeGraphRoot,
+        cwd: this.paths.codeGraphRoot, signal: this.cancellation,
       });
       if (verified.ok) {
         return {
@@ -605,20 +564,21 @@ export class CodeGraphInstaller {
       onStatus(`Installed binary failed verification (${verified.detail}); reinstalling the packaged version.`);
     }
 
-    const release = await acquireInstallLock(join(this.paths.codeGraphRoot, "install.lock"), onStatus, this.sleep);
+    const release = await acquireInstallLock(join(this.paths.codeGraphRoot, "coordination", "install.lock"), onStatus, this.sleep, INSTALL_LOCK_TIMEOUT_MS, this.cancellation);
     if (!release) throw new Error("Could not acquire the code graph install lock");
     try {
       // Re-check under the lock: another session may have finished while we waited.
-      const underLock = await discoverInstalled(this.binRoot, platform);
+      const underLock = await readInstalledRecord(this.binRoot, asset.version, platform);
       if (
         underLock &&
         underLock.version === asset.version &&
         underLock.resolvedUrl === resolvedUrl &&
-        underLock.sha256 === asset.sha256
+        underLock.sha256 === asset.sha256 &&
+        await this.verifyInstalledBytes(underLock, platform)
       ) {
         const binaryPath = installedBinaryPath(this.binRoot, asset.version, platform);
         const verified = await verifyBinaryVersion(binaryPath, asset.version, this.runProcess, {
-          cwd: this.paths.codeGraphRoot,
+          cwd: this.paths.codeGraphRoot, signal: this.cancellation,
         });
         if (verified.ok) {
           return { path: binaryPath, version: asset.version, resolvedUrl, sha256: asset.sha256, reused: true };
@@ -628,6 +588,15 @@ export class CodeGraphInstaller {
     } finally {
       await release();
     }
+  }
+
+  private async verifyInstalledBytes(record: InstalledAssetRecord, platform: CodeGraphPlatform): Promise<boolean> {
+    const path = installedBinaryPath(this.binRoot, record.version, platform);
+    await assertNoSymlink(path);
+    const info = await lstat(path).catch(() => null);
+    if (!info?.isFile() || (process.getuid && info.uid !== process.getuid()) ||
+        (info.mode & 0o022) !== 0 || !record.binarySha256) return false;
+    return await sha256OfFile(path) === record.binarySha256;
   }
 
   private async installFresh(
@@ -643,6 +612,8 @@ export class CodeGraphInstaller {
     const archivePath = join(stagingRoot, `${CODE_GRAPH_BINARY_MEMBER}-${asset.version}.tar.gz`);
 
     try {
+      this.cancellation?.throwIfAborted();
+      await requireDiskSpace(this.paths.codeGraphRoot, MAX_DOWNLOAD_BYTES + MAX_MEMBER_BYTES + 64 * 1024 * 1024);
       await mkdir(stagingRoot, { recursive: true });
       const tarPath = await findGnuTar(this.runProcess);
       onStatus(`Downloading codebase-memory-mcp ${asset.version}...`);
@@ -658,7 +629,7 @@ export class CodeGraphInstaller {
       const { binaryPath: stagedBinary } = await this.extract(archivePath, join(stagingRoot, "extracted"), tarPath);
 
       onStatus("Verifying binary version...");
-      const verified = await verifyBinaryVersion(stagedBinary, asset.version, this.runProcess, { cwd: this.paths.codeGraphRoot });
+      const verified = await verifyBinaryVersion(stagedBinary, asset.version, this.runProcess, { cwd: this.paths.codeGraphRoot, signal: this.cancellation });
       if (!verified.ok) throw new Error(`Binary verification failed: ${verified.detail}`);
 
       // Stage the final directory beside its destination, then rename.
@@ -667,12 +638,14 @@ export class CodeGraphInstaller {
       await writeFile(
         join(stagedFinal, ASSET_RECORD_FILE),
         JSON.stringify(
-          { version: asset.version, resolvedUrl, sha256: asset.sha256, installedAt: new Date().toISOString() },
+          { version: asset.version, resolvedUrl, sha256: asset.sha256,
+            binarySha256: await sha256OfFile(join(stagedFinal, CODE_GRAPH_BINARY_MEMBER)), installedAt: new Date().toISOString() },
           null,
           2,
         ) + "\n",
       );
       await mkdir(dirname(finalDir), { recursive: true });
+      this.cancellation?.throwIfAborted();
       await this.quarantineBrokenInstall(finalDir);
       await fsRename(stagedFinal, finalDir);
       await rm(stagingRoot, { recursive: true, force: true }).catch(() => {});

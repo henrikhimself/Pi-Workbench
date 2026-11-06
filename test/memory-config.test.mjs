@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, open, rm } from "node:fs/promises";
+import { mkdir, open, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtemp } from "node:fs/promises";
@@ -29,6 +29,8 @@ test("resolveMemoryStore: projects receive stable isolated paths", async () => {
     await mkdir(first.directory, { recursive: true });
     const handle = await open(first.databasePath, "a");
     await handle.close();
+    assert.equal(hasMemoryStore(first), false, "database alone is not fresh opt-in");
+    await writeFile(join(first.directory, "workbench-identity.json"), JSON.stringify({ schema: 1, layout: 1, headroomVersion: "0.41.0", kind: "memory", model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384 }));
     assert.equal(hasMemoryStore(first), true);
   } finally {
     await rm(tempDir, { recursive: true, force: true });
@@ -45,7 +47,7 @@ test("resolveMemoryStore: permits and identifies configured root inside project"
     const store = resolveMemoryStore({ cwd: project, root: rootInsideProject, userId: "tester" });
     assert.equal(store.rootConfigured, true);
     assert.equal(store.rootInsideProject, true);
-    assert.equal(store.directory, join(rootInsideProject, "projects", store.identifier));
+    assert.equal(store.directory, join(rootInsideProject, "workbench-memory-v1", "projects", store.identifier));
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -72,5 +74,5 @@ test("Memory configuration: validates root and namespace values", () => {
   assert.throws(() => parseMemoryNamespace(""), /headroom\.json memoryNamespace must be a non-empty single-line value/);
   assert.throws(() => parseMemoryNamespace("line\nbreak"), /headroom\.json memoryNamespace must be a non-empty single-line value/);
   assert.equal(parseMemoryNamespace("test-namespace"), "test-namespace");
-  assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom-memory"));
+  assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom", "v1", "memory"));
 });

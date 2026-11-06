@@ -16,15 +16,15 @@ const {
 
 test("approved linux-arm64 asset is internally consistent", () => {
   const asset = CODE_GRAPH_ASSETS["linux-arm64"];
-  assert.equal(asset.version, "v0.8.1");
-  assert.equal(asset.sha256, "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091");
+  assert.equal(asset.version, "v0.12.1");
+  assert.equal(asset.sha256, "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533");
   assert.deepEqual(validateAsset("linux-arm64", asset), []);
 });
 
 test("packaged asset size matches the spike-verified release archive", () => {
-  // Verified against the v0.8.1 GitHub release during the compatibility
+  // Verified against the v0.12.1 GitHub release during the compatibility
   // spike (36,458,830 bytes; SHA-256 d2f842d1...6091).
-  assert.equal(CODE_GRAPH_ASSETS["linux-arm64"].sizeBytes, 36_458_830);
+  assert.equal(CODE_GRAPH_ASSETS["linux-arm64"].sizeBytes, 48_466_763);
   const good = CODE_GRAPH_ASSETS["linux-arm64"];
   assert.deepEqual(
     validateAsset("linux-arm64", { ...good, sizeBytes: -5 }),
@@ -81,7 +81,7 @@ test("validateAsset rejects malformed version, checksum, URL, and platform", () 
   const badRepo = { ...good, url: good.url.replace("DeusData/codebase-memory-mcp", "Other/repo") };
   assert.match(validateAsset("linux-arm64", badRepo).join(" "), /DeusData\/codebase-memory-mcp release/);
 
-  const noToken = { ...good, url: good.url.replace(ASSET_VERSION_TOKEN, "v0.8.1") };
+  const noToken = { ...good, url: good.url.replace(ASSET_VERSION_TOKEN, "v0.12.1") };
   assert.match(validateAsset("linux-arm64", noToken).join(" "), /literal v0\.x\.y token/);
 
   const notUrl = { ...good, url: "not a url" };
@@ -92,23 +92,23 @@ test("resolveAssetUrl replaces every v0.x.y token and requires the token", () =>
   const asset = CODE_GRAPH_ASSETS["linux-arm64"];
   assert.equal(
     resolveAssetUrl(asset),
-    "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
+    "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64-portable.tar.gz",
   );
 
   const doubleToken = { ...asset, url: `https://github.com/DeusData/codebase-memory-mcp/releases/download/${ASSET_VERSION_TOKEN}/x-${ASSET_VERSION_TOKEN}.tar.gz` };
   assert.equal(
     resolveAssetUrl(doubleToken),
-    "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/x-v0.8.1.tar.gz",
+    "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.12.1/x-v0.12.1.tar.gz",
   );
 
-  const noToken = { ...asset, url: asset.url.replace(ASSET_VERSION_TOKEN, "v0.8.1") };
+  const noToken = { ...asset, url: asset.url.replace(ASSET_VERSION_TOKEN, "v0.12.1") };
   assert.throws(() => resolveAssetUrl(noToken), new RegExp(ASSET_VERSION_TOKEN));
 });
 
 test("getAsset returns the pinned entry and rejects unsupported platforms", () => {
   const { platform, asset } = getAsset("linux-arm64");
   assert.equal(platform, "linux-arm64");
-  assert.equal(asset.version, "v0.8.1");
+  assert.equal(asset.version, "v0.12.1");
   assert.throws(() => getAsset("linux-x64"), /Unsupported code graph platform/);
 });
 
@@ -125,9 +125,9 @@ test("asset selection is immune to legacy/user environment variables", () => {
     assert.equal(asset.url, CODE_GRAPH_ASSETS["linux-arm64"].url);
     assert.equal(
       resolveAssetUrl(asset),
-      "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
+      "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64-portable.tar.gz",
     );
-    assert.equal(asset.sha256, "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091");
+    assert.equal(asset.sha256, "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533");
     // The packaged manifest is the only accepted asset source: no asset API
     // reads environment overrides, and the installer exposes no env override.
   } finally {

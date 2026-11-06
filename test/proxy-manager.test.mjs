@@ -1,207 +1,185 @@
-/**
- * Unit tests for src/proxy-manager.ts — proxy lifecycle logic.
- *
- * Network-free: uses a local mock HTTP server for health checks.
- * Never triggers pip install / venv creation.
- *
- * Run: node --test test/
- */
+/** Hermetic managed-ownership tests. Local HTTP fixture only; no pip/model/real proxy. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import fsp from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+import { createHash, createHmac, randomUUID } from "node:crypto";
+import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
-
 const jiti = createJiti(import.meta.url);
-const { acquireStartupLock, findPython, getHeadroomAiVersion, ProxyManager } = await jiti.import("../src/proxy-manager.ts");
+async function waitHealth(manager) {
+  const deadline = Date.now() + 2000;
+  do { if (await manager.healthCheck()) return true; await new Promise(done => setTimeout(done, 20)); } while (Date.now() < deadline);
+  return false;
+}
+const { ProxyManager, acquireStartupLock, findPython, getHeadroomAiVersion } = await jiti.import("../src/proxy-manager.ts");
+const { createConsumerLease, ownIdentity, publishJson } = await jiti.import("../src/managed-lifecycle.ts");
 
-/** Start a mock proxy: answers GET /health with a versioned JSON response. */
-async function startMockProxy(health = { status: "ok", version: "0.41.0" }) {
-  const server = http.createServer((req, res) => {
-    if (req.url === "/health") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(health));
-    } else {
-      res.writeHead(404);
-      res.end();
-    }
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const port = server.address().port;
-  return { server, port };
+async function fixture(fn, { owned = true, verifier = true } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "wb-proxy-ownership-"));
+  const slot = join(root, "runtimes", "0.41.0", "fixture"); await mkdir(join(slot, "bin"), { recursive: true, mode: 0o700 });
+  const python = join(slot, "bin", "python"); await writeFile(python, "fixture", { mode: 0o700 });
+  const descriptor = { schema: 1, version: "0.41.0", slot, python, cli: join(slot, "bin", "headroom"), inventory: [], pythonIdentity: "fixture", dependencyDigest: "fixture", embedding: { model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384, provider: "CPUExecutionProvider" } };
+  await publishJson(root, join(slot, "ready.json"), descriptor);
+  const identity = await ownIdentity(); const nonce = "a".repeat(64);
+  const state = { healthy: true, alive: true, version: "0.41.0", nonce, requests: 0, installs: 0, killed: 0, starts: 0 };
+  const tag = createHash("sha256").update(`${python}|0.41.0`).digest("hex");
+  let server;
+  async function listen(port = 0) {
+    server = http.createServer((req, res) => {
+      state.requests++;
+      if (req.url !== "/health" && state.onRequest) { void state.onRequest(req, res); return; }
+      if (req.url !== "/health") { res.writeHead(404); res.end(); return; }
+      res.writeHead(state.healthy ? 200 : 503, { "content-type": "application/json", "x-pi-workbench-owner": state.replayedProof ?? createHmac("sha256", Buffer.from(state.nonce, "hex")).update(`health:${req.headers["x-pi-workbench-challenge"]}:${tag}`).digest("hex"), "x-pi-workbench-runtime": tag });
+      res.end(JSON.stringify({ version: state.version, config: { pid: identity.pid } }));
+    });
+    await new Promise(resolve => server.listen(port, "127.0.0.1", resolve));
+    return server.address().port;
+  }
+  async function close() { if (server?.listening) await new Promise(resolve => server.close(resolve)); }
+  const port = await listen();
+  const runtime = { root, leaseRoot: join(root, "consumers"), inspect: async () => descriptor, environment: () => ({}),
+    acquire: async resource => { state.installs++; return { descriptor, lease: await createConsumerLease(join(root, "consumers"), resource) }; } };
+  let keeper = owned ? await createConsumerLease(runtime.leaseRoot, `proxy:${port}`) : null;
+  const recordPath = join(root, "proxies", String(port), "owner.json");
+  const record = { schema: 1, ...identity, port, nonce, serviceToken: randomUUID(), script: "/fixture/managed-proxy.py", descriptor };
+  if (owned) await publishJson(root, recordPath, record);
+  const managers = [];
+  const make = () => {
+    const manager = new ProxyManager({ port, runtime,
+      ...(verifier ? { processMatches: async candidate => state.alive && candidate.pid === identity.pid && candidate.start === identity.start } : {}),
+      terminate: async () => { state.killed++; state.alive = false; await close(); },
+    }); managers.push(manager); return manager;
+  };
+  const releaseKeeper = async () => { await keeper?.release(); keeper = null; };
+  try { await fn({ root, port, state, runtime, descriptor, record, recordPath, make, close, listen, releaseKeeper }); }
+  finally {
+    for (const manager of managers) await manager.stop();
+    await releaseKeeper(); await close(); await rm(root, { recursive: true, force: true });
+  }
 }
 
-// ─── Version pin ──────────────────────────────────────────────────────
+test("proxy launch closes log handle when progress callback throws before spawn", async t => fixture(async fx => {
+  const manager = fx.make(); manager.descriptor = fx.descriptor;
+  const realOpen = fsp.open; let opened = 0, closed = 0;
+  t.mock.method(fsp, "open", async (...args) => {
+    const handle = await realOpen(...args);
+    if (String(args[0]).endsWith("/proxy.log")) {
+      opened++;
+      return { fd: handle.fd, close: async () => { closed++; await handle.close(); } };
+    }
+    return handle;
+  });
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(manager.launch(() => { throw new Error("fixture UI callback failed"); }), /fixture UI callback failed/);
+    assert.equal(opened, 1, "must intercept actual opened launch log");
+    assert.equal(closed, 1, "throwing callback must not leak opened file handle");
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+}));
 
-test("managed proxy version pin matches the extension SDK dependency", async () => {
-  const packageJson = JSON.parse(
-    await readFile(new URL("../package.json", import.meta.url), "utf8"),
-  );
+test("managed proxy pin equals exact extension SDK dependency", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(await getHeadroomAiVersion(), packageJson.dependencies["headroom-ai"]);
 });
-
-// ─── findPython ───────────────────────────────────────────────────────
-
-test("findPython: detects a Python >= 3.10 interpreter on this machine", async () => {
-  const cmd = await findPython();
-  assert.ok(cmd, "expected a python interpreter (python3) to be found");
-  assert.ok(["python3", "python"].includes(cmd));
+test("findPython detects supported system Python without package installation", async () => {
+  assert.ok(["python3", "python"].includes(await findPython()));
 });
-
-// ─── Startup lock ─────────────────────────────────────────────────────
-
-test("acquireStartupLock: waits for current owner before granting next owner", async () => {
-  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-lock-"));
-  const lockDir = join(tempDir, "startup.lock");
-
+test("startup lock waits for current owner before next ownership", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wb-proxy-lock-"));
   try {
-    const firstRelease = await acquireStartupLock(lockDir, () => {}, () => false);
-    assert.ok(firstRelease);
-
-    let secondAcquired = false;
-    const secondLock = acquireStartupLock(lockDir, () => {}, () => false).then((release) => {
-      secondAcquired = true;
-      return release;
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    assert.equal(secondAcquired, false);
-
-    await firstRelease();
-    const secondRelease = await secondLock;
-    assert.ok(secondRelease);
-    assert.equal(secondAcquired, true);
-    await secondRelease();
-  } finally {
-    await rm(tempDir, { recursive: true, force: true });
-  }
+    const first = await acquireStartupLock(join(root, "startup.lock"), () => {}, () => false);
+    let acquired = false;
+    const second = acquireStartupLock(join(root, "startup.lock"), () => {}, () => false).then(release => { acquired = true; return release; });
+    await new Promise(resolve => setTimeout(resolve, 30)); assert.equal(acquired, false);
+    await first(); await (await second)();
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
-
-// ─── ProxyManager basics ──────────────────────────────────────────────
-
-test("baseUrl: reflects configured port and host", () => {
-  const pm = new ProxyManager({ port: 1234, host: "127.0.0.1" });
-  assert.equal(pm.baseUrl, "http://127.0.0.1:1234");
-  assert.equal(pm.isManaged, false);
+test("managed proxy defaults to loopback 8787 and refuses non-loopback binding", () => {
+  assert.equal(new ProxyManager().baseUrl, "http://127.0.0.1:8787");
+  assert.throws(() => new ProxyManager({ host: "0.0.0.0" }), /only 127/);
 });
+test("exact-version unowned HTTP server is never adopted, probed or stopped", () => fixture(async fx => {
+  const manager = fx.make(); const messages = [];
+  assert.equal(await manager.ensureRunning(message => messages.push(message)), false);
+  assert.equal(manager.isManaged, false); assert.equal(fx.state.installs, 0); assert.equal(fx.state.requests, 0);
+  assert.match(messages.join("\n"), /unknown\/unowned/); await manager.stop(); assert.equal(fx.state.killed, 0);
+}, { owned: false }));
+test("managed peer requires nonce, version, runtime and PID attestation", () => fixture(async fx => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true); assert.equal(manager.isManaged, true);
+  assert.equal(await manager.healthCheck(), true);
+  fx.state.nonce = "b".repeat(64); assert.equal(await manager.healthCheck(), false);
+  fx.state.nonce = fx.record.nonce; fx.state.version = "0.40.0"; assert.equal(await manager.healthCheck(), false);
+  fx.state.version = "0.41.0";
+  await publishJson(fx.root, fx.recordPath, { ...fx.record, start: "reused-pid" });
+  assert.equal(await manager.healthCheck(), false);
+}));
+test("forged private record cannot claim an unrelated executable", () => fixture(async fx => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), false);
+  assert.equal(fx.state.installs, 0); assert.equal(fx.state.killed, 0); assert.equal(fx.state.requests, 0);
+}, { verifier: false }));
+test("creator exit preserves peers; only last consumer stops owned service", () => fixture(async fx => {
+  const a = fx.make(), b = fx.make();
+  assert.equal(await a.ensureRunning(() => {}), true); assert.equal(await b.ensureRunning(() => {}), true);
+  await fx.releaseKeeper(); await a.stop();
+  assert.equal(fx.state.killed, 0); assert.equal(await b.healthCheck(), true);
+  await b.stop(); assert.equal(fx.state.killed, 1);
+}));
+test("healthy owned proxy does not restart after healthy request failure", () => fixture(async fx => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true); await fx.releaseKeeper();
+  manager.launch = async () => { fx.state.starts++; return true; };
+  assert.equal(await manager.tryRestart(() => {}), true);
+  assert.equal(fx.state.starts, 0); assert.equal(fx.state.killed, 0);
+}));
+test("watchdog leader replaces unhealthy owned service with bounded owned restart", () => fixture(async fx => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true); await fx.releaseKeeper();
+  fx.state.healthy = false;
+  manager.launch = async () => { fx.state.starts++; fx.state.alive = true; fx.state.healthy = true; await fx.listen(fx.port); return waitHealth(manager); };
+  assert.equal(await manager.tryRestart(() => {}), true);
+  assert.equal(fx.state.killed, 1); assert.equal(fx.state.starts, 1);
+}));
+test("owned crash retains consumer restart eligibility without killing an external process", () => fixture(async fx => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true); await fx.releaseKeeper();
+  fx.state.alive = false; await fx.close();
+  manager.launch = async () => { fx.state.starts++; fx.state.alive = true; await fx.listen(fx.port); return waitHealth(manager); };
+  assert.equal(await manager.tryRestart(() => {}), true);
+  assert.equal(fx.state.killed, 0); assert.equal(fx.state.starts, 1);
+}));
+test("stopped instance cannot reactivate without explicit resume", () => fixture(async fx => {
+  const manager = fx.make(); await manager.stop();
+  assert.equal(await manager.ensureRunning(() => {}), false);
+  manager.resume(); assert.equal(await manager.ensureRunning(() => {}), true);
+}));
 
-test("baseUrl: defaults to 8787", () => {
-  const pm = new ProxyManager();
-  assert.equal(pm.baseUrl, "http://127.0.0.1:8787");
-});
 
-// ─── healthCheck ──────────────────────────────────────────────────────
-
-test("healthCheck: false when nothing listens", async () => {
-  // Find a free port, then check it (nothing listening)
-  const { server, port } = await startMockProxy();
-  await new Promise((resolve) => server.close(resolve));
-  const pm = new ProxyManager({ port });
-  assert.equal(await pm.healthCheck(), false);
-});
-
-test("healthCheck: true when proxy responds", async () => {
-  const { server, port } = await startMockProxy();
-  try {
-    const pm = new ProxyManager({ port });
-    assert.equal(await pm.healthCheck(), true);
-  } finally {
-    await new Promise((resolve) => server.close(resolve));
-  }
-});
-
-// ─── stop() idempotency ───────────────────────────────────────────────
-
-test("stop(): safe to call when proxy was never started (idempotent)", async () => {
-  const pm = new ProxyManager({ port: 1 });
-  await pm.stop();
-  await pm.stop(); // second call must not throw
-  assert.equal(pm.isManaged, false);
-});
-
-// ─── ensureRunning: external proxy detection ──────────────────────────
-
-test("ensureRunning: detects already-running external proxy, does not take ownership", async () => {
-  const { server, port } = await startMockProxy();
-  try {
-    const pm = new ProxyManager({ port });
-    const statuses = [];
-    const ok = await pm.ensureRunning((msg) => statuses.push(msg));
-    assert.equal(ok, true);
-    assert.equal(pm.isManaged, false); // external — extension must not kill it on shutdown
-    // No spawn-related status updates expected on the fast path
-    assert.ok(!statuses.some((s) => s.includes("Installing") || s.includes("venv")));
-  } finally {
-    await new Promise((resolve) => server.close(resolve));
-  }
-});
-
-test("ensureRunning: rejects version-mismatched external proxy without ownership", async () => {
-  const { server, port } = await startMockProxy({ status: "ok", version: "0.40.0" });
-  try {
-    const pm = new ProxyManager({ port });
-    const statuses = [];
-    assert.equal(await pm.ensureRunning((msg) => statuses.push(msg)), false);
-    assert.equal(pm.isManaged, false);
-    assert.ok(statuses.some((message) => message.includes("version mismatch")));
-  } finally {
-    await new Promise((resolve) => server.close(resolve));
-  }
-});
-
-test("tryRestart: restarts after an owned child exits", async () => {
-  const pm = new ProxyManager({ port: 1 });
-  const internal = pm;
-  const exitedChild = { exitCode: 1 };
-  internal.managedByThisInstance = true;
-  internal.proc = exitedChild;
-  internal.handleChildExit(exitedChild);
-
-  assert.equal(pm.isManaged, true, "unexpected exit must retain extension ownership");
-  assert.equal(internal.proc, null);
-
-  let starts = 0;
-  internal.ensureRunning = async () => {
-    starts++;
-    internal.proc = { exitCode: null };
-    return true;
+test("compression authenticates both directions; port replacement sees ciphertext only", () => fixture(async (fx) => {
+  const { openOwnedJson, sealOwnedJson } = await jiti.import("../src/owned-transport.ts");
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true);
+  let captured = "", forged = false;
+  fx.state.onRequest = async (req, res) => {
+    const chunks = []; for await (const chunk of req) chunks.push(chunk);
+    captured = Buffer.concat(chunks).toString();
+    const id = req.headers["x-pi-workbench-request"];
+    const body = openOwnedJson(fx.record.nonce, `pi-workbench:headroom:v1:request:${id}:POST:/v1/compress`, captured);
+    if (forged) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ messages: ["forged context"] })); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(sealOwnedJson(fx.record.nonce, `pi-workbench:headroom:v1:response:${id}:200`, { messages: body.messages, compressed: false }));
   };
+  const messages = [{ role: "user", content: "private context sentinel 978163" }];
+  assert.deepEqual((await manager.compressRaw({ messages })).messages, messages);
+  assert.equal(captured.includes("private context sentinel"), false);
+  assert.equal(captured.includes(fx.record.nonce), false);
+  forged = true;
+  await assert.rejects(manager.compressRaw({ messages }), /authentication failed/);
+  assert.equal(captured.includes("private context sentinel"), false, "foreign HTTP occupant never gets plaintext");
+}));
 
-  const recovered = await pm.tryRestart(() => {});
-  assert.equal(recovered, true);
-  assert.equal(starts, 1);
-  assert.equal(pm.isManaged, true);
-});
-
-test("tryRestart: replaces unhealthy owned child before its exit event arrives", async () => {
-  const pm = new ProxyManager({ port: 1 });
-  const internal = pm;
-  let killed = false;
-  internal.managedByThisInstance = true;
-  internal.proc = {
-    exitCode: null,
-    kill: () => { killed = true; },
-  };
-  let starts = 0;
-  internal.ensureRunning = async () => {
-    starts++;
-    internal.proc = { exitCode: null };
-    return true;
-  };
-
-  const recovered = await pm.tryRestart(() => {});
-  assert.equal(recovered, true);
-  assert.equal(killed, true);
-  assert.equal(starts, 1);
-});
-
-test("ensureRunning: fails fast while shutdown is in progress (stopping guard)", async () => {
-  // Deliberately does NOT exercise the install/spawn path (would pip install).
-  // stop() sets the stopping flag; ensureRunning must bail without touching python.
-  const pm = new ProxyManager({ port: 1 });
-  await pm.stop();
-  const ok = await pm.ensureRunning(() => {});
-  assert.equal(ok, false);
-});
+test("replayed health response cannot prove fresh process ownership", () => fixture(async (fx) => {
+  const manager = fx.make(); assert.equal(await manager.ensureRunning(() => {}), true);
+  const old = await fetch(manager.baseUrl + "/health", { headers: { "x-pi-workbench-challenge": "old-challenge" } });
+  fx.state.replayedProof = old.headers.get("x-pi-workbench-owner"); await old.text();
+  assert.equal(await manager.healthCheck(), false);
+}));

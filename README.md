@@ -1,69 +1,59 @@
 # pi-workbench
 
-`pi-workbench` adds Headroom context compression, project Memory, and Study Mode guidance to the [Pi coding agent](https://github.com/badlogic/pi-mono).
+Headroom context compression, project-scoped Memory, Code Graph, and optional Study Mode for [Pi](https://pi.dev).
 
-## Requirements
+## Requirements and verified scope
 
-- Pi 1.0+
-- Python 3.10+
+- Pi 1.0+ and Node.js 22+.
+- Python 3.10+ with venv/pip support for Headroom. Memory uses CPU ONNX only.
 
-## Install from GitHub
-
-Repository: <https://github.com/henrikhimself/Pi-Workbench>
+## Install, update, remove
 
 ```bash
-# Install for current user
 pi install git:github.com/henrikhimself/Pi-Workbench
-
-# Install for current project
+# Or project-local:
 pi install --local git:github.com/henrikhimself/Pi-Workbench
-
-# Try once without saving package settings
+# Try without saving package settings:
 pi -e git:github.com/henrikhimself/Pi-Workbench
-```
 
-Update installed extensions:
-
-```bash
 pi update --extensions
-```
-
-Remove extension:
-
-```bash
 pi remove git:github.com/henrikhimself/Pi-Workbench
 ```
 
-## Configuration
+**Choosing an extension upgrade authorizes its pinned backend upgrades.** Eligible components prepare/install/validate automatically, without an upgrade prompt, `--yes`, or a dedicated upgrade command. Busy peers, unsafe space, incompatible state, and failed validation leave the affected feature off, preserve data, and report a reason. Retry later through normal activation. Other healthy features remain usable.
 
-On first session start, pi-workbench creates `headroom.json` under `~/.pi/pi-workbench/` and never overwrites user edits.
+Read [RELEASE-NOTES.md](RELEASE-NOTES.md) before this release: **Headroom makes an intentional clean break.** Existing installation/store files remain untouched; no discovery, adoption, conversion, migration, or automatic import occurs.
 
-### `headroom.json`
+## Fresh managed Headroom configuration
+
+Canonical file: `~/.pi/pi-workbench/headroom.json`. A missing file is created on session start. An existing incompatible file is rejected **without rewriting it**. Supply a fresh configuration manually and reload/restart Pi.
 
 ```json
 {
+  "schemaVersion": 1,
   "port": 8787
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `url` | External Headroom proxy URL. Disables extension proxy management. Mutually exclusive with `port`. |
-| `port` | Managed localhost proxy port. Default: `8787`. Specifying `port` implies `http://127.0.0.1:<port>` and extension management. Mutually exclusive with `url`. |
-| `memoryRoot` | Absolute or `~/` root for project Memory stores. Default: `~/.pi/pi-workbench/headroom-memory`. |
-| `memoryNamespace` | Logical Headroom Memory namespace. Default: `project`. |
-| `memory.export` | Optional project-relative canonical Memory export directory, such as `.headroom-memory`. Must remain below project root. Required for export, import, and merge. |
-| `compression` | Optional per-request Headroom compression overrides. Omit to preserve Headroom defaults. See below. |
+| `schemaVersion` | Required format identity: `1`. Old-format files are not converted. |
+| `port` | Managed loopback port; default `8787`. No silent alternate port. |
+| `memoryRoot` | Optional absolute or `~/` Memory base. Custom roots use a distinct `workbench-memory-v1` namespace; old `projects/` stores are not adopted. |
+| `memoryNamespace` | Logical Memory namespace; default `project`. |
+| `memory.export` | Optional project-relative logical bundle directory. Must remain inside the project. Required for export/import/merge. |
+| `compression` | Optional per-request tuning; omit to use Headroom defaults. |
 
-Use exactly one proxy setting. `url` connects compression to external Headroom and never starts or installs its proxy. `port` selects extension-managed localhost Headroom. Configuring both is rejected.
+`url` and external-proxy mode are removed. Unknown occupants of the configured port are not adopted, stopped, or sent plaintext Pi context.
 
-### Compression tuning
-
-The optional `compression` settings travel with every compression request. They work with both managed `port` proxy and external `url` proxy; pi-workbench does not change or restart proxy service configuration.
+A fuller fresh configuration:
 
 ```json
 {
+  "schemaVersion": 1,
   "port": 8787,
+  "memoryNamespace": "project",
+  "memory": { "export": ".headroom-memory" },
   "compression": {
     "mode": "lossless_then_lossy",
     "targetRatio": 0.8,
@@ -77,7 +67,7 @@ The optional `compression` settings travel with every compression request. They 
 
 | Field | Valid values | Meaning |
 |---|---|---|
-| `mode` | `ccr`, `lossy_inline`, `lossless_then_lossy` | Compression pipeline. `ccr` and `lossless_then_lossy` better fit recovery-sensitive workflows. |
+| `mode` | `lossy_inline`, `lossless_then_lossy` | Compression pipeline. `lossless_then_lossy` better fit recovery-sensitive workflows. |
 | `targetRatio` | Number `0`–`1` | Requested retained fraction for lossy compression. Lower = more aggressive compression. |
 | `compressUserMessages` | Boolean | Allow compression of user-role messages. |
 | `protectRecent` | Non-negative integer | Number of newest messages left uncompressed. |
@@ -111,8 +101,9 @@ Optionally configure a namespace and export directory for sharing Memory through
 - `export` — write Memory data into export directory.
 - `import` — replace configured namespace from export directory; requires confirmation.
 - `merge` — combine exported Memory with local Memory; exported version wins conflicts.
+- `off` — delete this workspace's Memory after confirmation;
 
-### Code Graph (standalone codebase-memory-mcp)
+## Code Graph
 
 Code Graph gives Pi structural code intelligence: symbol search, call paths, architecture overview, and impact queries over a local index of the current workspace.
 
@@ -120,18 +111,18 @@ The feature is enabled using `/wb:code-graph on` in a workspace. Workspace data 
 
 ### Study Mode
 
-Study Mode adds branch-scoped guidance favoring questions, evidence, explanations, and avoiding changes. It is not a sandbox: tools, commands, Memory, proxy lifecycle, and session behavior remain available. For implementation, it recommends `/wb:study-mode off` or confirming intent; explicit requests can still proceed while enabled.
+Study Mode adds guidance favoring questions, evidence, explanations, and avoiding changes. It is not a sandbox: tools, commands, Memory, proxy lifecycle, and session behavior remain available. For implementation, it recommends `/wb:study-mode off` or confirming intent; explicit requests can still proceed while enabled.
 
 ## Commands
 
 | Command | Purpose |
 |---|---|
-| `/wb:headroom-proxy [on\|off\|status]` | Control or inspect Headroom context compression. |
-| `/wb:headroom-health` | Show Headroom proxy diagnostics. |
-| `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Manage project-scoped persistent Memory. `show` lists current records. `export`, `import`, and `merge` require `memory.export`. `import` needs UI confirmation or `--confirm-replace`; `off` needs UI confirmation or `--confirm-delete`. |
-| `/wb:code-graph [on\|off\|reindex\|status]` | Enable, disable, reindex, or inspect the standalone `codebase-memory-mcp` code graph for the current workspace. `reindex` updates the index; `off` needs UI confirmation or `--confirm-delete` and deletes only this workspace's code-graph data. |
-| `/wb:study-mode [on\|off\|status]` | Toggle branch-scoped Study guidance. Tools and commands remain available. |
-| `/wb:show-system-prompt` | Preview active Pi system prompt additions. |
+| `/wb:headroom-proxy [on\|off\|status]` | Activate/retry, disable session compression, inspect state. |
+| `/wb:headroom-health` | Managed ownership/runtime diagnostics. |
+| `/wb:headroom-memory [on\|off\|status\|show\|export\|import\|merge]` | Project Memory. Destructive `off` needs UI confirmation or `--confirm-delete`; `import` needs confirmation or `--confirm-replace`. |
+| `/wb:code-graph [on\|off\|reindex\|status]` | Workspace graph. `off` **deletes** its store after confirmation or `--confirm-delete`; binaries, backups, other workspaces and Memory remain. |
+| `/wb:study-mode [on\|off\|status]` | Study guidance, not a tool/command sandbox. |
+| `/wb:show-system-prompt` | Preview assembled prompt guidance. |
 
 ## License
 

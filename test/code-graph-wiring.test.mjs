@@ -8,6 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -42,6 +43,7 @@ function makePi() {
         return () => {};
       },
       appendEntry: () => {},
+      getActiveTools: () => mcp.has("codebase-memory") ? ["search_graph", "trace_path", "get_architecture", "get_code_snippet", "get_file_outline", "query_graph"].map(name => "mcp__codebase-memory__" + name) : [],
       registerCommand: (name, definition) => {
         commands.set(name, definition);
       },
@@ -89,13 +91,18 @@ async function makeFixture() {
   const configPath = join(home, "headroom.json");
   // User-managed external proxy that is unreachable: session_start must
   // fail open fast without touching the network for real.
-  await writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:1" }));
+  await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 8787 }));
   const piState = makePi();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {
     throw new Error("connection refused");
   };
-  extensionModule.default(piState.pi, { headroomConfigPath: configPath, workbenchPaths: paths });
+  extensionModule.default(piState.pi, {
+    headroomConfigPath: configPath,
+    workbenchPaths: paths,
+    codeGraphPlatform: () => ({ os: "linux", arch: "arm64" }),
+    proxyManager: { isManaged: false, baseUrl: "http://127.0.0.1:8787", resume() {}, ensureRunning: async () => false, healthCheck: async () => false, tryRestart: async () => false, stop: async () => {} },
+  });
   const callLog = join(home, "cbm-calls.log");
   return {
     home,
@@ -104,6 +111,7 @@ async function makeFixture() {
     piState,
     callLog,
     cleanup: async () => {
+      await piState.handlers.get("session_shutdown")?.();
       globalThis.fetch = originalFetch;
       await rm(home, { recursive: true, force: true });
       await rm(workspace, { recursive: true, force: true });
@@ -130,11 +138,12 @@ async function seedVerifiedInstall(fixture) {
   const binDir = join(paths.codeGraphBin, asset.version, "linux-arm64");
   await mkdir(binDir, { recursive: true });
   const fakeBinary = join(binDir, "codebase-memory-mcp");
-  await writeFile(fakeBinary, fakeCbmSource({ callLog }), "utf8");
+  await writeFile(fakeBinary, fakeCbmSource({ callLog, version: asset.version.slice(1) }), "utf8");
   await chmod(fakeBinary, 0o755);
   await writeFile(
     join(binDir, "asset.json"),
-    JSON.stringify({ version: asset.version, resolvedUrl, sha256: asset.sha256 }) + "\n",
+    JSON.stringify({ version: asset.version, resolvedUrl, sha256: asset.sha256,
+      binarySha256: createHash("sha256").update(await readFile(fakeBinary)).digest("hex") }) + "\n",
   );
   return fakeBinary;
 }
@@ -229,8 +238,9 @@ test("command: first on activates end to end without confirmation", async () => 
     await waitFor(() => fixture.piState.mcp.has("codebase-memory"), 15000, "MCP registration");
     const config = fixture.piState.mcp.get("codebase-memory");
     const fakeBinary = join(paths.codeGraphBin, asset.version, "linux-arm64", "codebase-memory-mcp");
-    assert.equal(config.command, fakeBinary);
-    assert.deepEqual(config.args, []);
+    assert.equal(config.command, process.execPath);
+    assert.equal(JSON.parse(config.args[1]).command, fakeBinary);
+    assert.deepEqual(JSON.parse(config.args[1]).args, ["--ui=false", "--quiet", "--repo-path", project.projectPath]);
     assert.equal(config.cwd, project.projectPath);
     assert.equal(config.exposure, "direct");
     assert.equal(config.env.CBM_CACHE_DIR, project.directory);
@@ -260,7 +270,7 @@ test("command: on again while enabled does not reindex", async () => {
   const fixture = await makeFixture();
   const { project, fakeBinary } = await seedEnabledWorkspace(fixture);
   try {
-    assert.equal(fakeBinary, join(fixture.paths.codeGraphBin, "v0.8.1", "linux-arm64", "codebase-memory-mcp"));
+    assert.equal(fakeBinary, join(fixture.paths.codeGraphBin, "v0.12.1", "linux-arm64", "codebase-memory-mcp"));
     const { ctx, notifications, confirms } = makeCtx(fixture.workspace, { confirmAnswer: true });
     await command(fixture).handler("on", ctx);
     assert.equal(confirms.length, 0, "no confirmation for already-enabled workspace");
@@ -275,6 +285,7 @@ test("command: on again while enabled does not reindex", async () => {
 
 test("command: first on without UI activates", async () => {
   const fixture = await makeFixture();
+  await seedVerifiedInstall(fixture);
   try {
     const { ctx, notifications } = makeCtx(fixture.workspace, { hasUI: false });
     await command(fixture).handler("on", ctx);
@@ -331,7 +342,7 @@ test("command: off without --confirm-delete asks and deletes only the project di
     assert.ok(detail.includes("state.json"), "deletion includes state.json");
     assert.ok(detail.includes(fixture.paths.codeGraphBin), "shared binary retained");
 
-    assert.equal(existsSync(project.directory), false, "project directory deleted");
+    assert.equal(existsSync(project.directory), false, JSON.stringify(notifications));
     assert.equal(existsSync(fakeBinary), true, "shared binary retained");
     assert.equal(fixture.piState.mcp.size, 0);
     assert.ok(notifications.some(({ message }) => /Code graph deleted/.test(message)));
@@ -431,11 +442,13 @@ test("session start with valid state restores and injects guidance", async () =>
     await fixture.piState.handlers.get("session_start")({}, ctx);
     await waitFor(() => fixture.piState.mcp.has("codebase-memory"), 15000, "MCP registration");
     const config = fixture.piState.mcp.get("codebase-memory");
-    assert.equal(config.command, fakeBinary);
+    assert.equal(config.command, process.execPath);
+    assert.equal(JSON.parse(config.args[1]).command, fakeBinary);
     assert.equal(config.cwd, project.projectPath);
     assert.equal(config.env.CBM_CACHE_DIR, project.directory);
     assert.ok(statuses.some(([key]) => key === "code-graph"), "code-graph status key set");
     assert.ok(!notifications.some(({ message }) => message.includes("structural")), "no user guidance notification");
+    await waitFor(() => statuses.some(([key, value]) => key === "code-graph" && value === "✓ Code Graph"), 5000, "restore completion");
     const promptEvent = { systemPromptOptions: { sections: {} } };
     fixture.piState.handlers.get("before_agent_start")(promptEvent);
     assert.match(promptEvent.systemPromptOptions.sections["pi-workbench-code-graph"], /structural/);
@@ -476,4 +489,22 @@ test("session shutdown releases only the owned registration", async () => {
   } finally {
     await fixture.cleanup();
   }
+});
+
+
+test("prompt guidance follows actual active direct MCP tools, not pending registration intent", async () => {
+  const fx = await makeFixture(); await seedEnabledWorkspace(fx);
+  try {
+    const state = makeCtx(fx.workspace);
+    await fx.piState.handlers.get("session_start")({}, state.ctx);
+    await waitFor(() => fx.piState.mcp.has("codebase-memory"), 15000, "registration");
+    await waitFor(() => state.statuses.some(([key, value]) => key === "code-graph" && value === "✓ Code Graph"), 5000, "restore");
+    fx.piState.pi.getActiveTools = () => [];
+    let event = { systemPromptOptions: { sections: {} } }; fx.piState.handlers.get("before_agent_start")(event);
+    assert.equal(event.systemPromptOptions.sections["pi-workbench-code-graph"], undefined);
+    fx.piState.pi.getActiveTools = () => ["mcp__codebase-memory__search_graph"];
+    event = { systemPromptOptions: { sections: {} } }; fx.piState.handlers.get("before_agent_start")(event);
+    assert.ok(event.systemPromptOptions.sections["pi-workbench-code-graph"].includes("tools (search_graph)"));
+    assert.doesNotMatch(event.systemPromptOptions.sections["pi-workbench-code-graph"], /get_file_outline|trace_path/);
+  } finally { await fx.cleanup(); }
 });

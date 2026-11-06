@@ -83,7 +83,7 @@ async function makeFixtureInstall(deps) {
   const downloads = [];
   const installer = new CodeGraphInstaller({
     paths,
-    platform: () => ({ os: "linux", arch: "arm64" }),
+    platform: () => ({ os: "linux", arch: deps.arch ?? "arm64" }),
     sleep: async () => {},
     download: async (url, destination) => {
       downloads.push(url);
@@ -118,13 +118,13 @@ const sleep0 = async () => {};
 
 // ─── Platform detection ───────────────────────────────────────────────
 
-test("detects linux/arm64 as the only supported platform", () => {
+test("detects approved Linux ARM64 and AMD64 platforms", () => {
   assert.equal(detectCodeGraphPlatform({ os: "linux", arch: "arm64" }), "linux-arm64");
-  assert.equal(detectCodeGraphPlatform({ os: "linux", arch: "x64" }), null);
+  assert.equal(detectCodeGraphPlatform({ os: "linux", arch: "x64" }), "linux-amd64");
   assert.equal(detectCodeGraphPlatform({ os: "darwin", arch: "arm64" }), null);
   assert.equal(detectCodeGraphPlatform({ os: "darwin", arch: "x64" }), null);
   assert.equal(detectCodeGraphPlatform({ os: "win32", arch: "x64" }), null);
-  assert.match(unsupportedPlatformMessage("linux", "x64"), /not supported on linux\/x64/);
+  assert.match(unsupportedPlatformMessage("linux", "riscv64"), /not supported on linux\/riscv64/);
   assert.match(unsupportedPlatformMessage("linux", "x64"), /linux\/arm64/);
 });
 
@@ -159,12 +159,12 @@ test("decideBinaryAction: newer packaged version installs an update", () => {
   assert.deepEqual(action, { action: "install", reason: "update" });
 });
 
-test("decideBinaryAction: older packaged version never downgrades", () => {
+test("decideBinaryAction: exact packaged identity wins over newer installed version", () => {
   const action = decideBinaryAction(
     { version: "v0.8.2", resolvedUrl: "u2", sha256: "s2" },
     { version: "v0.8.1", resolvedUrl: "u", sha256: "s" },
   );
-  assert.deepEqual(action, { action: "reuse", reason: "downgrade_refused" });
+  assert.deepEqual(action, { action: "install", reason: "pin" });
 });
 
 // ─── SHA-256 ──────────────────────────────────────────────────────────
@@ -390,14 +390,16 @@ test("install lock: second waiter succeeds after release", async () => {
   await cleanup();
 });
 
-test("install lock: abandons locks owned by dead processes", async () => {
+test("install lock: stale ownership is retained for safe manual recovery", async () => {
   const { root, cleanup } = await makeTempRoot();
   const lockDir = join(root, "install.lock");
-  await mkdir(lockDir, { recursive: true });
-  await writeFile(join(lockDir, "owner.json"), JSON.stringify({ pid: 4194303, host: "dead" }));
-  const release = await acquireInstallLock(lockDir, () => {}, sleep0);
-  assert.ok(release, "abandoned lock must be removed and re-acquired");
-  await release();
+  await mkdir(lockDir, { recursive: true, mode: 0o700 });
+  await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schema: 1, token: "stale", pid: 4194303, start: "dead", host: (await import("node:os")).hostname() }));
+  const messages = [];
+  const release = await acquireInstallLock(lockDir, message => messages.push(message), sleep0);
+  assert.equal(release, null, "never steal a stale mkdir lock with an ABA race");
+  assert.match(messages.join("\n"), /Stale managed lock/);
+  assert.ok(await stat(lockDir));
   await cleanup();
 });
 
@@ -409,7 +411,7 @@ test("install lock: times out while a live process holds it", async () => {
   const messages = [];
   const release2 = await acquireInstallLock(lockDir, (message) => messages.push(message), sleep0, 300);
   assert.equal(release2, null);
-  assert.match(messages.join(" | "), /Timed out waiting/);
+  assert.match(messages.join(" | "), /busy|Timed out waiting/);
   await release1();
   await cleanup();
 });
@@ -528,7 +530,7 @@ test("ensureInstalled installs a newer packaged version and keeps the older one"
   await fixture.cleanup();
 });
 
-test("ensureInstalled refuses to auto-downgrade", async () => {
+test("ensureInstalled selects exact package even with newer install retained", async () => {
   const archiveV2 = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-2" }]);
   const shaV2 = (await import("node:crypto")).createHash("sha256").update(archiveV2).digest("hex");
   const archiveV1 = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-1" }]);
@@ -536,11 +538,13 @@ test("ensureInstalled refuses to auto-downgrade", async () => {
   const fixture = await makeFixtureInstall({ archiveBytes: archiveV2, reportsVersion: "0.8.2" });
   await fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(shaV2, "v0.8.2") });
   fixture.state.archiveBytes = archiveV1;
+  fixture.state.reportsVersion = "0.8.1";
   const result = await fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(shaV1, "v0.8.1") });
-  assert.equal(result.reused, true);
-  assert.equal(result.version, "v0.8.2", "keeps the newer installed binary");
-  assert.equal(await readFile(result.path, "utf8"), "ELF-2");
-  assert.equal(fixture.downloads.length, 1);
+  assert.equal(result.reused, false);
+  assert.equal(result.version, "v0.8.1", "requires packaged pin, not highest directory");
+  assert.equal(await readFile(result.path, "utf8"), "ELF-1");
+  assert.equal(await readFile(installedBinaryPath(fixture.paths.codeGraphBin, "v0.8.2", "linux-arm64"), "utf8"), "ELF-2");
+  assert.equal(fixture.downloads.length, 2);
   await fixture.cleanup();
 });
 
@@ -608,14 +612,34 @@ test("ensureInstalled rejects unsupported platforms before any I/O", async () =>
   const { root, paths, cleanup } = await makeTempRoot();
   const installer = new CodeGraphInstaller({
     paths,
-    platform: () => ({ os: "linux", arch: "x64" }),
+    platform: () => ({ os: "linux", arch: "riscv64" }),
     sleep: sleep0,
   });
-  await assert.rejects(() => installer.ensureInstalled(() => {}), /not supported on linux\/x64/);
+  await assert.rejects(() => installer.ensureInstalled(() => {}), /not supported on linux\/riscv64/);
   const downloads = await readdir(paths.codeGraphDownloads);
   assert.deepEqual(downloads, []);
   await cleanup();
 });
+
+test("pinned installer supports both platforms and detects same-version byte tampering", async () => {
+  for (const arch of ["arm64", "x64"]) {
+    const bytes = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-approved" }]);
+    const sha = (await import("node:crypto")).createHash("sha256").update(bytes).digest("hex");
+    const fx = await makeFixtureInstall({ arch, archiveBytes: bytes, reportsVersion: "0.12.1" });
+    try {
+      const asset = { ...fixtureAsset(sha, "v0.12.1"), url: LINUX_ARM64_URL.replace("linux-arm64", arch === "x64" ? "linux-amd64" : "linux-arm64") };
+      const installed = await fx.installer.ensureInstalled(() => {}, { asset });
+      const platform = arch === "x64" ? "linux-amd64" : "linux-arm64";
+      assert.equal(installed.path, installedBinaryPath(fx.paths.codeGraphBin, "v0.12.1", platform));
+      await writeFile(installed.path, "ELF-tampered-still-reports-same-version");
+      const repaired = await fx.installer.ensureInstalled(() => {}, { asset });
+      assert.equal(repaired.reused, false);
+      assert.equal(await readFile(repaired.path, "utf8"), "ELF-approved");
+      assert.equal(fx.downloads.length, 2);
+    } finally { await fx.cleanup(); }
+  }
+});
+
 
 test("ensureInstalled rejects a broken packaged manifest before any I/O", async () => {
   const { root, paths, cleanup } = await makeTempRoot();

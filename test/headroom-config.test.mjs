@@ -13,7 +13,7 @@ test("Headroom config: bootstraps documented default once without overwriting us
   const configPath = join(directory, "nested", "headroom.json");
   try {
     assert.equal(await config.ensureHeadroomConfigFile(configPath), true);
-    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { port: 8787 });
+    assert.deepEqual(JSON.parse(await readFile(configPath, "utf8")), { schemaVersion: 1, port: 8787 });
     await writeFile(configPath, '{"url":"http://127.0.0.1:9000"}\n');
     assert.equal(await config.ensureHeadroomConfigFile(configPath), false);
     assert.equal(await readFile(configPath, "utf8"), '{"url":"http://127.0.0.1:9000"}\n');
@@ -24,6 +24,7 @@ test("Headroom config: bootstraps documented default once without overwriting us
 
 test("Headroom config: validates proxy, Memory, and compression values", () => {
   assert.deepEqual(config.parseHeadroomConfig({
+    schemaVersion: 1,
     port: 9000,
     memoryRoot: "/data/memory",
     memoryNamespace: "alice",
@@ -37,6 +38,7 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
       frozenMessageCount: 2,
     },
   }), {
+    schemaVersion: 1,
     port: 9000,
     memoryRoot: "/data/memory",
     memoryNamespace: "alice",
@@ -50,9 +52,10 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
       frozenMessageCount: 2,
     },
   });
-  assert.deepEqual(config.parseHeadroomConfig({ url: "http://127.0.0.1:9000/" }), { url: "http://127.0.0.1:9000" });
+  assert.throws(() => config.parseHeadroomConfig({ schemaVersion: 1, url: "http://127.0.0.1:9000/" }), /url is unsupported/);
+  assert.throws(() => config.parseHeadroomConfig({ port: 8787 }), /fresh schemaVersion/);
   for (const mode of ["ccr", "lossy_inline", "lossless_then_lossy"]) {
-    assert.deepEqual(config.parseHeadroomConfig({ compression: { mode } }), { port: 8787, compression: { mode } });
+    assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1, compression: { mode } }), { schemaVersion: 1, port: 8787, compression: { mode } });
   }
   for (const value of [
     { url: "http://127.0.0.1:9000", port: 8787 },
@@ -75,7 +78,7 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
     { compression: { frozenMessageCount: 1.5 } },
     { compression: { sessionId: "must-not-be-configurable" } },
   ]) {
-    assert.throws(() => config.parseHeadroomConfig(value), /headroom\.json/);
+    assert.throws(() => config.parseHeadroomConfig({ schemaVersion: 1, ...value }), /headroom\.json/);
   }
 });
 
@@ -83,8 +86,8 @@ test("Headroom config: loads JSON", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pi-headroom-config-"));
   const configPath = join(directory, "headroom.json");
   try {
-    await writeFile(configPath, JSON.stringify({ port: 9999, memoryNamespace: "tester" }));
-    assert.deepEqual(await config.loadHeadroomConfig(configPath), { port: 9999, memoryNamespace: "tester" });
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 9999, memoryNamespace: "tester" }));
+    assert.deepEqual(await config.loadHeadroomConfig(configPath), { schemaVersion: 1, port: 9999, memoryNamespace: "tester" });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

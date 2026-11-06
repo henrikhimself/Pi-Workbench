@@ -72,9 +72,11 @@ test("MemoryManager: preflights ONNX and produces direct local MCP configuration
 
     const config = manager.getMcpConfig("/managed/python");
     assert.equal(MEMORY_SERVER_NAME, "headroom-memory");
-    assert.equal(config.command, "/managed/python");
-    assert.deepEqual(config.args.slice(0, 3), ["-m", "headroom.memory.mcp_server", "--db"]);
-    assert.equal(config.args.at(-1), "tester");
+    assert.equal(config.command, process.execPath);
+    const spec = JSON.parse(config.args[1]);
+    assert.equal(spec.command, "/managed/python");
+    assert.deepEqual(spec.args.slice(0, 3), ["-m", "headroom.memory.mcp_server", "--db"]);
+    assert.equal(spec.args.at(-1), "tester");
     assert.equal(config.exposure, "direct");
     assert.equal(config.timeout, 60);
     assert.equal(config.env.HEADROOM_EMBEDDER_RUNTIME, undefined);

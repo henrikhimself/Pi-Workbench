@@ -1,6 +1,6 @@
 export const MEMORY_PROMPT_SECTION = "headroom_memory";
 
-export const MEMORY_GUIDANCE = `Headroom Memory provides project-scoped durable context through \`mcp__headroom-memory__memory_search\` and \`mcp__headroom-memory__memory_save\`.
+export const MEMORY_GUIDANCE = `Headroom Memory provides project-scoped durable context through \`mcp__headroom_memory__memory_search\` and \`mcp__headroom_memory__memory_save\`.
 
 Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present.
 
@@ -26,10 +26,10 @@ export function resolveMemoryGuidanceMode(options: {
 }): MemoryGuidanceMode {
   if (!options.memoryRegistered) return "off";
 
-  const activeTools = new Set(options.activeToolNames);
-  const searchAvailable = activeTools.has("mcp__headroom-memory__memory_search");
+  const activeTools = new Set(options.activeToolNames.map(name => name.replace("mcp__headroom-memory__", "mcp__headroom_memory__")));
+  const searchAvailable = activeTools.has("mcp__headroom_memory__memory_search");
   if (!searchAvailable) return "off";
 
-  if (activeTools.has("mcp__headroom-memory__memory_save")) return "normal";
+  if (activeTools.has("mcp__headroom_memory__memory_save")) return "normal";
   return options.studyEnabled ? "study" : "off";
 }

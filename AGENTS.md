@@ -18,14 +18,21 @@ npm test && npm run typecheck && git diff --check
 # Run extension once without installation
 pi -e ./src/index.ts
 
-# Start headless Pi with only this extension
-pi --mode rpc --no-session --no-extensions -e ./src/index.ts \
+# Start headless Pi with Workbench and required built-in MCP integration
+pi --mode rpc --no-session --no-extensions -e builtin:mcp -e ./src/index.ts \
   --model <provider>/<model>
 
-# Run live compression E2E only with a healthy proxy
-node test/e2e-check.mjs
+# Explicit isolated runtime acceptance; never current user proxy/stores
+WORKBENCH_RUNTIME_TESTS=1 node test/e2e-check.mjs
+WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs --old-fixture --debian11
 
-# Check default proxy manually
+# Explicit live Pi gate: exact already-loaded authorized local model only
+WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep
+
+# Deliberate test defects in disposable source copies
+node test/test-quality.mjs
+
+# Check HTTP availability only (not managed ownership)
 curl -fsS http://127.0.0.1:8787/health
 ```
 

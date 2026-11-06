@@ -8,9 +8,9 @@ import { WORKBENCH_PATHS } from "./paths.js";
 export type HeadroomCompressionConfig = Omit<CompressRequestConfig, "sessionId">;
 
 export interface HeadroomConfig {
-  /** External proxy URL. Omit to use extension-managed proxy. */
-  url?: string;
-  /** Extension-managed proxy port. Mutually exclusive with url. */
+  /** Explicit fresh-layout configuration; pre-refactor files are never converted. */
+  schemaVersion: 1;
+  /** Extension-managed loopback proxy port. */
   port?: number;
   /** Supported per-request compression overrides. */
   compression?: HeadroomCompressionConfig;
@@ -25,7 +25,7 @@ export interface HeadroomConfig {
 }
 
 /** Written once so users can discover configuration without environment variables. */
-export const DEFAULT_HEADROOM_CONFIG = { port: DEFAULT_HEADROOM_PORT } as const;
+export const DEFAULT_HEADROOM_CONFIG = { schemaVersion: 1, port: DEFAULT_HEADROOM_PORT } as const;
 
 function configError(message: string): Error {
   return new Error(`headroom.json ${message}`);
@@ -104,9 +104,13 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
     throw configError("must be a JSON object.");
   }
   const source = value as Record<string, unknown>;
-  const config: HeadroomConfig = {};
+  if ("url" in source) throw configError("url is unsupported; only extension-managed Headroom is allowed.");
+  if (source.schemaVersion !== 1) throw configError("requires fresh schemaVersion: 1 configuration. Existing file was not changed; replace it manually using documented fresh setup.");
+  const keys = ["schemaVersion", "port", "memoryRoot", "memoryNamespace", "memory", "compression"];
+  for (const key of Object.keys(source)) if (!keys.includes(key)) throw configError(`${key} is not supported.`);
+  const config: HeadroomConfig = { schemaVersion: 1 };
 
-  for (const key of ["url", "port", "memoryRoot", "memoryNamespace", "memory", "compression"]) {
+  for (const key of ["port", "memoryRoot", "memoryNamespace", "memory", "compression"]) {
     if (source[key] === undefined) continue;
     if (key === "port") {
       config.port = source.port as number;
@@ -126,29 +130,11 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
     if (key === "memoryNamespace" && /[\r\n\0]/.test(source.memoryNamespace as string)) {
       throw configError("memoryNamespace must be a non-empty single-line string when configured.");
     }
-    if (key === "url") config.url = source.url as string;
-    else if (key === "memoryRoot") config.memoryRoot = source.memoryRoot as string;
+    if (key === "memoryRoot") config.memoryRoot = source.memoryRoot as string;
     else if (key === "memoryNamespace") config.memoryNamespace = source.memoryNamespace as string;
   }
 
-  if (config.url !== undefined) {
-    if (config.port !== undefined) {
-      throw configError("url and port are mutually exclusive; url configures an external proxy, while port configures a localhost managed proxy.");
-    }
-    let url: URL;
-    try {
-      url = new URL(config.url);
-    } catch {
-      throw configError(`url must be an absolute http(s) URL; received ${JSON.stringify(config.url)}.`);
-    }
-    if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password) {
-      throw configError(`url must be an unauthenticated absolute http(s) URL; received ${JSON.stringify(config.url)}.`);
-    }
-    config.url = url.toString().replace(/\/$/, "");
-    delete config.port;
-  } else {
-    config.port = parseHeadroomPort(config.port);
-  }
+  config.port = parseHeadroomPort(config.port);
 
   return config;
 }
