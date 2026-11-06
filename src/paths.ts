@@ -18,7 +18,7 @@ export interface WorkbenchPaths {
 }
 export function resolveWorkbenchPaths(home: string = homedir()): WorkbenchPaths {
   const root = join(home, ".pi", "pi-workbench");
-  const headroomRoot = join(root, "headroom", "v1");
+  const headroomRoot = join(root, "headroom");
   const graph = join(root, "codebase-memory-mcp");
   return {
     root, headroomRoot, headroomMemory: join(headroomRoot, "memory"), headroomConfig: join(root, "headroom.json"),

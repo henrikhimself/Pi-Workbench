@@ -40,7 +40,7 @@ test("shared runtime prepares one immutable permanent slot and reuses without pi
   const runtime = fx.make();
   const one = await runtime.ensure(message => fx.messages.push(message)); assert.ok(one, fx.messages.join("\n"));
   const two = await runtime.ensure(message => fx.messages.push(message));
-  assert.deepEqual(one, two); assert.ok(one.slot.startsWith(join(fx.paths.root, "headroom", "v1", "runtimes")));
+  assert.deepEqual(one, two); assert.ok(one.slot.startsWith(join(fx.paths.root, "headroom", "runtimes")));
   assert.equal(fx.calls.filter(c => c.args.includes("venv")).length, 1);
   assert.equal(fx.calls.filter(c => c.args.includes("pip") && !c.args.includes("--dry-run")).length, 1);
   assert.ok(fx.calls.some(c => c.args.includes("--copies")), "entrypoint paths are never relocated");

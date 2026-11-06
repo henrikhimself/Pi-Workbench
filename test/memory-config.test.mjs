@@ -75,5 +75,5 @@ test("Memory configuration: validates root and namespace values", () => {
   assert.throws(() => parseMemoryNamespace(""), /headroom\.json memory\.namespace must be a non-empty single-line value/);
   assert.throws(() => parseMemoryNamespace("line\nbreak"), /headroom\.json memory\.namespace must be a non-empty single-line value/);
   assert.equal(parseMemoryNamespace("test-namespace"), "test-namespace");
-  assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom", "v1", "memory"));
+  assert.equal(resolveMemoryRoot(), join(homedir(), ".pi", "pi-workbench", "headroom", "memory"));
 });
