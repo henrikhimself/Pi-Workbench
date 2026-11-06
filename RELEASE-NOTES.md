@@ -27,6 +27,9 @@ New-layout future releases must provide reviewed runtime/store contracts. Unknow
 
 ## Code Graph
 
+- Fresh workspace startup now shows `○ Code Graph off`, matching the Headroom off labels.
+- `/wb:code-graph on` announces preparation before waiting and exposes existing installer/indexer progress in the footer instead of suppressing it. Success/failure restores the appropriate steady label. Symlink/path safety is unchanged.
+
 - Exact reviewed portable **v0.12.1**, Linux ARM64 and AMD64. No newest-arbitrary-version selection.
 - Archive/member caps: **64,000,000 / 400,000,000 bytes**; checksums and strict executable-only extraction retained. Bundled installers are never executed.
 - Explicit JSON CLI flags, bounded pagination, unique canonical workspace matching, protocol `2024-11-05`, and exact 17-tool name contract.

@@ -219,3 +219,10 @@ Done: permitted AMD64 live acceptance passed with exact already-loaded local mod
 - [ ] User verifies original symlinked setup, safe isolated persistence/peer behavior and optional live Pi acceptance using TEST-PROJECT-OPT-IN.md.
 
 Implementation and offline checks complete. Host/live acceptance remains user-owned and unverified for this follow-up; prior AMD64 live evidence predates the new startup behavior.
+
+### 20. Show Code Graph startup state and activation progress
+
+- [x] Show Code Graph off immediately in new projects and retain it after off restore.
+- [x] Announce preparation/waiting on explicit on; expose download/verification/indexing/activation footer phases using the current command UI.
+- [x] Preserve symlink safety, final ready/off labels and headless behavior; pass 276 offline regressions, typecheck/whitespace and all 16 existing mutation controls.
+- [ ] Verify actual host footer and live download UI feedback; no host/network acceptance claimed for this follow-up.

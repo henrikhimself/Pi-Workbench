@@ -104,6 +104,7 @@ export default function piWorkbenchExtension(
   let memoryRootWarningShown = false;
   let codeGraphManager: CodeGraphManager | null = null;
   let codeGraphActivationQuiet = false;
+  let codeGraphStatusContext: ExtensionContext | null = null;
   let codeGraphGuidanceActive = false;
 
   // Standalone codebase-memory-mcp lifecycle. Independent from the
@@ -285,6 +286,7 @@ export default function piWorkbenchExtension(
   // ─── Code graph (standalone codebase-memory-mcp) ──────────────────
 
   function codeGraphManagerFor(ctx: ExtensionContext): CodeGraphManager {
+    codeGraphStatusContext = ctx;
     const project = resolveCodeGraphProject(ctx.cwd ?? process.cwd(), paths);
     if (codeGraphManager && codeGraphManager.registeredProjectDirectory && codeGraphManager.registeredProjectDirectory !== project.directory) {
       background(codeGraphManager.shutdown(), ctx, "Previous workspace graph shutdown");
@@ -298,7 +300,8 @@ export default function piWorkbenchExtension(
         ensureInstalled: (onStatus) => codeGraphInstaller.ensureInstalled(onStatus),
         onStatus: (message) => {
           if (currentGeneration(generation) && !codeGraphActivationQuiet) {
-            ctx.ui.setStatus(CODE_GRAPH_STATUS_KEY, colorText(ctx, "dim", `⏳ ${message}`));
+            const statusContext = codeGraphStatusContext ?? ctx;
+            statusContext.ui.setStatus(CODE_GRAPH_STATUS_KEY, colorText(statusContext, "dim", `⏳ ${message}`));
           }
         },
         registerMcp: (name, config) => pi.registerMcpServer(name, config),
@@ -344,8 +347,8 @@ export default function piWorkbenchExtension(
         return;
       }
       codeGraphGuidanceActive = false;
+      codeGraphStatusOff(ctx);
       if (result.kind !== "off") {
-        codeGraphStatusOff(ctx);
         ctx.ui.notify(`Code graph ${result.kind}: ${result.detail}`, "warning");
       }
     } catch (error) {
@@ -485,6 +488,7 @@ export default function piWorkbenchExtension(
     proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false;
     memoryRootWarningShown = false; sessionTotals = { calls: 0, tokensSaved: 0 };
     ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
+    codeGraphStatusOff(ctx);
     const proxyJob = async () => {
       try {
         const optedIn = await compressionOptedIn(resolveCompressionProject(ctx.cwd ?? process.cwd(), paths));
@@ -970,7 +974,10 @@ export default function piWorkbenchExtension(
           );
           return;
         }
-        codeGraphActivationQuiet = true;
+        codeGraphActivationQuiet = false;
+        const preparing = `Preparing Code Graph ${getAsset(platform).asset.version} for this project...`;
+        ctx.ui.setStatus(CODE_GRAPH_STATUS_KEY, colorText(ctx, "dim", `⏳ ${preparing}`));
+        ctx.ui.notify(`${preparing} Downloading and indexing may take a while; please wait.`, "info");
         try {
           const result = await manager.activate(project);
           if (result.ok) {

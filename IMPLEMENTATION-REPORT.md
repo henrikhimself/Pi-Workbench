@@ -6,7 +6,7 @@ Assistant owns baseline implementation/testing under approved TODO.md. User owns
 
 ## Available passing evidence
 
-- **274 offline tests, zero failures/skips** after project-opt-in changes (`/tmp/workbench-project-optin-final.log`). Earlier 256-test baseline passed three consecutive isolated runs (`/tmp/workbench-handoff-offline-{1,2,3}.log`).
+- **276 offline tests, zero failures/skips** after Code Graph UI feedback changes (`/tmp/workbench-code-graph-ui-final.log`). Project-opt-in baseline was 274 tests; earlier 256-test baseline passed three consecutive isolated runs (`/tmp/workbench-handoff-offline-{1,2,3}.log`).
 - `npm run typecheck` and `git diff --check` pass.
 - **Sixteen** deliberate defects in disposable source copies fail intended assertions: artifact digest, backend version, tool names, namespace, health proof, authored-data loss, MCP registration, SDK transport bypass, plaintext context leakage, headless theme fallback, same-process shim publication, log-handle cleanup, native normalized Memory names, Memory startup gating, compression startup gating and project intent persistence. No setup/timeout substitute.
 - Default test runner isolates HOME/Pi/XDG and removes credentials; policy failures cannot be swallowed by fail-open code.
@@ -81,6 +81,12 @@ User approved persistent compression on/off per project and owns acceptance test
 Added 18 focused regressions covering absent/symlinked roots, independent Memory restoration, persisted on/off/restart/other-workspace behavior, peer preservation, failed activation/opt-out, corrupt/foreign/unsafe preferences, cancellation and pending startup/context races. Current suite: 274 pass, zero failures/skips; typecheck and whitespace pass. All 16 mutation controls caught intended assertions (`/tmp/workbench-project-optin-negative.json`; retained logs `/tmp/wb-test-quality-hn1g9S`).
 
 No new native/live inference, real host startup or symlinked production-store tests were performed. Earlier native/live evidence above must not be presented as acceptance of the changed startup behavior. The live harness now seeds explicit intent in disposable projects. User procedure: TEST-PROJECT-OPT-IN.md.
+
+## Code Graph startup/activation feedback follow-up
+
+New workspace startup initializes `○ Code Graph off` and preserves that label after a normal off restore. Explicit on immediately emits a preparing/wait notification, no longer suppresses installer/activation footer phases, and routes cached-manager progress to the current command UI. Failure clears preparation back to off; success shows the ready label. No symlink guard or backend lifecycle policy was changed.
+
+Offline regressions verify the startup label, headless theme fallback, progress before a deliberately blocked fixture download completes, current-vs-startup UI routing, real fake-backend indexing/handshake phases and failure cleanup. Current suite: 276 pass, zero failures/skips; typecheck/whitespace pass. All 16 existing mutation controls still catch intended assertions (`/tmp/workbench-code-graph-ui-negative.json`; retained logs `/tmp/wb-test-quality-PPN1GX`). Actual network download and host TUI rendering were not exercised for this follow-up; visible host acceptance still needs verification.
 
 ## Remaining external acceptance
 

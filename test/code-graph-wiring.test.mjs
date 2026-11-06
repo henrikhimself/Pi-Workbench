@@ -28,6 +28,7 @@ const {
 } = await jiti.import("../src/code-graph-config.ts");
 const { curlShimDirectory } = await jiti.import("../src/code-graph-manager.ts");
 const extensionModule = await jiti.import("../src/index.ts");
+const { CodeGraphInstaller } = await jiti.import("../src/code-graph-installer.ts");
 
 // ─── Harness ──────────────────────────────────────────────────────────
 
@@ -266,6 +267,68 @@ test("command: first on activates end to end without confirmation", async () => 
   }
 });
 
+test("command: on shows preparing and download progress before completion, then indexing and ready status", async () => {
+  const fixture = await makeFixture();
+  const originalEnsure = CodeGraphInstaller.prototype.ensureInstalled;
+  let finish, activation;
+  const waiting = new Promise(resolve => { finish = resolve; });
+  try {
+    await seedVerifiedInstall(fixture);
+    // Startup creates the cached manager with a different context.
+    const startup = makeCtx(fixture.workspace);
+    await fixture.piState.handlers.get("session_start")({}, startup.ctx);
+    await waitFor(() => startup.statuses.filter(([key, value]) => key === "code-graph" && value === "○ Code Graph off").length >= 2, 5000, "off restore");
+    let downloading = false, completed = false;
+    CodeGraphInstaller.prototype.ensureInstalled = async function (report, options) {
+      report("Downloading codebase-memory-mcp v0.12.1...");
+      downloading = true;
+      await waiting;
+      report("Downloaded fixture archive; verifying...");
+      return originalEnsure.call(this, report, options);
+    };
+    const current = makeCtx(fixture.workspace);
+    activation = command(fixture).handler("on", current.ctx).then(() => { completed = true; });
+    await waitFor(() => downloading, 5000, "fixture download progress");
+    assert.equal(completed, false, "feedback must precede activation completion");
+    assert.ok(current.notifications.some(({ level, message }) =>
+      level === "info" && /Preparing Code Graph v0\.12\.1/.test(message) && /please wait/i.test(message)),
+      "explicit on announces preparation before waiting");
+    assert.ok(current.statuses.some(([key, value]) => key === "code-graph" && /Downloading codebase-memory-mcp/.test(value)),
+      "download progress must reach current command UI while work is pending");
+    assert.equal(startup.statuses.some(([, value]) => /Downloading/.test(value)), false,
+      "cached manager must not route command progress to stale startup UI");
+    finish(); await activation;
+    assert.ok(current.statuses.some(([, value]) => /Building initial code index/.test(value)), "indexing phase remains visible");
+    assert.ok(current.statuses.some(([, value]) => /Validating MCP handshake/.test(value)), "activation validation remains visible");
+    assert.equal(current.statuses.filter(([key]) => key === "code-graph").at(-1)?.[1], "✓ Code Graph");
+  } finally {
+    finish(); await activation;
+    CodeGraphInstaller.prototype.ensureInstalled = originalEnsure;
+    await fixture.cleanup();
+  }
+});
+
+test("command: failed download clears preparing status back to off with an error", async () => {
+  const fixture = await makeFixture();
+  const originalEnsure = CodeGraphInstaller.prototype.ensureInstalled;
+  try {
+    CodeGraphInstaller.prototype.ensureInstalled = async report => {
+      report("Downloading codebase-memory-mcp v0.12.1...");
+      throw new Error("fixture download failed");
+    };
+    const { ctx, notifications, statuses } = makeCtx(fixture.workspace);
+    await command(fixture).handler("on", ctx);
+    assert.ok(notifications.some(({ message }) => /Preparing Code Graph/.test(message)));
+    assert.ok(statuses.some(([, value]) => /Downloading/.test(value)));
+    assert.ok(notifications.some(({ level, message }) => level === "error" && /fixture download failed/.test(message)));
+    assert.equal(statuses.filter(([key]) => key === "code-graph").at(-1)?.[1], "○ Code Graph off");
+    assert.equal(fixture.piState.mcp.size, 0);
+  } finally {
+    CodeGraphInstaller.prototype.ensureInstalled = originalEnsure;
+    await fixture.cleanup();
+  }
+});
+
 test("command: on again while enabled does not reindex", async () => {
   const fixture = await makeFixture();
   const { project, fakeBinary } = await seedEnabledWorkspace(fixture);
@@ -288,7 +351,9 @@ test("command: first on without UI activates", async () => {
   await seedVerifiedInstall(fixture);
   try {
     const { ctx, notifications } = makeCtx(fixture.workspace, { hasUI: false });
+    delete ctx.ui.theme;
     await command(fixture).handler("on", ctx);
+    assert.ok(notifications.some(({ message }) => /Preparing Code Graph v0\.12\.1/.test(message)));
     await waitFor(() => fixture.piState.mcp.has("codebase-memory"), 15000, "MCP registration");
     assert.ok(notifications.some(({ message }) => /Code graph enabled for /.test(message)));
   } finally {
@@ -420,11 +485,13 @@ test("command: off stops the owned MCP registration before deletion", async () =
 test("session start with no state stays off without error noise", async () => {
   const fixture = await makeFixture();
   try {
-    const { ctx, notifications } = makeCtx(fixture.workspace);
+    const { ctx, notifications, statuses } = makeCtx(fixture.workspace);
     await fixture.piState.handlers.get("session_start")({}, ctx);
+    assert.ok(statuses.some(([key, value]) => key === "code-graph" && value === "○ Code Graph off"), "new projects show Code Graph off immediately");
     // Allow the fire-and-forget restore to settle.
     await new Promise((resolve) => setTimeout(resolve, 300));
     assert.equal(fixture.piState.mcp.size, 0);
+    assert.equal(statuses.filter(([key]) => key === "code-graph").at(-1)?.[1], "○ Code Graph off", "normal off restore keeps visible off label");
     assert.ok(
       !notifications.some(({ level, message }) => level === "warning" && /code graph/i.test(message)),
       JSON.stringify(notifications),
