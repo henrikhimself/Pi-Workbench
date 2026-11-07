@@ -109,7 +109,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     if (!ctx || !available || !manager?.isManagedRegistration || resolvePlaywrightProject(ctx.cwd ?? process.cwd(), options.paths).identifier !== manager.project.identifier) return;
     const exposed = names(); if (!exposed.length) return;
     return "Managed Playwright is available for this workspace through " + exposed.join(", ") + ". " +
-      "Use accessibility snapshots for structure and normal browser tools for requested web tasks. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
+      "Use accessibility snapshots for structure and normal browser tools for requested web tasks. browser_navigate and other action tools only link to a snapshot file; call browser_snapshot to read page content. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
       "Each Pi session owns an isolated headless Chromium; browser state lasts until browser closure or runtime/session teardown, not a persistent login profile. " +
       `Write explicit output filenames only inside ${manager.managedSession?.artifacts ?? "the managed session artifact directory"}; project/external output destinations are rejected. Workspace uploads retain upstream file guardrails. ` +
       "Sandbox is mandatory; never retry unsandboxed. HTTP(S) targets include local/LAN/public sites without an origin allowlist. Browser sandboxing does not sandbox the MCP Node process; page/file/origin guardrails are not hard security boundaries. " +

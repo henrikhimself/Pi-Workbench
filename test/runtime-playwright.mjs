@@ -138,9 +138,16 @@ try {
   await first.manager.shutdown();
   const drained = await readPlaywrightOwnership(session); assert.equal((await new PlaywrightOwnedTree(drained.scope, drained.roots).capture()).processes.length, 0);
   await assert.rejects(first.manager.off(true), /same-workspace peers/); await snapshot(peer); await snapshot(other);
+  const peerBefore = await readPlaywrightOwnership(peer.manager.managedSession); assert.ok((await new PlaywrightOwnedTree(peerBefore.scope, peerBefore.roots).capture()).processes.length > 0, "peer browser tree must be live before normal shutdown");
   await peer.manager.shutdown(); await readFile(peer.manager.managedSession.markerPath); // No deferred deletion after peer exits.
+  const peerAfter = await readPlaywrightOwnership(peer.manager.managedSession); assert.equal((await new PlaywrightOwnedTree(peerAfter.scope, peerAfter.roots).capture()).processes.length, 0, "normal shutdown must leave no owned descendants");
   await first.manager.off(true); await accessAbsent(first.manager.project.directory); await snapshot(other); await readFile(join(cwd, "upload.txt"));
   assert.equal(await fingerprint(ready.slot), before); report.checks.push("forced MCP exit/descendant cleanup, peer-busy refusal, explicit scoped deletion, other-workspace protection and shared-slot immutability");
+  const eofOwn = await readPlaywrightOwnership(other.manager.managedSession), eofTree = new PlaywrightOwnedTree(eofOwn.scope, eofOwn.roots);
+  assert.ok((await eofTree.capture()).processes.length > 0, "browser tree must be live before EOF");
+  await (await other.client()).close(); // EOF on MCP stdio without manager shutdown.
+  await wait(async () => (await eofTree.capture()).processes.length === 0, "owned descendants gone after EOF", 30000);
+  report.checks.push("normal-shutdown and stdio-EOF descendant quiescence");
   await other.manager.shutdown(); await other.manager.off(true);
   completed = true;
 } catch (error) {

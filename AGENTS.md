@@ -29,11 +29,11 @@ WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs --old-fixture --debia
 # Playwright runtime only after approved host-specific authorization; no Pi/model
 WORKBENCH_RUNTIME_TESTS=1 node test/runtime-playwright.mjs --keep
 
-# Explicit live Pi gate: exact already-loaded authorized local model only
-WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep
+# Explicit live Pi gate: already-loaded local model named in WORKBENCH_LIVE_MODEL (plus LLAMA_BASE_URL/LLAMA_API_KEY)
+WORKBENCH_LIVE_MODEL=<model-id> WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep
 
 # Separately approved Playwright live gate; requires successful retained runtime report
-WORKBENCH_LIVE_TESTS=1 WORKBENCH_PLAYWRIGHT_LIVE_TESTS=1 \
+WORKBENCH_LIVE_MODEL=<model-id> WORKBENCH_LIVE_TESTS=1 WORKBENCH_PLAYWRIGHT_LIVE_TESTS=1 \
   WORKBENCH_PLAYWRIGHT_RUNTIME_EVIDENCE=/retained/disposable/acceptance.json \
   node test/live-playwright.mjs --keep
 
