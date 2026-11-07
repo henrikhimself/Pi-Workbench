@@ -22,6 +22,13 @@ const mutations = [
   { name: "authored data restoration lost", file: "src/code-graph-upgrade.ts", from: "await restoreAuthoredData(stage.directory, authored);", to: "// Deliberate data loss", test: "code-graph-upgrade", pattern: "extension activation automatically stages upgrade", evidence: /ADR sentinel/ },
   { name: "direct MCP registration removed", file: "src/code-graph-manager.ts", from: "this.deps.registerMcp(CODE_GRAPH_MCP_SERVER_NAME, this.getMcpConfig(project, binaryPath));", to: "// Deliberate missing direct registration", test: "code-graph-manager", pattern: "activate: full transaction publishes state", evidence: /0 !== 1/ },
   { name: "SDK transport bypasses ownership adapter", file: "src/headroom-client.ts", from: "const value = await proxy.requestOwned(path, body, method);", to: "const value = await (await fetch(proxy.baseUrl + path, { method, body: JSON.stringify(body) })).json();", test: "headroom-client", pattern: "actual SDK compress and raw calls use owned transport", evidence: /Unsealed fetch must not run/ },
+  { name: "Playwright absent opt-in adopted", file: "src/playwright-config.ts", from: 'const raw = await readPlaywrightJson(project.root, project.statePath);\n  if (raw === null) return false;', to: 'const raw = await readPlaywrightJson(project.root, project.statePath);\n  if (raw === null) return true;', test: "playwright-manager", pattern: "restore obeys absent opt-in before runtime seam", evidence: /off Playwright must be gated before runtime preparation/ },
+  { name: "Playwright Chromium sandbox disabled", file: "src/playwright-config.ts", from: "chromiumSandbox: true", to: "chromiumSandbox: false", test: "playwright-config", pattern: "fresh session has fixed sandbox", evidence: /false !== true/ },
+  { name: "Playwright unsafe server code directly exposed", file: "src/playwright-policy.ts", from: 'browser_run_code_unsafe: "hidden"', to: 'browser_run_code_unsafe: "direct"', test: "playwright-integration", pattern: "normal core/vision exposure hides unsafe", evidence: /direct.*hidden|hidden.*direct/s },
+  { name: "Playwright WebMCP enabled", file: "src/playwright-config.ts", from: "webmcp: false", to: "webmcp: true", test: "playwright-config", pattern: "fresh session has fixed sandbox", evidence: /true !== false/ },
+  { name: "Playwright deletion escapes workspace", file: "src/playwright-manager.ts", from: '(this.deps.remove ?? (path => rm(path, { recursive: true })))(this.project.directory)', to: '(this.deps.remove ?? (path => rm(path, { recursive: true })))(this.paths.playwrightRoot)', test: "playwright-manager", pattern: "confirmed off deletes only workspace data", evidence: /Only exact managed workspace may be deleted/ },
+  { name: "Playwright detached browser lease prematurely quiescent", file: "src/playwright-runtime.ts", from: "active = snapshot.processes.length > 0;", to: "active = false;", test: "playwright-launcher", pattern: "recovery detects orphaned detached descendants", evidence: /0 !== 2/ },
+
   { name: "plaintext context accidentally attached", file: "src/owned-transport.ts", from: 'JSON.stringify({ v: 1, iv: iv.toString("base64"), data: data.toString("base64") })', to: 'JSON.stringify({ v: 1, leak: value, iv: iv.toString("base64"), data: data.toString("base64") })', test: "proxy-manager", pattern: "compression authenticates both directions", evidence: /true !== false/ },
 ];
 const root = await mkdtemp(join(tmpdir(), "wb-test-quality-")), results = [];
@@ -29,7 +36,7 @@ let completed = false;
 try {
   for (const [index, mutation] of mutations.entries()) {
     const copy = join(root, String(index)), home = join(copy, "home"); await mkdir(home, { recursive: true, mode: 0o700 });
-    for (const entry of ["src", "test", "package.json", "tsconfig.json"]) await cp(join(repository, entry), join(copy, entry), { recursive: true });
+    for (const entry of ["src", "test", "assets", "package.json", "tsconfig.json"]) await cp(join(repository, entry), join(copy, entry), { recursive: true });
     await symlink(join(repository, "node_modules"), join(copy, "node_modules"), "dir");
     const path = join(copy, mutation.file), original = await readFile(path, "utf8");
     assert.equal(original.split(mutation.from).length - 1, 1, `Unique mutation anchor: ${mutation.name}`);

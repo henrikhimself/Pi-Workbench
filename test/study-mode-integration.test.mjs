@@ -119,7 +119,7 @@ test("Study Mode adds guidance without restricting tools, skills, or commands", 
 
   assert.ok(commands.has("wb:study-mode"));
   assert.equal(handlers.has("input"), false, "Study Mode does not block skill input");
-  assert.equal(handlers.has("tool_call"), false, "Study Mode does not block tools");
+  assert.equal(await handlers.get("tool_call")({ toolName: "bash", input: { command: "synthetic-not-executed" } }, {}), undefined, "Study Mode does not block ordinary tools; managed Playwright has its own scoped policy");
 
   const statuses = [];
   const notifications = [];
@@ -146,6 +146,7 @@ test("Study Mode adds guidance without restricting tools, skills, or commands", 
     level: "info",
   });
   assert.deepEqual(activeTools, ["bash", "read", "grep"], "active tool loadout remains unchanged");
+  for (const toolName of ["bash", "read", "grep", "mcp__external__tool"]) assert.equal(await handlers.get("tool_call")({ toolName, input: {} }, ctx), undefined);
   assert.deepEqual(statuses.at(-1), { key: "study", value: "✓ Study" });
 
   const prompt = { systemPromptOptions: { sections: { unrelated: "keep" } } };

@@ -1,0 +1,9 @@
+{
+  "name": "pi-workbench-playwright-runtime",
+  "version": "0.0.84",
+  "private": true,
+  "description": "Private immutable runtime for Pi Workbench managed Playwright MCP",
+  "dependencies": {
+    "@playwright/mcp": "0.0.84"
+  }
+}

@@ -1,7 +1,8 @@
 /** Enforced in every offline test worker. A swallowed fail-open error still fails exit. */
 import { createRequire, syncBuiltinESMExports } from "node:module";
+import { fileURLToPath } from "node:url";
 import { basename, delimiter, join, isAbsolute } from "node:path";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 const require = createRequire(import.meta.url), violations = [];
 function deny(reason) { violations.push(reason); throw new Error(`Offline policy violation: ${reason}`); }
 process.once("exit", () => { if (violations.length) { process.stderr.write(`Offline policy violation(s): ${[...new Set(violations)].join(", ")}\n`); process.exitCode = 1; } });
@@ -46,6 +47,14 @@ function resolved(command, options) {
   for (const dir of String(options?.env?.PATH ?? process.env.PATH ?? "").split(delimiter)) { const path = join(dir, command); try { if (statSync(path).isFile()) return path; } catch {} }
   return command;
 }
+function syntheticPlaywrightEntry(path) {
+  // Allow only byte-attested checked-in Node fixtures, never an upstream backend.
+  // This lets owned-launcher tests use the real layout without disabling guards.
+  try {
+    return readFileSync(path).equals(readFileSync(new URL("./fake-playwright-mcp.mjs", import.meta.url))) &&
+      readFileSync(join(path, "..", "fake-playwright-browser.mjs")).equals(readFileSync(new URL("./fake-playwright-browser.mjs", import.meta.url)));
+  } catch { return false; }
+}
 function checkCommand(command, args = [], options = {}) {
   const name = basename(String(command)).toLowerCase(), text = args.join(" ");
   if (name === "curl") {
@@ -54,6 +63,19 @@ function checkCommand(command, args = [], options = {}) {
     deny("curl network client");
   }
   if (["wget", "pip", "pip3", "uv", "npm", "npx", "yarn", "pnpm", "bash", "sh", "zsh"].includes(name)) deny(`unexpected installer/shell ${name}`);
+  let executable = resolved(command, options);
+  try { executable = realpathSync(executable); } catch { /* Missing executables still undergo name/argument checks. */ }
+  const executableName = basename(String(executable)).toLowerCase();
+  const browser = /^(?:chrome|chromium|chromium-browser|chrome-headless-shell|headless_shell)(?:[.]exe)?$/;
+  if (browser.test(name) || browser.test(executableName)) deny(`browser execution ${name}`);
+  if (/^(?:playwright|playwright-mcp)(?:[.]cmd)?$/.test(name)) deny(`Playwright backend ${name}`);
+  const backendEntry = /(?:^|\/)(?:(?:npm|npx)-cli[.](?:c?js|mjs)|(?:@playwright\/mcp|playwright(?:-core)?)\/(?:cli|index)[.](?:c?js|mjs))$/;
+  if (backendEntry.test(String(executable).replaceAll("\\", "/")) && !syntheticPlaywrightEntry(executable)) deny("package/backend entrypoint");
+  let nodeExecutable = /^(?:node|nodejs)(?:[.]exe)?$/.test(name);
+  try { nodeExecutable ||= executable === realpathSync(process.execPath); } catch { /* Name check remains effective. */ }
+  if (nodeExecutable && args.some(arg => typeof arg === "string" && backendEntry.test(arg.replaceAll("\\", "/")) && !syntheticPlaywrightEntry(arg))) {
+    deny("Node package/backend entrypoint");
+  }
   if (name === "git" && args.some(arg => ["clone", "fetch", "pull", "push", "ls-remote"].includes(arg))) deny("Git network operation");
   if (/python(?:3(?:[.][0-9]+)?)?(?:[.]exe)?$/.test(name)) {
     if (args[0] === "-m" && /^(pip|venv|headroom)([.]|$)/.test(args[1] ?? "")) deny("Python package/service operation");
@@ -82,4 +104,13 @@ for (const method of ["spawn", "spawnSync", "execFile", "execFileSync", "exec", 
     checkCommand(command, args, options); return original[custom].call(this, command, args, options);
   };
 }
+// fork bypasses spawn/exec wrappers internally; inspect its module entry explicitly.
+const originalFork = child.fork;
+child.fork = function(modulePath, args, options) {
+  const argv = Array.isArray(args) ? args : [];
+  const opts = (Array.isArray(args) ? options : args) ?? {};
+  const entry = modulePath instanceof URL ? fileURLToPath(modulePath) : String(modulePath);
+  checkCommand(opts.execPath ?? process.execPath, [entry, ...argv], opts);
+  return originalFork.call(this, modulePath, args, options);
+};
 syncBuiltinESMExports();

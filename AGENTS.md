@@ -26,8 +26,16 @@ pi --mode rpc --no-session --no-extensions -e builtin:mcp -e ./src/index.ts \
 WORKBENCH_RUNTIME_TESTS=1 node test/e2e-check.mjs
 WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs --old-fixture --debian11
 
+# Playwright runtime only after approved host-specific authorization; no Pi/model
+WORKBENCH_RUNTIME_TESTS=1 node test/runtime-playwright.mjs --keep
+
 # Explicit live Pi gate: exact already-loaded authorized local model only
 WORKBENCH_LIVE_TESTS=1 node test/live-pi.mjs --keep
+
+# Separately approved Playwright live gate; requires successful retained runtime report
+WORKBENCH_LIVE_TESTS=1 WORKBENCH_PLAYWRIGHT_LIVE_TESTS=1 \
+  WORKBENCH_PLAYWRIGHT_RUNTIME_EVIDENCE=/retained/disposable/acceptance.json \
+  node test/live-playwright.mjs --keep
 
 # Deliberate test defects in disposable source copies
 node test/test-quality.mjs
@@ -51,3 +59,10 @@ curl -fsS http://127.0.0.1:8787/health
 - Study Mode stays opt-in and branch-scoped guidance. It favors questions, evidence, explanations, and avoiding changes, but is not a tool or command sandbox.
 - Explicit user requests may proceed while Study Mode is enabled. Recommend `/wb:study-mode off` or confirm intent before implementation work; do not claim actions are blocked.
 - Study Mode must not create learner profiles, assessments, or stored learner data.
+- Playwright startup is independently workspace-opt-in; absent intent/status must not prepare roots, install packages, register MCP, or launch a browser.
+- Playwright pins are `@playwright/mcp` 0.0.84 and `playwright`/`playwright-core` 1.65.0-alpha-2026-10-30. Provision immutable slots under `~/.pi/pi-workbench/playwright/`; never install OS dependencies, download Node/npm, change host security, or retry unsandboxed.
+- Managed Playwright uses isolated headless Chromium with sandbox required, vision enabled, idle timeout 0, WebMCP disabled, and unknown/unsafe tools hidden. Preserve the direct/nested tool guard and canonical managed output filenames; workspace uploads retain upstream guardrails.
+- Each Pi session owns its browser and transient HOME/cache/tmp. Chromium uses detached groups: MCP exit alone is not quiescence. Verify birth/ancestry/private-scope witnesses, protect the Pi process/group, and retain evidence when ownership is uncertain.
+- Playwright off requires confirmation before stopping the invoking session. Same-workspace active peers prevent deletion; retain intent/data, never stop peers, and never schedule deferred deletion. Shared runtime/browser/npm assets and other workspaces/features remain untouched.
+- Retain browser artifacts/diagnostics until confirmed workspace off; no automatic artifact/runtime GC, quotas, TTL, persistent profiles, or automatic storage snapshots. Never log credentials/raw browsing content in Workbench lifecycle diagnostics.
+- Default tests may execute only byte-attested Node Playwright fixtures, never real npm/Playwright/Chromium. Current-host real-browser acceptance and live Pi/model acceptance are separate gates; flags are not approval. The Playwright live fixture additionally requires environment-supplied selected-provider credentials and a successful current-host runtime report; no normal auth-store fallback, model load/unload, router control, or paid/default provider fallback.
