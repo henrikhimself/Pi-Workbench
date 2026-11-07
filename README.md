@@ -122,14 +122,14 @@ Each workspace creates a managed session store that saves Playwright configurati
 
 A model with vision capability is required if you want your agent to look at screenshots.
 
-### Study Mode
+## Study Mode
 
 Study Mode adds guidance favoring questions, evidence, explanations, and avoiding changes. It is not a sandbox: tools, commands, Memory, proxy lifecycle, and session behavior remain available. For implementation, it recommends `/wb:study-mode off` or confirming intent; explicit requests can still proceed while enabled.
 
 - `/wb:study-mode on` — enables study guidance.
 - `/wb:study-mode off` — disables study guidance.
 
-### System Prompt
+## System Prompt
 
 Displays the system prompt which models usually will refuse to do when asked. Even when asked nicely.
 
