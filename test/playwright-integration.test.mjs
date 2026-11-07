@@ -62,7 +62,7 @@ test("Playwright normal core/vision exposure hides unsafe, optional, and later p
 test("Playwright footer and guidance follow passive startup, availability, and cleanup", async t => {
   const f = await fixture(t); await f.integration.start(f.ctx); assert.match(f.statuses.at(-1).text, /dim:○ Playwright off/);
   await f.command("on"); assert.match(f.statuses.at(-1).text, /success:✓ Playwright/);
-  const options = { sections: {} }; await f.integration.beforeAgent(options, f.ctx); assert.match(options.sections[PLAYWRIGHT_PROMPT_SECTION], /image-capable model/);
+  const options = { sections: {} }; await f.integration.beforeAgent(options, f.ctx); assert.match(options.sections[PLAYWRIGHT_PROMPT_SECTION], /image-capable model/); assert.match(options.sections[PLAYWRIGHT_PROMPT_SECTION], /call browser_snapshot to read page content/);
   assert.equal(f.integration.guidance(f.ctx), options.sections[PLAYWRIGHT_PROMPT_SECTION]);
   await f.integration.shutdown(); assert.equal(f.statuses.at(-1).text, undefined); await f.integration.beforeAgent(options, f.ctx); assert.equal(options.sections[PLAYWRIGHT_PROMPT_SECTION], undefined);
 });

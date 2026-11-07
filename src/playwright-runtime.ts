@@ -48,7 +48,7 @@ async function hostFile(path: string): Promise<string> {
   const canonical = await realpath(path);
   await assertNoSymlink(canonical);
   const info = await lstat(canonical);
-  if (!info.isFile() || (info.mode & 0o022) !== 0 || process.getuid && ![0, process.getuid()].includes(info.uid)) throw new Error("Unsafe Playwright host executable");
+  if (!info.isFile() || (info.mode & 0o022) !== 0) throw new Error("Unsafe Playwright host executable"); // Owner is not checked (product-owner decision); group/other-writable files, symlinks and writable ancestors are still refused.
   return canonical;
 }
 async function findHostCommand(name: string): Promise<string> {

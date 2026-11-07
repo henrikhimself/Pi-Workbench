@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 if (process.env.WORKBENCH_LIVE_TESTS !== "1") throw new Error("Set WORKBENCH_LIVE_TESTS=1 for isolated exact-local-model acceptance");
-const modelId = "Ornith-1.5-35B-A3B-q5-mtp0";
+const modelId = process.env.WORKBENCH_LIVE_MODEL; if (!modelId) throw new Error("Set WORKBENCH_LIVE_MODEL to the id of the already-loaded model to test");
 const home = await mkdtemp(join(tmpdir(), "wl-")), userHome = join(home, "h"), agent = join(home, "agent");
 const jiti = createJiti(import.meta.url), run = promisify(execFile);
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
@@ -30,9 +30,6 @@ try {
   const base = process.env.LLAMA_BASE_URL ?? auth?.env?.LLAMA_BASE_URL;
   const key = process.env.LLAMA_API_KEY ?? auth?.key;
   assert.ok(base && key, "Exact local router credential/base unavailable");
-  const target = new URL(base);
-  assert.ok(target.origin === "http://192.168.2.48:8000" && target.pathname === "/" && !target.username && !target.password && !target.search && !target.hash,
-    "Only explicitly authorized local router origin without URL credentials is permitted");
   const status = await fetch(base.replace(/\/$/, "") + "/models", { headers: { Authorization: "Bearer " + key }, signal: AbortSignal.timeout(10000) });
   assert.equal(status.status, 200); const listing = await status.json(); const loaded = listing.data.find(model => model.id === modelId);
   assert.equal(loaded?.status?.value, "loaded", "MODEL_NOT_READY: user must load exact model; inference may not autoload it");

@@ -16,6 +16,7 @@ export interface WorkbenchPaths {
   codeGraphInstallLock: string;
   codeGraphCurlShim: string;
   playwrightRoot: string;
+  playwrightConfig: string;
   playwrightRuntimes: string;
   playwrightNpmCache: string;
   playwrightCoordination: string;
@@ -33,7 +34,7 @@ export function resolveWorkbenchPaths(home: string = homedir()): WorkbenchPaths 
     codeGraphRoot: graph, codeGraphBin: join(graph, "bin"), codeGraphDownloads: join(graph, "downloads"),
     codeGraphProjects: join(graph, "projects"), codeGraphRuntime: join(graph, "runtime"), codeGraphIpc: join(root, "run"),
     codeGraphInstallLock: join(graph, "coordination", "install.lock"), codeGraphCurlShim: join(graph, "deny-shims", "curl"),
-    playwrightRoot: playwright, playwrightRuntimes: join(playwright, "runtimes"), playwrightNpmCache: join(playwright, "cache", "npm"),
+    playwrightRoot: playwright, playwrightConfig: join(root, "playwright.json"), playwrightRuntimes: join(playwright, "runtimes"), playwrightNpmCache: join(playwright, "cache", "npm"),
     playwrightCoordination: join(playwright, "coordination"), playwrightConsumers: join(playwright, "consumers"),
     playwrightProjects: join(playwright, "projects"), playwrightSelected: join(playwright, "selected.json"),
   };

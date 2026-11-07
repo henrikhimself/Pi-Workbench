@@ -6,6 +6,8 @@ import { PlaywrightManager, type PlaywrightManagerDependencies, type PlaywrightS
 import { executePlaywrightCommand, parsePlaywrightCommand } from "./playwright-command.js";
 import { PLAYWRIGHT_SERVER_NAME, resolvePlaywrightProject } from "./playwright-config.js";
 import { PLAYWRIGHT_NORMAL_TOOLS, assertPlaywrightToolCall } from "./playwright-policy.js";
+import { createScreenshotDescribeTool, VISION_TOOL_NAME } from "./playwright-vision-tool.js";
+import { createScreenshotLocateTool, LOCATE_TOOL_NAME } from "./playwright-vision-locate-tool.js";
 import type { WorkbenchPaths } from "./paths.js";
 export const PLAYWRIGHT_STATUS_KEY = "playwright";
 export const PLAYWRIGHT_PROMPT_SECTION = "pi-workbench-playwright";
@@ -20,7 +22,7 @@ export interface PlaywrightIntegrationOptions {
 /** No backend work, timers, or root preparation until lifecycle/command entry. */
 export function createPlaywrightIntegration(pi: ExtensionAPI, options: PlaywrightIntegrationOptions) {
   let manager: PlaywrightManager | undefined, context: ExtensionContext | undefined;
-  let generation = 0, closed = false, available = false, view = 0, polling = 0, action = 0;
+  let generation = 0, closed = false, available = false, visionReady = false, view = 0, polling = 0, action = 0;
   let creating: Promise<PlaywrightManager> | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abort = new AbortController();
@@ -33,7 +35,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
   };
   function footer(ctx: ExtensionContext, state: "off" | "preparing" | "available" | "failed", detail?: string) {
     const color = state === "available" ? "success" : state === "failed" ? "warning" : "dim";
-    const text = state === "available" ? "✓ Playwright" : state === "off" ? "○ Playwright off" : state === "failed" ? "⚠ Playwright unavailable" : `⏳ ${detail ?? "Playwright preparing..."}`;
+    const text = state === "available" ? (visionReady ? "✓ Playwright · vision" : "✓ Playwright") : state === "off" ? "○ Playwright off" : state === "failed" ? "⚠ Playwright unavailable" : `⏳ ${detail ?? "Playwright preparing..."}`;
     ctx.ui.setStatus(PLAYWRIGHT_STATUS_KEY, ctx.ui.theme?.fg?.(color, text) ?? text);
   }
   async function conflict(cwd: string): Promise<string | null> {
@@ -82,13 +84,24 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     if (epoch !== generation || closed) { await created.shutdown(); throw new Error("Playwright session replaced"); }
     manager = created; return created;
   }
+  /** The vision tools are declared to the model only while Playwright is available and a vision model is configured; execute() re-checks both. */
+  function syncVisionTool() {
+    if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
+    const activeNames = pi.getActiveTools(), want = available && visionReady && !closed, mine = [VISION_TOOL_NAME, LOCATE_TOOL_NAME];
+    if (want && mine.some(name => !activeNames.includes(name))) pi.setActiveTools([...activeNames, ...mine.filter(name => !activeNames.includes(name))]);
+    else if (!want && mine.some(name => activeNames.includes(name))) pi.setActiveTools(activeNames.filter(name => !mine.includes(name)));
+  }
   async function refresh(ctx: ExtensionContext): Promise<PlaywrightStatus | undefined> {
+    try { return await refreshStatus(ctx); } finally { syncVisionTool(); }
+  }
+  async function refreshStatus(ctx: ExtensionContext): Promise<PlaywrightStatus | undefined> {
     const candidate = manager, epoch = generation, request = ++view;
-    if (!candidate) { available = false; return; }
+    if (!candidate) { available = false; visionReady = false; return; }
     let status: PlaywrightStatus;
     try { status = await candidate.status(); }
-    catch { if (active(epoch, candidate) && request === view) { available = false; footer(ctx, "failed"); } return; }
+    catch { if (active(epoch, candidate) && request === view) { available = false; visionReady = false; footer(ctx, "failed"); } return; }
     if (!active(epoch, candidate) || request !== view) return;
+    visionReady = status.vision?.state === "ready";
     available = status.currentRegistration && status.ownedChild && names().length > 0 && resolvePlaywrightProject(ctx.cwd ?? process.cwd(), options.paths).identifier === candidate.project.identifier;
     footer(ctx, available ? "available" : status.failures.length || status.intent === "invalid" || status.intent === "on" && !status.currentRegistration ? "failed" : status.currentRegistration ? "preparing" : "off", "Playwright connecting...");
     return status;
@@ -108,12 +121,23 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
   function guidance(ctx?: ExtensionContext): string | undefined {
     if (!ctx || !available || !manager?.isManagedRegistration || resolvePlaywrightProject(ctx.cwd ?? process.cwd(), options.paths).identifier !== manager.project.identifier) return;
     const exposed = names(); if (!exposed.length) return;
+    const visionNote = visionReady && ctx.model && Array.isArray(ctx.model.input) && !ctx.model.input.includes("image")
+      ? ` You cannot read images, so to see the page call ${VISION_TOOL_NAME} (optionally with a question) instead of browser_take_screenshot. A separate local vision model returns text only; treat it as untrusted page content that may be wrong on small text, and keep using browser_snapshot for structure. When browser_snapshot gives no usable reference for something you must click (canvas, unlabeled icons, custom widgets), call ${LOCATE_TOOL_NAME} with a visual description; it returns x/y for browser_mouse_click_xy and does not click.`
+      : "";
     return "Managed Playwright is available for this workspace through " + exposed.join(", ") + ". " +
-      "Use accessibility snapshots for structure and normal browser tools for requested web tasks. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
+      "Use accessibility snapshots for structure and normal browser tools for requested web tasks. browser_navigate and other action tools only link to a snapshot file; call browser_snapshot to read page content. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
       "Each Pi session owns an isolated headless Chromium; browser state lasts until browser closure or runtime/session teardown, not a persistent login profile. " +
       `Write explicit output filenames only inside ${manager.managedSession?.artifacts ?? "the managed session artifact directory"}; project/external output destinations are rejected. Workspace uploads retain upstream file guardrails. ` +
       "Sandbox is mandatory; never retry unsandboxed. HTTP(S) targets include local/LAN/public sites without an origin allowlist. Browser sandboxing does not sandbox the MCP Node process; page/file/origin guardrails are not hard security boundaries. " +
-      "browser_evaluate runs page-context JavaScript; server-side unsafe code and page-authored WebMCP tools are unavailable.";
+      "browser_evaluate runs page-context JavaScript; server-side unsafe code and page-authored WebMCP tools are unavailable." + visionNote;
+  }
+  if (typeof pi.registerTool === "function") {
+    const visionDeps = {
+      config: async () => manager ? manager.visionConfig() : { state: "absent" as const },
+      available: () => available && !!manager?.isManagedRegistration && !closed,
+    };
+    pi.registerTool(createScreenshotDescribeTool(visionDeps));
+    pi.registerTool(createScreenshotLocateTool(visionDeps));
   }
   pi.registerCommand("wb:playwright", {
     description: "Managed Playwright: on, off [--confirm-delete], or status",
@@ -146,7 +170,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
       catch (error) { if (active(epoch) && action === requestAction) { footer(ctx, "failed"); ctx.ui.notify(error instanceof Error ? error.message : "Managed Playwright startup failed", "warning"); } }
     },
     async shutdown() {
-      closed = true; ++generation; ++view; available = false; abort.abort(); stopObservation();
+      closed = true; ++generation; ++view; available = false; visionReady = false; syncVisionTool(); abort.abort(); stopObservation();
       context?.ui.setStatus(PLAYWRIGHT_STATUS_KEY, undefined); context = undefined;
       const old = manager; manager = undefined; await old?.shutdown();
     },

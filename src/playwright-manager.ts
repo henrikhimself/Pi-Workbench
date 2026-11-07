@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
 import { acquireManagedLock, createConsumerLease, syncDirectory, type ConsumerLease } from "./managed-lifecycle.js";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
+import { createPlaywrightVisionConfigReader, ensurePlaywrightUserConfig, formatPlaywrightVisionConfig, type PlaywrightVisionConfigState } from "./playwright-vision-config.js";
 import { PLAYWRIGHT_ENGINE_VERSION, PLAYWRIGHT_SERVER_NAME, PLAYWRIGHT_VERSION, assertPlaywrightProject, inspectPlaywrightPath, playwrightChildEnvironment, playwrightOptedIn, playwrightPiEnvironment, playwrightWorkspaceLock, preparePlaywrightSession, readPlaywrightJson, resolvePlaywrightProject, resolvePlaywrightSession, setPlaywrightOptIn, type PlaywrightProject, type PlaywrightRuntimeRecord, type PlaywrightSession } from "./playwright-config.js";
 import { PlaywrightRuntime, playwrightConsumers, type PlaywrightProgress } from "./playwright-runtime.js";
 import { attestPlaywrightWitnesses, readPlaywrightOwnership, retirePlaywrightOwnership } from "./playwright-ownership.js";
@@ -32,6 +33,7 @@ export interface PlaywrightManagerDependencies {
 }
 export interface PlaywrightStatus {
   intent: "on" | "off" | "invalid";
+  vision?: PlaywrightVisionConfigState;
   registered: boolean;
   currentRegistration: boolean;
   ownedChild: boolean;
@@ -60,6 +62,7 @@ export class PlaywrightManager {
   private session?: PlaywrightSession;
   private evidence?: Evidence;
   private failure?: string;
+  private readVision?: () => Promise<PlaywrightVisionConfigState>;
   constructor(cwd: string, private deps: PlaywrightManagerDependencies) {
     this.paths = deps.paths ?? WORKBENCH_PATHS;
     this.project = resolvePlaywrightProject(cwd, this.paths);
@@ -106,6 +109,7 @@ export class PlaywrightManager {
       this.fence(epoch, signal);
       if (this.registered) { this.unregister(); await this.stopOwned(); this.fence(epoch, signal); }
       if (explicit) await setPlaywrightOptIn(this.project, true, signal);
+      if (explicit) { try { await ensurePlaywrightUserConfig(this.paths.playwrightConfig); } catch { this.progress("playwright.json template could not be created; vision bridge stays off"); } }
       if (!await playwrightOptedIn(this.project)) return;
       this.fence(epoch, signal);
       const conflict = await this.deps.conflict?.();
@@ -243,6 +247,8 @@ export class PlaywrightManager {
       } finally { await unlock(); }
     } catch (error) { this.failure = error instanceof Error ? error.message : "Playwright off incomplete"; throw error; }
   }
+  /** Passive read of the user-wide vision config; never creates or edits it. */
+  async visionConfig(): Promise<PlaywrightVisionConfigState> { this.readVision ??= createPlaywrightVisionConfigReader(this.paths.playwrightConfig); return this.readVision(); }
   async status(): Promise<PlaywrightStatus> {
     const failures: string[] = this.failure ? [this.failure] : [];
     let intent: PlaywrightStatus["intent"] = "off", selected: PlaywrightRuntimeRecord | null = null, ownedChild = false, consumers = 0;
@@ -255,7 +261,8 @@ export class PlaywrightManager {
         ownedChild = !!evidence?.roots.some(owner => owner.pid === evidence.record.child.pid && owner.start === evidence.record.child.start);
       }
     } catch { failures.push("Owned session evidence invalid or unsafe"); }
-    return { intent, registered: this.registered, currentRegistration: this.current(), ownedChild,
+    const vision = await this.visionConfig();
+    return { intent, vision, registered: this.registered, currentRegistration: this.current(), ownedChild,
       tools: this.current() ? (this.deps.tools?.() ?? []).filter(name => PLAYWRIGHT_NORMAL_TOOLS.some(tool => name === `mcp__playwright__${tool}`)) : [],
       selected, workspace: this.project.projectPath, directory: this.project.directory, session: this.session?.directory ?? null, consumers, failures };
   }
@@ -271,6 +278,7 @@ export function formatPlaywrightStatus(status: PlaywrightStatus): string {
     `Observed non-hidden tool registrations: ${status.tools.length ? status.tools.join(", ") : "none"}`,
     `Last readiness: ${status.selected ? `${status.selected.validatedAt}; Chromium ${status.selected.browserVersion}` : "none"}`,
     "Policy: headless isolated Chromium; sandbox required; vision on; WebMCP off; unsafe server code hidden; idle timeout 0; unrestricted HTTP(S)",
+    ...(status.vision ? [formatPlaywrightVisionConfig(status.vision)] : []),
     "Browser state: lazy; status does not launch a browser or prove one is open",
     `Workspace data: ${status.directory}`, `Session: ${status.session ?? "none"}`,
     "Artifacts/diagnostics retained until confirmed workspace off; no quota, TTL, or automatic artifact/runtime GC",
