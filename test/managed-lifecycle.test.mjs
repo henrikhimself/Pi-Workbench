@@ -18,8 +18,11 @@ test("managed paths reject escapes, symlink ancestry and unsafe permissions", ()
   await symlink(join(root, "private"), join(root, "link"));
   await assert.rejects(m.ensurePrivateDirectory(root, join(root, "link", "child")), /Symlink/);
   await chmod(join(root, "private"), 0o755);
-  await assert.rejects(m.ensurePrivateDirectory(root, join(root, "private")), /Unsafe/);
-  assert.equal((await lstat(join(root, "private"))).mode & 0o777, 0o755, "do not repair/adopt unsafe paths");
+  await m.ensurePrivateDirectory(root, join(root, "private"));
+  assert.equal((await lstat(join(root, "private"))).mode & 0o777, 0o700, "repair unsafe permission bits");
+  await rm(join(root, "link"), { force: true });
+  await symlink(join(root, "private"), join(root, "link"));
+  await assert.rejects(m.ensurePrivateDirectory(root, join(root, "link")), /Symlink/);
 }));
 
 test("metadata publication replaces complete JSON privately and rejects symlinks", () => fixture(async (root) => {

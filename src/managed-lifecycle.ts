@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, statfs } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, statfs } from "node:fs/promises";
 
 /** Small shared filesystem/consumer primitives, not a rollback engine. */
 export function assertWithin(root: string, target: string): void {
@@ -31,7 +31,7 @@ export async function assertNoSymlink(path: string): Promise<void> {
   }
 }
 
-/** Use a NEW private namespace; never chmod/adopt existing unsafe directories. */
+/** Use a NEW private namespace. Repair self-healing group/other permission bits; */
 export async function ensurePrivateDirectory(root: string, target = root): Promise<void> {
   assertWithin(root, target);
   await assertNoSymlink(target);
@@ -44,9 +44,13 @@ export async function ensurePrivateDirectory(root: string, target = root): Promi
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
     const info = await lstat(current);
     if (!info.isDirectory() || info.isSymbolicLink() ||
-        (process.getuid && info.uid !== process.getuid()) ||
-        (process.platform !== "win32" && (info.mode & 0o077) !== 0)) {
-      throw new Error(`Unsafe managed directory (owner, type or permissions): ${current}`);
+        (process.getuid && info.uid !== process.getuid())) {
+      throw new Error(`Unsafe managed directory (owner, or type): ${current}`);
+    }
+    // Group/other access bits are self-healing: tighten to owner-only. Also
+    // reclaims results mkdir masked by a permissive umask.
+    if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
+      await chmod(current, 0o700);
     }
   }
 }
