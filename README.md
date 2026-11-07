@@ -120,7 +120,23 @@ Playwright gives Pi access to a browser, so it can use your website or the web.
 
 Each workspace creates a managed session store that saves Playwright configuration, artifacts, diagnostics and a private HOME/cache/tmp.
 
-A model with vision capability is required if you want your agent to look at screenshots.
+### Screenshots for text-only models
+
+If your primary model cannot see images, a separate vision model can describe screenshots for it.
+
+```json
+{
+  "schemaVersion": 1,
+  "vision": {
+    "provider": "llama.cpp",
+    "model": "Qwen3-VL-4B-q4"
+  }
+}
+```
+
+Model must be selected and loaded manually before it can be used.
+
+Images over 4 MiB are refused, and a failure returns a short reason (`unavailable`, `not loaded`, `too large`, `auth`, `timeout` or `model error`) so the agent can fall back to `browser_snapshot`.
 
 ## Study Mode
 

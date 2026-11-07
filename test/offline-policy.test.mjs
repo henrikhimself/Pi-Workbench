@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 const guard = fileURLToPath(new URL("./helpers/offline-guard.mjs", import.meta.url));
 for (const [label, code, pattern] of [
   ["external fetch swallowed by fail-open", 'try { await fetch("https://example.invalid"); } catch {}', /network example.invalid:443/],
+  ["LAN router vision request swallowed by fail-open", 'try { await fetch("http://192.168.2.48:8000/v1/chat/completions", { method: "POST" }); } catch {}', /network 192.168.2.48:8000/],
   ["real default proxy access", 'try { await fetch("http://127.0.0.1:8787/health"); } catch {}', /network 127.0.0.1:8787/],
   ["pip installer", 'import { execFileSync } from "node:child_process"; try { execFileSync("python3", ["-m", "pip", "install", "fixture-package"]); } catch {}', /Python package\/service operation/],
   ["promisified installer", 'import { execFile } from "node:child_process"; import { promisify } from "node:util"; try { await promisify(execFile)("python3", ["-m", "venv", "unused"]); } catch {}', /Python package\/service operation/],
