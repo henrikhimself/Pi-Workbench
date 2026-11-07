@@ -57,15 +57,22 @@ const ended = (slice, name) => slice.filter(event => event.type === "tool_execut
 const started = (slice, name) => slice.filter(event => event.type === "tool_execution_start" && event.toolName === name);
 const textOf = result => (result?.content ?? []).filter(part => part.type === "text").map(part => part.text).join("\n");
 const lastText = async () => String((await command({ type: "get_last_assistant_text" })).data?.text);
-const DESCRIBE = "wb_screenshot_describe";
+const DESCRIBE = "wb_screenshot_describe", LOCATE = "wb_screenshot_locate", CLICK = "mcp__playwright__browser_mouse_click_xy";
+const hits = [], tiles = [["Alpha", "#c62828"], ["Beta", "#2e7d32"], ["Gamma", "#1565c0"]], wanted = tiles[randomBytes(1)[0] % 3][0];
 const page = (title, body) => `<!doctype html><title>${title}</title><body style="font-family:sans-serif;margin:30px">${body}</body>`;
 const pages = {
   "/": page("Order", `<h1 style="font-size:72px">Order reference ${token}</h1><p style="font-size:24px">Synthetic acceptance page.</p>`),
   "/buttons": page("Actions", `<h1>Choose an action</h1><div style="display:flex;gap:30px;margin-top:40px"><button style="background:#d22;color:#fff;font-size:36px;padding:30px">Delete</button><button style="background:#1a1;color:#fff;font-size:36px;padding:30px">Approve</button><button style="background:#22d;color:#fff;font-size:36px;padding:30px">Cancel</button></div>`),
+  // Low-accessibility page: tiles exist only as canvas pixels, so browser_snapshot has nothing to reference.
+  "/canvas": page("Canvas", `<h1>Pick a tile</h1><canvas id="c" width="900" height="260" style="border:1px solid #888"></canvas><script>
+    const tiles=${JSON.stringify(tiles)},c=document.getElementById("c"),g=c.getContext("2d");
+    tiles.forEach(([name,color],i)=>{g.fillStyle=color;g.fillRect(30+i*290,40,260,180);g.fillStyle="#fff";g.font="bold 44px sans-serif";g.fillText(name,60+i*290,145);});
+    c.addEventListener("click",e=>{const r=c.getBoundingClientRect(),x=e.clientX-r.left,y=e.clientY-r.top;tiles.forEach(([name],i)=>{if(x>=30+i*290&&x<=290+i*290&&y>=40&&y<=220)fetch("/hit/"+name,{method:"POST"});});});
+  </script>`),
 };
 try {
   for (const path of [home, agent, join(root, "cache"), join(root, "config"), join(root, "data"), join(root, "tmp"), workspace]) await mkdir(path, { mode: 0o700 });
-  server = createServer((request, reply) => { reply.setHeader("content-type", "text/html"); reply.end(pages[new URL(request.url, "http://x").pathname] ?? pages["/"]); });
+  server = createServer((request, reply) => { if (request.method === "POST" && request.url?.startsWith("/hit/")) { hits.push(decodeURIComponent(request.url.slice(5))); reply.end("ok"); return; } reply.setHeader("content-type", "text/html"); reply.end(pages[new URL(request.url, "http://x").pathname] ?? pages["/"]); });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); const url = `http://127.0.0.1:${server.address().port}`;
   const jiti = createJiti(import.meta.url, { fsCache: false }), { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts"), paths = resolveWorkbenchPaths(home);
   const { PlaywrightRuntime } = await jiti.import("../src/playwright-runtime.ts"), { resolvePlaywrightProject, setPlaywrightOptIn } = await jiti.import("../src/playwright-config.ts");
@@ -132,6 +139,19 @@ try {
   const direct = ended(slice, "mcp__playwright__browser_take_screenshot"); assert.ok(direct.length && direct.every(event => !event.isError));
   assert.ok(direct.flatMap(event => event.result.content).some(part => part.type === "image"), "direct screenshot behaves as before");
   report.checks.push("a direct browser_take_screenshot call is unchanged (no result rewriting)");
+
+  // 5b. Coordinate grounding on a canvas page: locate (no click) then the agent clicks with the returned point.
+  slice = await run(`Open ${url}/canvas in the browser. The page is a canvas with no accessible elements. Click the tile labelled "${wanted}", then reply done.`, "canvas locate and click", 300000);
+  const located = ended(slice, LOCATE).filter(event => !event.isError);
+  report.metrics.locate = { locateCalls: ended(slice, LOCATE).length, clickCalls: ended(slice, CLICK).length, hits: [...hits], wanted };
+  assert.ok(located.length, `agent chose ${LOCATE} from guidance on a canvas page`);
+  assert.ok((located[0].result.content ?? []).every(part => part.type === "text"), "locate result is text only");
+  assert.match(textOf(located[0].result), /Nothing was clicked/); assert.deepEqual(hits.filter(name => name !== wanted), [], "locate itself clicked nothing and no wrong tile was hit");
+  const point = /x=(\d+), y=(\d+)/.exec(textOf(located[0].result)); assert.ok(point, "locate result carries a point");
+  const clicks = started(slice, CLICK); assert.ok(clicks.length, "agent clicked through the existing click tool");
+  assert.ok(clicks.some(event => Math.abs(Number(event.args?.x) - Number(point[1])) <= 3 && Math.abs(Number(event.args?.y) - Number(point[2])) <= 3), "agent used the returned coordinates");
+  assert.deepEqual([...new Set(hits)], [wanted], `the click landed on the ${wanted} tile (hits: ${hits.join(",")})`);
+  report.checks.push(`on a canvas page with no accessible elements the text-only agent chose ${LOCATE} from guidance, received text-only coordinates, clicked through browser_mouse_click_xy, and the page recorded a hit on the requested ${wanted} tile only`);
 
   // 6. Fail-open: valid config naming a model the registry does not know.
   await setVision("Missing-Model-For-Acceptance");

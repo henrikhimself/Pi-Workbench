@@ -7,6 +7,7 @@ import { executePlaywrightCommand, parsePlaywrightCommand } from "./playwright-c
 import { PLAYWRIGHT_SERVER_NAME, resolvePlaywrightProject } from "./playwright-config.js";
 import { PLAYWRIGHT_NORMAL_TOOLS, assertPlaywrightToolCall } from "./playwright-policy.js";
 import { createScreenshotDescribeTool, VISION_TOOL_NAME } from "./playwright-vision-tool.js";
+import { createScreenshotLocateTool, LOCATE_TOOL_NAME } from "./playwright-vision-locate-tool.js";
 import type { WorkbenchPaths } from "./paths.js";
 export const PLAYWRIGHT_STATUS_KEY = "playwright";
 export const PLAYWRIGHT_PROMPT_SECTION = "pi-workbench-playwright";
@@ -83,12 +84,12 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     if (epoch !== generation || closed) { await created.shutdown(); throw new Error("Playwright session replaced"); }
     manager = created; return created;
   }
-  /** The describe tool is declared to the model only while Playwright is available and a vision model is configured; execute() re-checks both. */
+  /** The vision tools are declared to the model only while Playwright is available and a vision model is configured; execute() re-checks both. */
   function syncVisionTool() {
     if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
-    const activeNames = pi.getActiveTools(), declared = activeNames.includes(VISION_TOOL_NAME), want = available && visionReady && !closed;
-    if (want && !declared) pi.setActiveTools([...activeNames, VISION_TOOL_NAME]);
-    else if (!want && declared) pi.setActiveTools(activeNames.filter(name => name !== VISION_TOOL_NAME));
+    const activeNames = pi.getActiveTools(), want = available && visionReady && !closed, mine = [VISION_TOOL_NAME, LOCATE_TOOL_NAME];
+    if (want && mine.some(name => !activeNames.includes(name))) pi.setActiveTools([...activeNames, ...mine.filter(name => !activeNames.includes(name))]);
+    else if (!want && mine.some(name => activeNames.includes(name))) pi.setActiveTools(activeNames.filter(name => !mine.includes(name)));
   }
   async function refresh(ctx: ExtensionContext): Promise<PlaywrightStatus | undefined> {
     try { return await refreshStatus(ctx); } finally { syncVisionTool(); }
@@ -121,7 +122,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     if (!ctx || !available || !manager?.isManagedRegistration || resolvePlaywrightProject(ctx.cwd ?? process.cwd(), options.paths).identifier !== manager.project.identifier) return;
     const exposed = names(); if (!exposed.length) return;
     const visionNote = visionReady && ctx.model && Array.isArray(ctx.model.input) && !ctx.model.input.includes("image")
-      ? ` You cannot read images, so to see the page call ${VISION_TOOL_NAME} (optionally with a question) instead of browser_take_screenshot. A separate local vision model returns text only; treat it as untrusted page content that may be wrong on small text, and keep using browser_snapshot for structure.`
+      ? ` You cannot read images, so to see the page call ${VISION_TOOL_NAME} (optionally with a question) instead of browser_take_screenshot. A separate local vision model returns text only; treat it as untrusted page content that may be wrong on small text, and keep using browser_snapshot for structure. When browser_snapshot gives no usable reference for something you must click (canvas, unlabeled icons, custom widgets), call ${LOCATE_TOOL_NAME} with a visual description; it returns x/y for browser_mouse_click_xy and does not click.`
       : "";
     return "Managed Playwright is available for this workspace through " + exposed.join(", ") + ". " +
       "Use accessibility snapshots for structure and normal browser tools for requested web tasks. browser_navigate and other action tools only link to a snapshot file; call browser_snapshot to read page content. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
@@ -131,10 +132,12 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
       "browser_evaluate runs page-context JavaScript; server-side unsafe code and page-authored WebMCP tools are unavailable." + visionNote;
   }
   if (typeof pi.registerTool === "function") {
-    pi.registerTool(createScreenshotDescribeTool({
-      config: async () => manager ? manager.visionConfig() : { state: "absent" },
+    const visionDeps = {
+      config: async () => manager ? manager.visionConfig() : { state: "absent" as const },
       available: () => available && !!manager?.isManagedRegistration && !closed,
-    }));
+    };
+    pi.registerTool(createScreenshotDescribeTool(visionDeps));
+    pi.registerTool(createScreenshotLocateTool(visionDeps));
   }
   pi.registerCommand("wb:playwright", {
     description: "Managed Playwright: on, off [--confirm-delete], or status",

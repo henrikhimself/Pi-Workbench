@@ -66,8 +66,13 @@ function classify(error: string | undefined): VisionFailureReason {
   return "model error";
 }
 
-/** Fail-open core: always resolves with a reason class; never throws except to propagate the caller's abort. */
-export async function describeImage(request: DescribeRequest, deps: DescribeDependencies): Promise<DescribeResult> {
+export interface VisionTextRequest { image: VisionImage; systemPrompt: string; userText: string; maxTokens: number; signal?: AbortSignal }
+export type VisionTextResult =
+  | { ok: true; text: string; model: string; elapsedMs: number }
+  | { ok: false; reason: VisionFailureReason; message: string };
+
+/** Shared gated request: MIME/size/registry/image-input/require-loaded checks, then one bounded completion. Never throws except to propagate the caller's abort. */
+export async function requestVisionText(request: VisionTextRequest, deps: DescribeDependencies): Promise<VisionTextResult> {
   const now = deps.now ?? Date.now, started = now();
   request.signal?.throwIfAborted();
   if (!(VISION_MIME_TYPES as readonly string[]).includes(request.image.mimeType)) return fail("unavailable", "Unsupported screenshot image type.");
@@ -79,21 +84,28 @@ export async function describeImage(request: DescribeRequest, deps: DescribeDepe
   try {
     const gate = await requireLoaded(deps, model, signal);
     if (gate) return gate;
-    const question = request.question?.trim().slice(0, VISION_LIMITS.maxQuestionChars);
     const message = await deps.registry.complete(model, {
-      systemPrompt: VISION_SYSTEM_PROMPT,
-      messages: [{ role: "user", timestamp: now(), content: [{ type: "image", data: request.image.data, mimeType: request.image.mimeType }, { type: "text", text: question ? `Question: ${question}` : "Describe this screenshot." }] }],
-    }, { maxTokens: question ? VISION_LIMITS.maxTokensQuestion : VISION_LIMITS.maxTokensGeneric, temperature: VISION_LIMITS.temperature, signal });
+      systemPrompt: request.systemPrompt,
+      messages: [{ role: "user", timestamp: now(), content: [{ type: "image", data: request.image.data, mimeType: request.image.mimeType }, { type: "text", text: request.userText }] }],
+    }, { maxTokens: request.maxTokens, temperature: VISION_LIMITS.temperature, signal });
     request.signal?.throwIfAborted();
     if (timeout.aborted) return fail("timeout", "Vision model did not answer within 60 seconds.");
     if (message.stopReason === "aborted") return fail("unavailable", "Vision request was aborted.");
     if (message.stopReason === "error") return fail(classify(message.errorMessage), "Vision model request failed.");
     const text = message.content.filter(part => part.type === "text").map(part => part.text).join("").trim();
     if (!text) return fail("model error", "Vision model returned no text.");
-    return { ok: true, text: wrapVisionText(text), model: `${deps.target.provider}/${deps.target.model}`, elapsedMs: Math.max(0, now() - started) };
+    return { ok: true, text, model: `${deps.target.provider}/${deps.target.model}`, elapsedMs: Math.max(0, now() - started) };
   } catch (error) {
     request.signal?.throwIfAborted();
     if (timeout.aborted) return fail("timeout", "Vision model did not answer within 60 seconds.");
     return fail(classify(error instanceof Error ? error.message : undefined), "Vision model request failed.");
   }
+}
+
+/** Fail-open core: always resolves with a reason class; never throws except to propagate the caller's abort. */
+export async function describeImage(request: DescribeRequest, deps: DescribeDependencies): Promise<DescribeResult> {
+  const question = request.question?.trim().slice(0, VISION_LIMITS.maxQuestionChars);
+  const result = await requestVisionText({ image: request.image, signal: request.signal, systemPrompt: VISION_SYSTEM_PROMPT,
+    userText: question ? `Question: ${question}` : "Describe this screenshot.", maxTokens: question ? VISION_LIMITS.maxTokensQuestion : VISION_LIMITS.maxTokensGeneric }, deps);
+  return result.ok ? { ...result, text: wrapVisionText(result.text) } : result;
 }

@@ -91,7 +91,7 @@ const textModel = { id: "Ornith", input: ["text"] }, imageModel = { id: "Qwen3-V
 
 test("integration registers the describe tool inactive and declares it only when Playwright and vision are both ready", async t => {
   const f = await integrationFixture(t, { model: textModel });
-  assert.deepEqual(f.registered.map(def => [def.name, def.defaultActive]), [["wb_screenshot_describe", false]]);
+  assert.deepEqual(f.registered.map(def => [def.name, def.defaultActive]), [["wb_screenshot_describe", false], ["wb_screenshot_locate", false]]);
   assert.equal(f.active().includes("wb_screenshot_describe"), false);
   await f.command("on"); await f.integration.refresh(f.ctx);
   assert.equal(f.active().includes("wb_screenshot_describe"), false, "playwright up but vision unset: tool stays undeclared");
