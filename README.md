@@ -1,6 +1,6 @@
 # pi-workbench
 
-Headroom context compression, project-scoped Memory, Code Graph, and optional Study Mode for [Pi](https://pi.dev).
+Headroom context compression, project-scoped Memory, Code Graph, managed Playwright, and optional Study Mode for [Pi](https://pi.dev).
 
 ## Requirements and verified scope
 
@@ -109,6 +109,18 @@ Code Graph gives Pi structural code intelligence: symbol search, call paths, arc
 - `/wb:code-graph off` — delete this workspace's Code-Graph after confirmation.
 - `/wb:code-graph reindex` — reindexes code.
 - `/wb:code-graph status` — reports the status of the Code-Graph.
+
+## Playwright
+
+Playwright gives Pi access to a browser, so it can use your website or the web.
+
+- `/wb:playwright on` — saves this project's Playwright opt-in, then attempts managed activation.
+- `/wb:playwright off` — deletes this workspace's managed artifacts/diagnostics.
+- `/wb:playwright status` — reports the status of Playwright
+
+Each workspace creates a managed session store that saves Playwright configuration, artifacts, diagnostics and a private HOME/cache/tmp.
+
+A model with vision capability is required if you want your agent to look at screenshots.
 
 ### Study Mode
 

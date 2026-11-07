@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 const root = await mkdtemp(join(tmpdir(), "wb-offline-suite-"));
 try {
-  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(HEADROOM_|HF_|PYTHON|PIP_|PI_|XDG_|NODE_OPTIONS|WORKBENCH_RUNTIME_TESTS)/.test(key) && !/(API_KEY|TOKEN|PASSWORD|SECRET)$/.test(key)));
+  const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^(HEADROOM_|HF_|PYTHON|PIP_|PI_|XDG_|NODE_OPTIONS|NODE_PATH|PLAYWRIGHT_|NPM_CONFIG_|npm_config_|WORKBENCH_(?:(?:RUNTIME|LIVE)_TESTS|PLAYWRIGHT_))/.test(key) && !/(API_KEY|TOKEN|PASSWORD|SECRET)$/.test(key)));
   for (const dir of ["agent", "cache", "config", "data"]) await mkdir(join(root, dir), { mode: 0o700 });
   Object.assign(env, { HOME: root, USERPROFILE: root, PI_CODING_AGENT_DIR: join(root, "agent"),
     XDG_CACHE_HOME: join(root, "cache"), XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"),

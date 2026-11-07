@@ -51,6 +51,7 @@ import {
 } from "./code-graph-config.js";
 import { configureMemoryGit } from "./memory-git.js";
 import { applyMemoryGuidance, resolveMemoryGuidanceMode } from "./memory-guidance.js";
+import { createPlaywrightIntegration, PLAYWRIGHT_PROMPT_SECTION } from "./playwright-integration.js";
 import {
   STUDY_ENTRY_TYPE,
   STUDY_GUIDANCE,
@@ -70,6 +71,7 @@ export default function piWorkbenchExtension(
   let lifecycleGeneration = 0;
   let sessionClosed = false;
   let sessionAbort = new AbortController();
+  const playwright = createPlaywrightIntegration(pi, { paths, signal: () => sessionAbort.signal });
   const startupJobs = new Set<Promise<unknown>>();
   const currentGeneration = (generation: number) => !sessionClosed && generation === lifecycleGeneration;
   function background(job: Promise<unknown>, ctx: ExtensionContext, label: string, generation = lifecycleGeneration): void {
@@ -238,6 +240,7 @@ export default function piWorkbenchExtension(
     const renderer = (await import(new URL("./core/system-prompt.js", piEntry).href)) as {
       buildSystemPrompt: (options: BuildSystemPromptOptions) => string;
     };
+    await playwright.refresh(ctx);
     const options = ctx.getSystemPromptOptions();
     const sections = { ...options.sections };
     if (studyEnabled) {
@@ -249,6 +252,9 @@ export default function piWorkbenchExtension(
     const graphGuidance = activeCodeGraphGuidance();
     if (graphGuidance) sections[CODE_GRAPH_PROMPT_SECTION] = graphGuidance;
     else delete sections[CODE_GRAPH_PROMPT_SECTION];
+    const playwrightGuidance = playwright.guidance(ctx);
+    if (playwrightGuidance) sections[PLAYWRIGHT_PROMPT_SECTION] = playwrightGuidance;
+    else delete sections[PLAYWRIGHT_PROMPT_SECTION];
     return renderer.buildSystemPrompt({ ...options, sections });
   }
 
@@ -440,7 +446,7 @@ export default function piWorkbenchExtension(
   /** Only opted-in features create configuration or prepare managed storage. */
   async function ensureConfiguration(ctx: ExtensionContext): Promise<void> {
     await assertNoSymlink(headroomConfigPath);
-    if (await ensureHeadroomConfigFile(headroomConfigPath)) ctx.ui.notify("Created fresh managed Headroom configuration.", "info");
+    if (await ensureHeadroomConfigFile(headroomConfigPath)) ctx.ui.notify("Created managed Headroom configuration.", "info");
   }
 
   const compressionCurrent = (generation: number, epoch: number) =>
@@ -508,6 +514,7 @@ export default function piWorkbenchExtension(
     background(proxyJob(), ctx, "Managed proxy startup", generation);
     background(startMemory(ctx, false), ctx, "Memory startup", generation);
     background(restoreCodeGraph(ctx), ctx, "Code Graph startup", generation);
+    background(playwright.start(ctx), ctx, "Playwright startup", generation);
   });
 
   pi.on("session_tree", (_event, ctx) => {
@@ -522,12 +529,12 @@ export default function piWorkbenchExtension(
     }
     memoryRegistered = false; memoryRegistrationDirectory = null;
     const graph = codeGraphManager; codeGraphManager = null;
-    await Promise.allSettled([graph?.shutdown(), proxyManager?.stop()]);
+    await Promise.allSettled([graph?.shutdown(), proxyManager?.stop(), playwright.shutdown()]);
   });
 
   // ─── Prompt guidance before every agent run ────────────────────────
 
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (studyEnabled) {
       event.systemPromptOptions.sections[STUDY_PROMPT_SECTION] = STUDY_GUIDANCE;
     } else {
@@ -537,7 +544,11 @@ export default function piWorkbenchExtension(
     const graphGuidance = activeCodeGraphGuidance();
     if (graphGuidance) event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION] = graphGuidance;
     else delete event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION];
+    await playwright.beforeAgent(event.systemPromptOptions, ctx);
   });
+
+  pi.on("tool_call", (event, ctx) => playwright.toolCall(event, ctx));
+  pi.on("tool_result", (event, ctx) => playwright.toolResult(event, ctx));
 
   // ─── Core: compress context before every LLM call ───────────────────
 

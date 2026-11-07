@@ -401,6 +401,7 @@ test("commands: registers only current Workbench commands", async () => {
     "wb:headroom-health",
     "wb:headroom-memory",
     "wb:headroom-proxy",
+    "wb:playwright",
     "wb:show-system-prompt",
     "wb:study-mode",
   ]);

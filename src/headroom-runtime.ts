@@ -211,7 +211,7 @@ export class ManagedHeadroomRuntime {
         await requireDiskSpace(this.root, 2 * 1024 * 1024 * 1024);
         const python = join(slot, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
         const cli = join(slot, process.platform === "win32" ? "Scripts/headroom.exe" : "bin/headroom");
-        onStatus(`Preparing fresh Headroom ${version} runtime...`);
+        onStatus(`Preparing Headroom ${version} runtime...`);
         await this.execute(system, ["-m", "venv", "--copies", slot], { env: this.environment(), timeoutMs: 60_000 });
         const report = join(slot, "resolved.json");
         await this.execute(python, ["-m", "pip", "--isolated", "install", "--dry-run", "--report", report, `headroom-ai[proxy]==${version}`, `cryptography==${MANAGED_CRYPTOGRAPHY_VERSION}`, "--disable-pip-version-check"], { env: this.environment(), timeoutMs: 240_000 });
