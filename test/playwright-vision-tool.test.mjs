@@ -5,7 +5,6 @@ import { createJiti } from "jiti";
 import { playwrightFixture } from "./helpers/playwright-fixture.mjs";
 const jiti = createJiti(import.meta.url);
 const tool = await jiti.import("../src/playwright-vision-tool.ts");
-const v = await jiti.import("../src/playwright-vision.ts");
 const { createPlaywrightIntegration, PLAYWRIGHT_PROMPT_SECTION } = await jiti.import("../src/playwright-integration.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 const config = await jiti.import("../src/playwright-config.ts");
@@ -13,7 +12,6 @@ const { Value } = await import("typebox/value");
 const READY = { state: "ready", target: { provider: "llama.cpp", model: "Qwen3-VL-4B-q4" } };
 const png = Buffer.from("synthetic-png").toString("base64");
 const shot = { toolCall: {}, isError: false, result: { content: [{ type: "text", text: "### Result\n- [Screenshot of viewport](/managed/artifacts/page-1.png)" }, { type: "image", data: png, mimeType: "image/png" }], details: {} } };
-const decl = state => ({ config: async () => state, available: () => true });
 
 function toolFixture({ outcome = shot, registry, state = READY, available = true } = {}) {
   const calls = [], completions = [];
@@ -67,9 +65,9 @@ test("caller abort is passed to the nested screenshot", async () => {
 
 async function integrationFixture(t, { model } = {}) {
   const f = await playwrightFixture(t), paths = resolveWorkbenchPaths(f.home), commands = new Map(), registry = new Map(), statuses = [], registered = [];
-  let vision = { state: "absent" }, tools = [], active = [];
+  let vision = { state: "absent" }, tools = [], active = []; const setCalls = [];
   const pi = { registerCommand: (name, value) => commands.set(name, value), registerTool: def => registered.push(def), registerMcpServer: (name, value) => registry.set(name, value), unregisterMcpServer: name => registry.delete(name),
-    getMcpServers: () => [...registry].map(([name, value]) => ({ name, config: value })), getAllTools: () => tools.map(name => ({ name })), getActiveTools: () => active, setActiveTools: names => { active = [...names]; } };
+    getMcpServers: () => [...registry].map(([name, value]) => ({ name, config: value })), getAllTools: () => tools.map(name => ({ name })), getActiveTools: () => active, setActiveTools: names => { setCalls.push([...names]); active = [...names]; } };
   const ctx = { cwd: f.workspace, hasUI: false, mode: "print", model, ui: { theme: { fg: (_color, text) => text }, setStatus: (key, text) => statuses.push({ key, text }), notify() {}, confirm: async () => false } };
   const integration = createPlaywrightIntegration(pi, { paths, agentDir: () => join(f.root, "agent"), observationMs: 200,
     manager: (cwd, deps) => {
@@ -84,7 +82,7 @@ async function integrationFixture(t, { model } = {}) {
         async status() { return { intent: "on", vision, registered: registeredServer, currentRegistration: this.isManagedRegistration, ownedChild: child, tools, selected: null, workspace: cwd, directory: project.directory, session: this.managedSession.directory, consumers: 1, failures: [] }; } };
     } });
   t.after(() => integration.shutdown());
-  return { ...f, integration, ctx, statuses, registered, active: () => active, setVision: value => { vision = value; }, command: raw => commands.get("wb:playwright").handler(raw, ctx),
+  return { ...f, integration, ctx, statuses, registered, setCalls, active: () => active, setActive: names => { active = [...names]; }, setVision: value => { vision = value; }, command: raw => commands.get("wb:playwright").handler(raw, ctx),
     guidance: async () => { const options = { sections: {} }; await integration.beforeAgent(options, ctx); return options.sections[PLAYWRIGHT_PROMPT_SECTION]; } };
 }
 const textModel = { id: "Ornith", input: ["text"] }, imageModel = { id: "Qwen3-VL-4B-q4", input: ["text", "image"] };
@@ -103,7 +101,32 @@ test("integration registers the describe tool inactive and declares it only when
   f.setVision({ state: "invalid", reason: "playwright.json is not valid JSON." }); await f.integration.refresh(f.ctx);
   assert.equal(f.active().includes("wb_screenshot_describe"), false); assert.doesNotMatch(f.statuses.at(-1).text, /vision/);
   f.setVision(READY); await f.integration.refresh(f.ctx); assert.equal(f.active().includes("wb_screenshot_describe"), true);
-  await f.integration.shutdown(); assert.equal(f.active().includes("wb_screenshot_describe"), false);
+  // L2: shutdown never touches the active set (Pi rebuilds it for the replacement session).
+  const before = f.setCalls.length; await f.integration.shutdown(); assert.equal(f.setCalls.length, before, "session_shutdown makes no setActiveTools call");
+});
+test("L2: tools are added only on the unavailable-to-available edge and only for a model that cannot read images", async t => {
+  const image = await integrationFixture(t, { model: imageModel });
+  await image.command("on"); image.setVision(READY); await image.integration.refresh(image.ctx);
+  assert.equal(image.active().includes("wb_screenshot_describe"), false, "an image-capable model reads screenshots itself");
+  assert.equal(image.setCalls.length, 0);
+  const text = await integrationFixture(t, { model: textModel });
+  await text.command("on"); text.setVision(READY); await text.integration.refresh(text.ctx);
+  assert.equal(text.active().includes("wb_screenshot_describe") && text.active().includes("wb_screenshot_locate"), true);
+  const calls = text.setCalls.length;
+  await text.integration.refresh(text.ctx); await text.integration.refresh(text.ctx);
+  assert.equal(text.setCalls.length, calls, "no change between edges");
+});
+test("L2: a tool the user deactivated stays off while available, and a tool the user activated is never removed", async t => {
+  const f = await integrationFixture(t, { model: textModel });
+  f.setActive(["wb_screenshot_locate"]);                                  // the user already had locate on
+  await f.command("on"); f.setVision(READY); await f.integration.refresh(f.ctx);
+  assert.deepEqual(f.active().filter(n => n.startsWith("wb_")).sort(), ["wb_screenshot_describe", "wb_screenshot_locate"], "only the missing one is added");
+  f.setActive(f.active().filter(n => n !== "wb_screenshot_describe"));       // the user turns describe off again
+  await f.integration.refresh(f.ctx);
+  assert.equal(f.active().includes("wb_screenshot_describe"), false, "not re-activated by a later refresh");
+  f.setVision({ state: "unset" }); await f.integration.refresh(f.ctx);
+  assert.equal(f.active().includes("wb_screenshot_locate"), true, "the user's own activation survives; Workbench removes only what it added");
+  assert.equal(f.active().includes("wb_screenshot_describe"), false);
 });
 test("guidance recommends the tool only to a model without image input and follows model switches", async t => {
   const f = await integrationFixture(t, { model: textModel });
@@ -121,4 +144,15 @@ test("the registered tool refuses before any screenshot when Playwright is not a
   await assert.rejects(def.execute("id", {}, undefined, undefined, ctx), /not available/); assert.equal(calls.length, 0);
   await f.command("on"); f.setVision({ state: "unset" });
   await assert.rejects(def.execute("id", {}, undefined, undefined, ctx), /No screenshot was taken/); assert.equal(calls.length, 0);
+});
+
+test("L3: the nested vision usage is returned on the describe tool result, and absent when the model reports none", async () => {
+  const model = { id: "Qwen3-VL-4B-q4", provider: "llama.cpp", input: ["text", "image"], baseUrl: "http://router.invalid/v1" };
+  const usage = { input: 900, output: 30, cacheRead: 0, cacheWrite: 0, totalTokens: 930, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  const make = withUsage => ({ find: () => model, getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", baseUrl: model.baseUrl }), complete: async () => ({ stopReason: "stop", ...(withUsage ? { usage } : {}), content: [{ type: "text", text: "A page." }] }) });
+  const original = globalThis.fetch; globalThis.fetch = async () => new Response(JSON.stringify({ data: [{ id: model.id, status: { value: "loaded" } }] }));
+  try {
+    assert.deepEqual((await run(toolFixture({ registry: make(true) }))).usage, usage);
+    assert.equal("usage" in await run(toolFixture({ registry: make(false) })), false);
+  } finally { globalThis.fetch = original; }
 });

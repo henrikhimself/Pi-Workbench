@@ -64,19 +64,6 @@ export function parseAssetVersion(version: string): ParsedAssetVersion | null {
   return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
 }
 
-/** Numeric semantic comparison. Both arguments must parse; returns -1/0/1. */
-export function compareAssetVersions(left: string, right: string): number {
-  const a = parseAssetVersion(left);
-  const b = parseAssetVersion(right);
-  if (!a || !b) {
-    throw new Error(`Unparseable asset version(s): ${JSON.stringify(left)} vs ${JSON.stringify(right)}`);
-  }
-  for (const field of ["major", "minor", "patch"] as const) {
-    if (a[field] !== b[field]) return a[field] < b[field] ? -1 : 1;
-  }
-  return 0;
-}
-
 /**
  * Validate one packaged asset entry. Returns a list of human-readable
  * problems; an empty list means the asset is acceptable.

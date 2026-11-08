@@ -28,7 +28,7 @@ export async function playwrightFixture(t) {
 export async function syntheticPlaywrightOwnership(directory, resource, overrides = {}) {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const token = randomUUID();
-  const record = { schema: 1, token, resource, pid: process.pid, start: "synthetic-not-live", host: "fixture-only", ...overrides };
+  const record = { schemaVersion: 1, token, resource, pid: process.pid, start: "synthetic-not-live", host: "fixture-only", ...overrides };
   const path = join(directory, `${token}.json`);
   await writeFile(path, JSON.stringify(record), { flag: "wx", mode: 0o600 });
   return { path, record };

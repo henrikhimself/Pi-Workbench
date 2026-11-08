@@ -1,7 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, rename as fsRename, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -9,17 +8,15 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const config = await jiti.import("../src/code-graph-config.ts");
 const { resolveMemoryStore } = await jiti.import("../src/memory-config.ts");
+const { otherVersionMessage } = await jiti.import("../src/store-identity.ts");
 const {
-  CODE_GRAPH_STATE_SCHEMA,
   assertWithinRoot,
   canonicalWorkspacePath,
-  createCodeGraphState,
+  codeGraphIdentity,
   formatCodeGraphStatus,
   isWithinPath,
-  parseCodeGraphState,
   resolveCodeGraphProject,
   validateCodeGraphState,
-  writeCodeGraphStateAtomic,
 } = config;
 
 async function makeTemp(name) {
@@ -53,7 +50,6 @@ test("workspace identity: stable, canonical, and collision-safe", async () => {
     assert.equal(viaSymlink.projectPath, a.projectPath);
     assert.notEqual(b.identifier, a.identifier, "same basename in another tree must not collide");
     assert.match(a.identifier, /^acme-api-[0-9a-f]{16}$/);
-    assert.equal(a.statePath, join(a.directory, "state.json"));
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -101,18 +97,25 @@ test("path containment helpers reject escapes", () => {
   assert.throws(() => assertWithinRoot(join(root, "..", "evil"), root), /outside managed root/);
 });
 
-function validState(project, overrides = {}) {
-  return {
-    schema: CODE_GRAPH_STATE_SCHEMA,
-    workspacePath: project.projectPath,
-    identifier: project.identifier,
-    version: "v0.8.1",
-    resolvedUrl: "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
-    sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
-    createdAt: "2026-01-01T00:00:00.000Z",
-    updatedAt: "2026-01-02T00:00:00.000Z",
-    ...overrides,
-  };
+const ASSET = {
+  version: "v0.8.1",
+  resolvedUrl: "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
+  sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
+};
+function validOptIn(project, overrides = {}) {
+  return { schemaVersion: 1, enabled: true, projectPath: project.projectPath, identifier: project.identifier, ...overrides };
+}
+function validIdentity(overrides = {}) {
+  return { ...codeGraphIdentity(ASSET), ...overrides };
+}
+async function writeJson(path, value) { await writeFile(path, typeof value === "string" ? value : JSON.stringify(value), { mode: 0o600 }); }
+/** A project directory in the state `on` leaves behind: both files, `_config.db` and one index. */
+async function seedEnabled(project) {
+  await mkdir(project.directory, { recursive: true });
+  await writeFile(join(project.directory, "_config.db"), "x");
+  await writeFile(join(project.directory, "some-project.db"), "index-bytes");
+  await writeJson(project.identityPath, validIdentity());
+  await writeJson(project.optInPath, validOptIn(project));
 }
 
 async function seedProject(temp, name) {
@@ -123,11 +126,24 @@ async function seedProject(temp, name) {
   return { temp, paths, project, projectDir };
 }
 
+test("project files: opt-in.json and workbench-identity.json inside the project directory; no state.json", async () => {
+  const temp = await makeTemp("pi-cgm-files-");
+  try {
+    const { project } = await seedProject(temp, "workspace");
+    assert.equal(project.optInPath, join(project.directory, "opt-in.json"));
+    assert.equal(project.identityPath, join(project.directory, "workbench-identity.json"));
+    assert.equal("statePath" in project, false);
+    assert.deepEqual(validIdentity(), { schemaVersion: 1, layout: 1, kind: "code-graph", codeGraphVersion: "v0.8.1", resolvedUrl: ASSET.resolvedUrl, sha256: ASSET.sha256 });
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
 test("state validation: absent directory is plain off", async () => {
   const temp = await makeTemp("pi-cgm-off-");
   try {
     const { project } = await seedProject(temp, "workspace");
-    const result = validateCodeGraphState(project);
+    const result = await validateCodeGraphState(project);
     assert.equal(result.ok, false);
     assert.equal(result.problem, "missing");
   } finally {
@@ -135,54 +151,92 @@ test("state validation: absent directory is plain off", async () => {
   }
 });
 
-test("state validation: full valid state is enabled", async () => {
+test("state validation: both files, _config.db and an index make a workspace enabled", async () => {
   const temp = await makeTemp("pi-cgm-valid-");
   try {
     const { project } = await seedProject(temp, "workspace");
-    await mkdir(project.directory, { recursive: true });
-    await writeFile(join(project.directory, "_config.db"), Buffer.from([0x53, 0x51, 0x4c]));
-    await writeFile(join(project.directory, "some-project.db"), "index-bytes");
-    await writeFile(project.statePath, JSON.stringify(validState(project)));
-
-    const result = validateCodeGraphState(project);
+    await seedEnabled(project);
+    const result = await validateCodeGraphState(project);
     assert.equal(result.ok, true);
-    assert.equal(result.state.identifier, project.identifier);
+    assert.deepEqual(result.identity, validIdentity());
     assert.deepEqual(result.indexDbs, ["some-project.db"]);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
 });
 
-test("state validation: corrupt and mismatched states stay off with reasons", async () => {
+test("state validation: one failing case per problem code", async () => {
   const temp = await makeTemp("pi-cgm-corrupt-");
   try {
     const { project } = await seedProject(temp, "workspace");
-    await mkdir(project.directory, { recursive: true });
-    await writeFile(join(project.directory, "_config.db"), "x");
-    await writeFile(join(project.directory, "idx.db"), "x");
-
-    const cases = [
-      ["not valid json {", "malformed_json"],
-      [JSON.stringify(validState(project, { schema: 99 })), "unknown_schema"],
-      [JSON.stringify(validState(project, { workspacePath: "/other" })), "wrong_workspace"],
-      [JSON.stringify(validState(project, { identifier: "other-abc" })), "wrong_identifier"],
-      [JSON.stringify(validState(project, { version: "0.8.1" })), "invalid_asset_identity"],
-      [JSON.stringify(validState(project, { sha256: "zz" })), "invalid_asset_identity"],
-      [JSON.stringify(validState(project, { createdAt: "yesterday" })), "invalid_timestamps"],
+    await seedEnabled(project);
+    const optIns = [
+      ["not valid json {", "read_error", /Cannot read project opt-in/],
+      [validOptIn(project, { schemaVersion: 2 }), "read_error", /schemaVersion must be 1/],
+      [validOptIn(project, { enabled: false }), "read_error", /Incompatible project opt-in/],
+      [validOptIn(project, { extra: true }), "read_error", /Incompatible project opt-in/],
+      [validOptIn(project, { projectPath: "/other" }), "wrong_workspace", /belongs to \/other/],
+      [validOptIn(project, { identifier: "other-abc" }), "wrong_identifier", /other-abc/],
     ];
-    for (const [raw, problem] of cases) {
-      await writeFile(project.statePath, raw);
-      const result = validateCodeGraphState(project);
-      assert.equal(result.ok, false, raw);
-      assert.equal(result.problem, problem, raw);
+    for (const [value, problem, detail] of optIns) {
+      await writeJson(project.optInPath, value);
+      const result = await validateCodeGraphState(project);
+      assert.equal(result.ok, false, JSON.stringify(value));
+      assert.equal(result.problem, problem, JSON.stringify(value));
+      assert.match(result.detail, detail);
     }
-
-    await writeFile(project.statePath, JSON.stringify(validState(project)));
+    await writeJson(project.optInPath, validOptIn(project));
+    const identities = [
+      [validIdentity({ schemaVersion: 2 }), "read_error", /schemaVersion must be 1/],
+      [validIdentity({ kind: "memory" }), "read_error", /not a Code Graph identity/],
+      [validIdentity({ layout: 2 }), "read_error", /not a Code Graph identity/],
+      [{ ...validIdentity(), createdAt: "2026-01-01T00:00:00.000Z" }, "read_error", /not a Code Graph identity/],
+      [validIdentity({ codeGraphVersion: "0.8.1" }), "invalid_asset_identity", /vMAJOR/],
+      [validIdentity({ sha256: "zz" }), "invalid_asset_identity", /SHA-256/],
+      [validIdentity({ resolvedUrl: "http://x" }), "invalid_asset_identity", /SHA-256/],
+    ];
+    for (const [value, problem, detail] of identities) {
+      await writeJson(project.identityPath, value);
+      const result = await validateCodeGraphState(project);
+      assert.equal(result.problem, problem, JSON.stringify(value));
+      assert.match(result.detail, detail);
+    }
+    await rm(project.identityPath);
+    assert.equal((await validateCodeGraphState(project)).problem, "missing_identity");
+    await writeJson(project.identityPath, validIdentity());
     await rm(join(project.directory, "_config.db"));
-    assert.equal(validateCodeGraphState(project).problem, "missing_config_db");
+    assert.equal((await validateCodeGraphState(project)).problem, "missing_config_db");
     await writeFile(join(project.directory, "_config.db"), "x");
-    await rm(join(project.directory, "idx.db"));
-    assert.equal(validateCodeGraphState(project).problem, "missing_index_db");
+    await rm(join(project.directory, "some-project.db"));
+    assert.equal((await validateCodeGraphState(project)).problem, "missing_index_db");
+    await rm(project.optInPath);
+    assert.equal((await validateCodeGraphState(project)).problem, "missing");
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("state validation: an unsafe opt-in file is refused, not read", async () => {
+  const temp = await makeTemp("pi-cgm-unsafe-");
+  try {
+    const { project } = await seedProject(temp, "workspace");
+    await seedEnabled(project);
+    await chmod(project.optInPath, 0o644);
+    const result = await validateCodeGraphState(project);
+    assert.equal(result.problem, "read_error");
+    assert.match(result.detail, /Unsafe project opt-in file/);
+  } finally {
+    await rm(temp, { recursive: true, force: true });
+  }
+});
+
+test("state validation: a directory holding only a leftover state.json is off, not enabled", async () => {
+  const temp = await makeTemp("pi-cgm-leftover-");
+  try {
+    const { project } = await seedProject(temp, "workspace");
+    await mkdir(project.directory, { recursive: true });
+    await writeJson(join(project.directory, "state.json"), { schema: 1 });
+    assert.equal((await validateCodeGraphState(project)).problem, "missing");
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -197,67 +251,9 @@ test("state validation: a stray file instead of the project directory is not_a_d
     // projects/<id> path exists as a regular file, not a directory
     await mkdir(join(temp, "codebase-memory-mcp", "projects"), { recursive: true });
     await writeFile(project.directory, "nope");
-    const result = validateCodeGraphState(project);
+    const result = await validateCodeGraphState(project);
     assert.equal(result.ok, false);
     assert.equal(result.problem, "not_a_directory");
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test("state write: staged temp file is renamed into state.json and fsynced", async () => {
-  const temp = await makeTemp("pi-cgm-atomic-");
-  try {
-    const { project } = await seedProject(temp, "workspace");
-    await mkdir(project.directory, { recursive: true });
-    const state = createCodeGraphState(project, {
-      version: "v0.8.1",
-      resolvedUrl: "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-linux-arm64.tar.gz",
-      sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
-    }, () => new Date("2026-02-03T04:05:06.000Z"));
-
-    const writes = [];
-    await writeCodeGraphStateAtomic(project, state, {
-      rename: async (from, to) => {
-        writes.push({ from, to });
-        await fsRename(from, to);
-      },
-    });
-
-    assert.equal(writes.length, 1);
-    assert.equal(writes[0].to, project.statePath);
-    assert.ok(writes[0].from.startsWith(project.statePath + "."), "temp file must live beside state.json");
-    assert.equal(existsSync(writes[0].from), false, "temp file must be renamed away");
-    const parsed = parseCodeGraphState(await readFile(project.statePath));
-    assert.deepEqual(parsed, state);
-    const listing = await readdir(project.directory);
-    assert.equal(listing.filter((name) => name.includes(".tmp")).length, 0);
-  } finally {
-    await rm(temp, { recursive: true, force: true });
-  }
-});
-
-test("state write: rename failure cleans up the temp file and leaves no marker", async () => {
-  const temp = await makeTemp("pi-cgm-atomicfail-");
-  try {
-    const { project } = await seedProject(temp, "workspace");
-    await mkdir(project.directory, { recursive: true });
-    const state = createCodeGraphState(project, {
-      version: "v0.8.1",
-      resolvedUrl: "https://example.invalid/x",
-      sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
-    });
-    await assert.rejects(
-      writeCodeGraphStateAtomic(project, state, {
-        rename: async () => {
-          throw new Error("disk full");
-        },
-      }),
-      /disk full/,
-    );
-    assert.equal(existsSync(project.statePath), false);
-    const listing = await readdir(project.directory);
-    assert.equal(listing.length, 0);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }
@@ -271,7 +267,7 @@ test("status formatting covers every state kind without leaking internals", () =
     platform: "linux-arm64",
     manifestVersion: "v0.8.1",
   };
-  const kinds = ["off", "enabled", "corrupt", "unsupported_platform", "binary_missing", "binary_incompatible", "index_missing", "mcp_failed", "deletion_failed"];
+  const kinds = ["off", "enabled", "corrupt", "binary_missing", "mcp_failed", "upgrade_pending", "locked"];
   for (const kind of kinds) {
     const lines = formatCodeGraphStatus({ ...base, kind });
     assert.ok(lines[0].includes("Code Graph"));
@@ -288,4 +284,25 @@ test("status formatting covers every state kind without leaking internals", () =
   assert.ok(enabled.join("\n").includes("Git watcher enabled"));
   const nonGit = formatCodeGraphStatus({ ...base, kind: "off", watcher: "disabled_non_git" });
   assert.ok(nonGit.join("\n").includes("disabled (non-Git workspace)"));
+});
+
+test("status uses the shared layout, and a refused identity shows the shared refusal reason", () => {
+  const base = {
+    workspacePath: "/work/acme",
+    identifier: "acme-0123456789abcdef",
+    projectDirectory: tmpdir(),
+    platform: "linux-arm64",
+    manifestVersion: "v0.8.1",
+  };
+  const on = formatCodeGraphStatus({ ...base, kind: "enabled", installedVersion: "v0.8.1", mcpRegistered: true }).join("\n");
+  assert.match(on, /^Code Graph\n {2}State: {4}on\n {2}Project: {2}\/work\/acme {2}\(acme-0123456789abcdef\)\n {2}Data: {5}/);
+  assert.match(on, /Version: {2}v0\.8\.1 \(expected v0\.8\.1\)/);
+  assert.match(on, /Link: {5}registered/);
+  assert.doesNotMatch(on, /Problem:/);
+  const refused = formatCodeGraphStatus({ ...base, kind: "upgrade_pending", recovery: otherVersionMessage("Code Graph") }).join("\n");
+  assert.match(refused, /State: {4}refused \(data written by another version\)/);
+  assert.ok(refused.includes(`Problem:  ${otherVersionMessage("Code Graph")}`));
+  const gone = formatCodeGraphStatus({ ...base, projectDirectory: join(tmpdir(), "no-such-code-graph-dir"), kind: "off" }).join("\n");
+  assert.match(gone, /Data: {5}none/);
+  assert.match(gone, /Version: {2}not installed/);
 });

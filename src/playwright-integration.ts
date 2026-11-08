@@ -1,7 +1,8 @@
-import { getAgentDir, type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isDeepStrictEqual } from "node:util";
+import { offMessage } from "./command-messages.js";
+import { TOOL_NAMES } from "./tool-names.js";
+import { detectMcpConflict } from "./mcp-conflict.js";
 import { PlaywrightManager, type PlaywrightManagerDependencies, type PlaywrightStatus } from "./playwright-manager.js";
 import { executePlaywrightCommand, parsePlaywrightCommand } from "./playwright-command.js";
 import { PLAYWRIGHT_SERVER_NAME, resolvePlaywrightProject } from "./playwright-config.js";
@@ -38,19 +39,12 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     const text = state === "available" ? (visionReady ? "✓ Playwright · vision" : "✓ Playwright") : state === "off" ? "○ Playwright off" : state === "failed" ? "⚠ Playwright unavailable" : `⏳ ${detail ?? "Playwright preparing..."}`;
     ctx.ui.setStatus(PLAYWRIGHT_STATUS_KEY, ctx.ui.theme?.fg?.(color, text) ?? text);
   }
-  async function conflict(cwd: string): Promise<string | null> {
-    if (typeof pi.registerMcpServer !== "function" || typeof pi.unregisterMcpServer !== "function" || typeof pi.getMcpServers !== "function" || typeof pi.getAllTools !== "function" || typeof pi.getActiveTools !== "function") return "required public Pi MCP APIs unavailable";
-    const existing = pi.getMcpServers().find(server => server.name === PLAYWRIGHT_SERVER_NAME);
-    if (existing && !manager?.isManagedRegistration) return "same-name extension MCP registration";
-    for (const path of [join((options.agentDir ?? getAgentDir)(), "mcp.json"), join(cwd, ".pi", "mcp.json")]) {
-      let raw: string;
-      try { raw = await readFile(path, "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; return "MCP configuration cannot be inspected safely"; }
-      let config: any;
-      try { config = JSON.parse(raw); } catch { return "MCP configuration is invalid; conflict cannot be ruled out"; }
-      if (!config || typeof config !== "object" || Array.isArray(config) || config.mcpServers !== undefined && (!config.mcpServers || typeof config.mcpServers !== "object" || Array.isArray(config.mcpServers))) return "MCP configuration shape is invalid";
-      if (config?.mcpServers && Object.hasOwn(config.mcpServers, PLAYWRIGHT_SERVER_NAME)) return `same-name MCP declaration in ${path}`;
-    }
-    return null;
+  function conflict(cwd: string): Promise<string | null> {
+    return detectMcpConflict(pi, {
+      serverName: PLAYWRIGHT_SERVER_NAME, cwd, agentDir: options.agentDir, requireApis: true,
+      ownRegistration: manager?.isManagedRegistration,
+      projectTrusted: () => typeof context?.isProjectTrusted === "function" ? context.isProjectTrusted() : true,
+    });
   }
   async function managerFor(ctx: ExtensionContext): Promise<PlaywrightManager> {
     while (creating) await creating.catch(() => {});
@@ -76,7 +70,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
         if (!active(epoch, created)) return;
         ++view;
         if (/failed|unavailable|incomplete|uncertain/i.test(message)) footer(context ?? ctx, "failed");
-        else if (message.startsWith("Playwright off;")) footer(context ?? ctx, "off");
+        else if (message === offMessage(TOOL_NAMES.playwright, "deleted")) footer(context ?? ctx, "off");
         else footer(context ?? ctx, "preparing", message);
       },
     };
@@ -84,15 +78,32 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
     if (epoch !== generation || closed) { await created.shutdown(); throw new Error("Playwright session replaced"); }
     manager = created; return created;
   }
-  /** The vision tools are declared to the model only while Playwright is available and a vision model is configured; execute() re-checks both. */
-  function syncVisionTool() {
+  /** The vision tools are declared to the model only while Playwright is available and a vision model is configured; execute() re-checks both.
+   * Workbench changes the active tool set only on the edge: when the tools become available it adds them (unless the current model can read
+   * images itself), and when they stop being available it removes only the ones it added. Between edges the user's own choice stands, and
+   * `session_shutdown` never touches the set (Pi rebuilds it for the replacement session). */
+  const activatedVisionTools = new Set<string>();
+  let visionDeclared = false;
+  function syncVisionTool(ctx?: ExtensionContext) {
     if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
-    const activeNames = pi.getActiveTools(), want = available && visionReady && !closed, mine = [VISION_TOOL_NAME, LOCATE_TOOL_NAME];
-    if (want && mine.some(name => !activeNames.includes(name))) pi.setActiveTools([...activeNames, ...mine.filter(name => !activeNames.includes(name))]);
-    else if (!want && mine.some(name => activeNames.includes(name))) pi.setActiveTools(activeNames.filter(name => !mine.includes(name)));
+    const want = available && visionReady && !closed;
+    if (want === visionDeclared) return;
+    visionDeclared = want;
+    const activeNames = pi.getActiveTools();
+    if (want) {
+      if (Array.isArray(ctx?.model?.input) && ctx.model.input.includes("image")) return;
+      const added = [VISION_TOOL_NAME, LOCATE_TOOL_NAME].filter(name => !activeNames.includes(name));
+      if (!added.length) return;
+      for (const name of added) activatedVisionTools.add(name);
+      pi.setActiveTools([...activeNames, ...added]);
+    } else {
+      const removable = [...activatedVisionTools].filter(name => activeNames.includes(name));
+      activatedVisionTools.clear();
+      if (removable.length) pi.setActiveTools(activeNames.filter(name => !removable.includes(name)));
+    }
   }
   async function refresh(ctx: ExtensionContext): Promise<PlaywrightStatus | undefined> {
-    try { return await refreshStatus(ctx); } finally { syncVisionTool(); }
+    try { return await refreshStatus(ctx); } finally { syncVisionTool(ctx); }
   }
   async function refreshStatus(ctx: ExtensionContext): Promise<PlaywrightStatus | undefined> {
     const candidate = manager, epoch = generation, request = ++view;
@@ -170,7 +181,7 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
       catch (error) { if (active(epoch) && action === requestAction) { footer(ctx, "failed"); ctx.ui.notify(error instanceof Error ? error.message : "Managed Playwright startup failed", "warning"); } }
     },
     async shutdown() {
-      closed = true; ++generation; ++view; available = false; visionReady = false; syncVisionTool(); abort.abort(); stopObservation();
+      closed = true; ++generation; ++view; available = false; visionReady = false; visionDeclared = false; activatedVisionTools.clear(); abort.abort(); stopObservation();
       context?.ui.setStatus(PLAYWRIGHT_STATUS_KEY, undefined); context = undefined;
       const old = manager; manager = undefined; await old?.shutdown();
     },

@@ -22,10 +22,8 @@ const {
   CODE_GRAPH_ASSETS,
   resolveAssetUrl,
 } = await jiti.import("../src/code-graph-assets.ts");
-const {
-  createCodeGraphState,
-  resolveCodeGraphProject,
-} = await jiti.import("../src/code-graph-config.ts");
+const { resolveCodeGraphProject } = await jiti.import("../src/code-graph-config.ts");
+import { writeCodeGraphFiles } from "./helpers/code-graph-files.mjs";
 const { curlShimDirectory } = await jiti.import("../src/code-graph-manager.ts");
 const extensionModule = await jiti.import("../src/index.ts");
 const { CodeGraphInstaller } = await jiti.import("../src/code-graph-installer.ts");
@@ -149,19 +147,12 @@ async function seedVerifiedInstall(fixture) {
   return fakeBinary;
 }
 
-/** Seed a valid project state: state.json, _config.db, and an index DB. */
+/** Seed a valid project: opt-in.json, workbench-identity.json, _config.db, and an index DB. */
 async function seedProjectData(fixture) {
   const { paths, workspace } = fixture;
   const project = resolveCodeGraphProject(workspace, paths);
   const asset = CODE_GRAPH_ASSETS["linux-arm64"];
-  await mkdir(project.directory, { recursive: true });
-  const state = createCodeGraphState(project, {
-    version: asset.version,
-    resolvedUrl: resolveAssetUrl(asset),
-    sha256: asset.sha256,
-  });
-  await writeFile(project.statePath, JSON.stringify(state, null, 2) + "\n");
-  await writeFile(join(project.directory, "_config.db"), "auto_index = true\n");
+  await writeCodeGraphFiles(project, { version: asset.version, resolvedUrl: resolveAssetUrl(asset), sha256: asset.sha256 });
   const derived = project.projectPath.replace(/^\//, "").replace(/\//g, "-");
   await writeFile(join(project.directory, `${derived}.db`), "INDEX");
   return project;
@@ -244,23 +235,27 @@ test("command: first on activates end to end without confirmation", async () => 
     assert.deepEqual(JSON.parse(config.args[1]).args, ["--ui=false", "--quiet", "--repo-path", project.projectPath]);
     assert.equal(config.cwd, project.projectPath);
     assert.equal(config.exposure, "direct");
-    assert.equal(config.env.CBM_CACHE_DIR, project.directory);
-    assert.equal(config.env.CBM_LOG_LEVEL, "error");
-    assert.ok(config.env.PATH.startsWith(`${curlShimDirectory(fixture.paths.codeGraphCurlShim)}:`), "curl shim dir first in PATH");
-    assert.ok(!("CBM_DOWNLOAD_URL" in config.env));
+    assert.equal(config.env, undefined, "nothing is registered through Pi's merged, interpolated env");
+    const specEnv = JSON.parse(config.args[1]).env;
+    assert.equal(specEnv.CBM_CACHE_DIR, project.directory);
+    assert.equal(specEnv.CBM_LOG_LEVEL, "error");
+    assert.ok(specEnv.PATH.startsWith(`${curlShimDirectory(fixture.paths.codeGraphCurlShim)}:`), "curl shim dir first in PATH");
+    assert.ok(!("CBM_DOWNLOAD_URL" in specEnv));
 
     // State published last, valid, with auto_index proven and index DB present.
-    await waitFor(() => existsSync(project.statePath), 5000, "state.json");
-    const state = JSON.parse(await readFile(project.statePath, "utf8"));
-    assert.equal(state.version, asset.version);
-    assert.equal(state.identifier, project.identifier);
+    await waitFor(() => existsSync(project.optInPath), 5000, "opt-in.json");
+    const optIn = JSON.parse(await readFile(project.optInPath, "utf8"));
+    assert.deepEqual(optIn, { schemaVersion: 1, enabled: true, projectPath: project.projectPath, identifier: project.identifier });
+    const identity = JSON.parse(await readFile(project.identityPath, "utf8"));
+    assert.equal(identity.codeGraphVersion, asset.version);
+    assert.equal(identity.kind, "code-graph");
     const configDb = await readFile(join(project.directory, "_config.db"), "utf8");
     assert.match(configDb, /auto_index = true/);
     const calls = await readCallLog(fixture);
     assert.ok(calls.includes("index-repository"), "index_repository ran once via owned binary");
     assert.ok(calls.includes("index-status"), "index validated via index_status");
 
-    assert.match(notifications.map((n) => n.message).join("\n"), /Code graph enabled for /);
+    assert.match(notifications.map((n) => n.message).join("\n"), /Code Graph enabled for this project/);
     assert.equal(existsSync(fixture.paths.codeGraphCurlShim), true, "curl deny shim materialized");
   } finally {
     await fixture.cleanup();
@@ -355,7 +350,7 @@ test("command: first on without UI activates", async () => {
     await command(fixture).handler("on", ctx);
     assert.ok(notifications.some(({ message }) => /Preparing Code Graph v0\.12\.1/.test(message)));
     await waitFor(() => fixture.piState.mcp.has("codebase-memory"), 15000, "MCP registration");
-    assert.ok(notifications.some(({ message }) => /Code graph enabled for /.test(message)));
+    assert.ok(notifications.some(({ message }) => /Code Graph enabled for this project/.test(message)));
   } finally {
     await fixture.cleanup();
   }
@@ -388,7 +383,7 @@ test("command: off on a clean workspace reports already off", async () => {
   try {
     const { ctx, notifications } = makeCtx(fixture.workspace, { confirmAnswer: true });
     await command(fixture).handler("off", ctx);
-    assert.ok(notifications.some(({ message }) => /already off/.test(message)));
+    assert.ok(notifications.some(({ message }) => /Code Graph already off for this project/.test(message)));
   } finally {
     await fixture.cleanup();
   }
@@ -404,13 +399,13 @@ test("command: off without --confirm-delete asks and deletes only the project di
     const detail = confirms[0].detail;
     assert.ok(detail.includes(project.directory), "exact deletion target stated");
     assert.ok(detail.includes("_config.db"), "deletion includes _config.db");
-    assert.ok(detail.includes("state.json"), "deletion includes state.json");
+    assert.ok(detail.includes("opt-in.json") && detail.includes("workbench-identity.json"), "deletion names both files");
     assert.ok(detail.includes(fixture.paths.codeGraphBin), "shared binary retained");
 
     assert.equal(existsSync(project.directory), false, JSON.stringify(notifications));
     assert.equal(existsSync(fakeBinary), true, "shared binary retained");
     assert.equal(fixture.piState.mcp.size, 0);
-    assert.ok(notifications.some(({ message }) => /Code graph deleted/.test(message)));
+    assert.ok(notifications.some(({ message }) => /Code Graph data deleted for this project/.test(message)));
   } finally {
     await fixture.cleanup();
   }
@@ -474,7 +469,7 @@ test("command: off stops the owned MCP registration before deletion", async () =
     await command(fixture).handler("off --confirm-delete", ctx);
     assert.deepEqual(fixture.piState.unregistered, ["codebase-memory"], "owned server unregistered");
     assert.equal(existsSync(project.directory), false);
-    assert.ok(notifications.some(({ message }) => /Code graph deleted/.test(message)));
+    assert.ok(notifications.some(({ message }) => /Code Graph data deleted for this project/.test(message)));
   } finally {
     await fixture.cleanup();
   }
@@ -512,7 +507,7 @@ test("session start with valid state restores and injects guidance", async () =>
     assert.equal(config.command, process.execPath);
     assert.equal(JSON.parse(config.args[1]).command, fakeBinary);
     assert.equal(config.cwd, project.projectPath);
-    assert.equal(config.env.CBM_CACHE_DIR, project.directory);
+    assert.equal(JSON.parse(config.args[1]).env.CBM_CACHE_DIR, project.directory);
     assert.ok(statuses.some(([key]) => key === "code-graph"), "code-graph status key set");
     assert.ok(!notifications.some(({ message }) => message.includes("structural")), "no user guidance notification");
     await waitFor(() => statuses.some(([key, value]) => key === "code-graph" && value === "✓ Code Graph"), 5000, "restore completion");
@@ -528,7 +523,7 @@ test("session start with corrupt state stays off with a diagnostic", async () =>
   const fixture = await makeFixture();
   const { project } = await seedEnabledWorkspace(fixture);
   try {
-    // Keep state.json but break the CBM config so validation is corrupt.
+    // Keep both files but break the CBM config so validation is corrupt.
     await rm(join(project.directory, "_config.db"));
     const { ctx, notifications } = makeCtx(fixture.workspace);
     await fixture.piState.handlers.get("session_start")({}, ctx);

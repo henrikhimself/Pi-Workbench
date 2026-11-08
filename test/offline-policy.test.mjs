@@ -19,7 +19,7 @@ for (const [label, code, pattern] of [
   ["Chromium executable", 'import { execFileSync } from "node:child_process"; try { execFileSync("/fixture/chrome", ["--headless"]); } catch {}', /browser execution/],
   ["Chromium headless shell", 'import { execFileSync } from "node:child_process"; try { execFileSync("/fixture/chrome-headless-shell"); } catch {}', /browser execution/],
   ["Playwright binary", 'import { execFileSync } from "node:child_process"; try { execFileSync("playwright", ["install"]); } catch {}', /Playwright backend/],
-  ["managed launcher JSON Node backend", 'import { execFileSync } from "node:child_process"; try { execFileSync(process.execPath, ["/fixture/launcher.mjs", JSON.stringify({schema:1,command:process.execPath,args:["/fixture/@playwright/mcp/cli.js"]})]); } catch {}', /Node package.backend entrypoint/],
+  ["managed launcher JSON Node backend", 'import { execFileSync } from "node:child_process"; try { execFileSync(process.execPath, ["/fixture/launcher.mjs", JSON.stringify({schemaVersion:1,command:process.execPath,args:["/fixture/@playwright/mcp/cli.js"]})]); } catch {}', /Node package.backend entrypoint/],
   ["external DNS", 'import dns from "node:dns"; try { dns.lookup("example.invalid", () => {}); } catch {}', /DNS example.invalid/],
   ["shell installer", 'import { execSync } from "node:child_process"; try { execSync("pip install fixture"); } catch {}', /unexpected shell execution/],
   ["external socket", 'import net from "node:net"; try { net.connect({host:"example.invalid",port:443}); } catch {}', /network example.invalid:443/],

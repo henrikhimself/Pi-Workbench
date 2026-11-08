@@ -8,7 +8,7 @@ import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url, { moduleCache: false, fsCache: false });
 
-async function studySession(run, initialBranch = []) {
+async function studySession(run, initialBranch = [], extensionOptions = {}) {
   const home = await mkdtemp(join(tmpdir(), "wb-study-"));
   const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
   const paths = resolveWorkbenchPaths(home);
@@ -31,6 +31,7 @@ async function studySession(run, initialBranch = []) {
   };
   const { default: extension } = await jiti.import("../src/index.ts");
   extension(pi, {
+    ...extensionOptions,
     workbenchPaths: paths,
     proxyManager: {
       resume: () => assert.fail("off compression must not resume"),
@@ -183,3 +184,50 @@ test("Study Mode adds guidance without restricting tools, skills, or commands", 
   assert.doesNotMatch(previews.at(-1).prefill, /<study_mode>/);
   assert.match(previews.at(-1).prefill, /keep/);
 });
+
+const previewCtx = (ctx, previews, effective) => ({
+  ...ctx, hasUI: true,
+  getSystemPrompt: () => effective,
+  getSystemPromptOptions: () => ({ cwd: "/tmp", sections: { unrelated: "keep" } }),
+  ui: { ...ctx.ui, theme: { fg: (_c, v) => v }, editor: async (title, prefill) => previews.push({ title, prefill }) },
+});
+
+test("M3: preview falls back to the effective prompt, current Workbench guidance and a one-line note when Pi's renderer cannot load", () => studySession(async s => {
+  await s.handlers.get("session_start")({}, s.ctx);
+  const previews = [];
+  const ctx = previewCtx(s.ctx, previews, "EFFECTIVE PROMPT FROM PI");
+  await s.commands.get("wb:study-mode").handler("on", ctx);
+  await s.commands.get("wb:show-system-prompt").handler("", ctx);
+  const text = previews.at(-1).prefill;
+  assert.equal(s.notices.filter(n => n.level === "error").length, 0, "no error notification");
+  assert.match(text, /^\[Pi renderer not used: cannot resolve pi\]\n\nEFFECTIVE PROMPT FROM PI/);
+  assert.match(text, /<study_mode>[\s\S]*You are in Study Mode/);
+  assert.equal(text.split("\n").filter(line => line.startsWith("[Pi renderer not used")).length, 1);
+}, [], { promptRenderer: async () => ({ note: "Pi renderer not used: cannot resolve pi" }) }));
+
+test("M3: the default loader's resolver failure becomes a note, not a failed command", () => studySession(async s => {
+  const { loadPromptRenderer } = await jiti.import("../src/prompt-renderer.ts");
+  const failing = await loadPromptRenderer({ resolve: () => { throw new Error("Cannot find package"); }, load: async () => ({}), readVersion: () => "1.5.0", runningVersion: "1.5.0" });
+  assert.deepEqual(failing, { note: "Pi renderer not used: Cannot find package" });
+  const mismatch = await loadPromptRenderer({ resolve: () => "file:///x/dist/index.js", load: async () => assert.fail("must not load a different Pi"), readVersion: () => "2.0.0", runningVersion: "1.5.0" });
+  assert.match(mismatch.note, /resolved Pi 2\.0\.0 differs from running Pi 1\.5\.0/);
+  const moved = await loadPromptRenderer({ resolve: () => "file:///x/dist/index.js", load: async () => ({}), readVersion: () => "1.5.0", runningVersion: "1.5.0" });
+  assert.match(moved.note, /no buildSystemPrompt export/);
+  const ok = await loadPromptRenderer({ resolve: () => "file:///x/dist/index.js", load: async (url) => ({ buildSystemPrompt: () => url }), readVersion: () => undefined, runningVersion: "1.5.0" });
+  assert.equal(ok.renderer(), "file:///x/dist/core/system-prompt.js");
+}));
+
+test("M3: a renderer that throws still falls back to the effective prompt", () => studySession(async s => {
+  await s.handlers.get("session_start")({}, s.ctx);
+  const previews = [];
+  const ctx = previewCtx(s.ctx, previews, "EFFECTIVE");
+  await s.commands.get("wb:show-system-prompt").handler("", ctx);
+  assert.match(previews.at(-1).prefill, /^\[Pi renderer not used: boom\]\n\nEFFECTIVE/);
+}, [], { promptRenderer: async () => ({ renderer: () => { throw new Error("boom"); } }) }));
+
+test("M3: a working renderer is used without a note", () => studySession(async s => {
+  await s.handlers.get("session_start")({}, s.ctx);
+  const previews = [];
+  await s.commands.get("wb:show-system-prompt").handler("", previewCtx(s.ctx, previews, "EFFECTIVE"));
+  assert.equal(previews.at(-1).prefill, "RENDERED keep");
+}, [], { promptRenderer: async () => ({ renderer: (o) => `RENDERED ${o.sections.unrelated}` }) }));

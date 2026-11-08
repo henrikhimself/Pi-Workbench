@@ -50,7 +50,7 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
     },
   });
   assert.throws(() => config.parseHeadroomConfig({ schemaVersion: 1, url: "http://127.0.0.1:9000/" }), /url is unsupported/);
-  assert.throws(() => config.parseHeadroomConfig({ port: 8787 }), /fresh schemaVersion/);
+  assert.throws(() => config.parseHeadroomConfig({ port: 8787 }), /new schemaVersion/);
   for (const mode of ["ccr", "lossy_inline", "lossless_then_lossy"]) {
     assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1, compression: { mode } }), { schemaVersion: 1, port: 8787, compression: { mode } });
   }
@@ -100,21 +100,6 @@ test("Headroom config: namespace rejects invalid types and empty or multiline va
   }
 });
 
-test("Headroom config: old top-level namespace is unsupported and configuration is never rewritten", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-headroom-namespace-"));
-  const configPath = join(directory, "headroom.json");
-  try {
-    for (const memory of [undefined, { namespace: "new-value" }]) {
-      const raw = JSON.stringify({ schemaVersion: 1, memoryNamespace: "old-value", memory }, null, 2) + "\n";
-      await writeFile(configPath, raw);
-      assert.throws(() => config.loadHeadroomConfigSync(configPath), /headroom\.json memoryNamespace is not supported\./);
-      await assert.rejects(config.loadHeadroomConfig(configPath), /headroom\.json memoryNamespace is not supported\./);
-      assert.equal(await config.ensureHeadroomConfigFile(configPath), false);
-      assert.equal(await readFile(configPath, "utf8"), raw, "unsupported old key must not be migrated or rewritten");
-    }
-  } finally { await rm(directory, { recursive: true, force: true }); }
-});
-
 test("Headroom config: nested root is optional and coexists with namespace and export", () => {
   for (const memory of [undefined, {}, { namespace: "alice", export: ".headroom-memory" }]) {
     const parsed = config.parseHeadroomConfig({ schemaVersion: 1, memory });
@@ -137,17 +122,18 @@ test("Headroom config: nested root requires a non-empty string", () => {
   }
 });
 
-test("Headroom config: top-level memoryRoot is rejected without migration or rewriting", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pi-headroom-root-"));
+test("Headroom config: an unknown top-level key is rejected and the file is not rewritten", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headroom-unknown-key-"));
   const configPath = join(directory, "headroom.json");
   try {
-    for (const memory of [undefined, { root: "/new-root", namespace: "alice", export: ".headroom-memory" }]) {
-      const raw = JSON.stringify({ schemaVersion: 1, memoryRoot: "/old-root", memory }, null, 2) + "\n";
-      await writeFile(configPath, raw);
-      assert.throws(() => config.loadHeadroomConfigSync(configPath), /headroom\.json memoryRoot is not supported\./);
-      await assert.rejects(config.loadHeadroomConfig(configPath), /headroom\.json memoryRoot is not supported\./);
-      assert.equal(await config.ensureHeadroomConfigFile(configPath), false);
-      assert.equal(await readFile(configPath, "utf8"), raw);
+    for (const key of ["memoryNamespace", "memoryRoot", "somethingElse"]) {
+      for (const memory of [undefined, { namespace: "alice" }]) {
+        const raw = JSON.stringify({ schemaVersion: 1, [key]: "value", memory }, null, 2) + "\n";
+        await writeFile(configPath, raw);
+        assert.throws(() => config.loadHeadroomConfigSync(configPath), new RegExp(`headroom\\.json ${key} is not supported\\.`));
+        assert.equal(await config.ensureHeadroomConfigFile(configPath), false);
+        assert.equal(await readFile(configPath, "utf8"), raw, "the file must not be rewritten");
+      }
     }
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
@@ -157,9 +143,45 @@ test("Headroom config: loads JSON", async () => {
   const configPath = join(directory, "headroom.json");
   try {
     await writeFile(configPath, JSON.stringify({ schemaVersion: 1, port: 9999, memory: { namespace: "tester" } }));
-    assert.deepEqual(await config.loadHeadroomConfig(configPath), { schemaVersion: 1, port: 9999, memory: { namespace: "tester" } });
     assert.deepEqual(config.loadHeadroomConfigSync(configPath), { schemaVersion: 1, port: 9999, memory: { namespace: "tester" } });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("Headroom config: proxy tuning section accepts bounded values and maps to Headroom variables", () => {
+  const proxy = { compressionTimeoutSeconds: 90, backgroundCompression: true, backgroundCompressionMinTokens: 20000, quarantineThreshold: 2, quarantineMaxSeconds: 120 };
+  assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1, proxy }).proxy, proxy);
+  assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1, proxy: {} }).proxy, {});
+  assert.deepEqual(config.proxyTuningEnvironment(proxy), {
+    HEADROOM_COMPRESSION_TIMEOUT_SECONDS: "90", HEADROOM_BACKGROUND_COMPRESSION: "1",
+    HEADROOM_BACKGROUND_COMPRESSION_MIN_TOKENS: "20000", HEADROOM_COMPRESSION_QUARANTINE_THRESHOLD: "2",
+    HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS: "120",
+  });
+  assert.equal(config.proxyTuningEnvironment({ backgroundCompression: false }).HEADROOM_BACKGROUND_COMPRESSION, "0");
+  assert.deepEqual(config.proxyTuningEnvironment({}), {});
+  assert.deepEqual(config.proxyTuningEnvironment(undefined), {});
+  assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1 }).proxy, undefined);
+});
+
+test("Headroom config: proxy tuning rejects unknown keys, wrong types and out-of-range values", () => {
+  const bad = (proxy, pattern) => assert.throws(() => config.parseHeadroomConfig({ schemaVersion: 1, proxy }), pattern);
+  bad("fast", /proxy must be a JSON object/);
+  bad([], /proxy must be a JSON object/);
+  bad(null, /proxy must be a JSON object/);
+  bad({ HEADROOM_COMPRESSION_TIMEOUT_SECONDS: 30 }, /proxy\.HEADROOM_COMPRESSION_TIMEOUT_SECONDS is not supported/);
+  bad({ port: 1 }, /proxy\.port is not supported/);
+  for (const value of [4, 601, 0, -1, 30.5, "30", null, Number.NaN, Infinity]) bad({ compressionTimeoutSeconds: value }, /proxy\.compressionTimeoutSeconds must be an integer from 5 to 600/);
+  bad({ backgroundCompression: "yes" }, /proxy\.backgroundCompression must be a boolean/);
+  bad({ backgroundCompression: 1 }, /proxy\.backgroundCompression must be a boolean/);
+  bad({ backgroundCompressionMinTokens: 0 }, /backgroundCompressionMinTokens must be an integer from 1 to 10000000/);
+  bad({ quarantineThreshold: 65 }, /quarantineThreshold must be an integer from 1 to 64/);
+  bad({ quarantineMaxSeconds: 3601 }, /quarantineMaxSeconds must be an integer from 1 to 3600/);
+});
+
+test("Headroom config: client request timeout always exceeds the proxy's compression timeout", () => {
+  assert.equal(config.headroomRequestTimeoutMs(), 45_000, "30 s server default plus 15 s");
+  assert.equal(config.headroomRequestTimeoutMs({}), 45_000);
+  assert.equal(config.headroomRequestTimeoutMs({ compressionTimeoutSeconds: 120 }), 135_000);
+  assert.equal(config.headroomRequestTimeoutMs({ compressionTimeoutSeconds: 5 }), 20_000);
 });

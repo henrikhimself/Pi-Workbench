@@ -13,7 +13,7 @@ test("Playwright command defaults to read-only status and rejects extra argument
 });
 test("Playwright noninteractive off never confirms implicitly", async () => {
   const ctx = context(); assert.match(await executePlaywrightCommand("off", ctx), /requires --confirm-delete/); assert.deepEqual(ctx.calls, []);
-  await executePlaywrightCommand("off --confirm-delete", ctx); assert.deepEqual(ctx.calls, [["off", true]]);
+  assert.equal(await executePlaywrightCommand("off --confirm-delete", ctx), "Playwright data deleted for this project"); assert.deepEqual(ctx.calls, [["off", true]]);
 });
 test("Playwright interactive refusal preserves session even when noninteractive confirmation flag supplied", async () => {
   let questions = 0; const ctx = context(true, async () => { questions++; return false; });

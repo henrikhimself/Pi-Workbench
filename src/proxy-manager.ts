@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
+import { requireSchemaVersion } from "./schema-version.js";
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import { createServer } from "node:net";
 import { lstat, open, readFile, readlink, realpath, rm } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   acquireManagedLock, activeConsumers, assertNoSymlink, assertWithin, ensurePrivateDirectory,
@@ -11,33 +12,35 @@ import {
 import { DEFAULT_HEADROOM_RUNTIME, ManagedHeadroomRuntime, type ManagedHeadroomDescriptor } from "./headroom-runtime.js";
 export { findPython, getHeadroomAiVersion } from "./headroom-runtime.js";
 import { sealOwnedJson, openOwnedJson, readOwnedFrame } from "./owned-transport.js";
-import { prepareHeadroomStore } from "./headroom-state.js";
+import { prepareDataStore } from "./store-identity.js";
+import { proxyTuningEnvironment, type HeadroomProxyConfig } from "./headroom-config.js";
 
 const PROXY_ENTRY = fileURLToPath(new URL("./managed-proxy.py", import.meta.url));
 const sleep = (ms: number) => new Promise<void>((done) => setTimeout(done, ms));
+/** Headroom's own server-side compression timeout is 30 s and cannot be pre-empted, so the
+ * client must wait longer than that: a busy proxy is not a dead proxy. */
+export const HEADROOM_REQUEST_TIMEOUT_MS = 45_000;
+export const HEALTH_CHECK_TIMEOUT_MS = 3_000;
+/** Watchdog probes tolerate a proxy that is busy compressing. */
+export const WATCHDOG_HEALTH_TIMEOUT_MS = 10_000;
+/** Longer than the longest hold of the proxy lock: launch() waits up to 60 s for health. */
+export const PROXY_LOCK_WAIT_MS = 90_000;
 export interface ManagedProxyRecord extends ProcessIdentity {
-  schema: 1; port: number; nonce: string; serviceToken: string; script: string;
+  schemaVersion: 1; port: number; nonce: string; serviceToken: string; script: string;
   descriptor: ManagedHeadroomDescriptor;
 }
 export interface ProxyManagerOptions {
   port?: number; host?: string; runtime?: ManagedHeadroomRuntime;
+  /** Per-request timeout for owned compression requests. */
+  requestTimeoutMs?: number;
+  /** Validated headroom.json `proxy` tuning, mapped to Headroom's environment when the proxy starts. */
+  tuning?: HeadroomProxyConfig;
   /** Dependency seams for hermetic ownership/lifecycle tests, never config fields. */
   processMatches?: (record: ManagedProxyRecord) => Promise<boolean>;
   terminate?: (record: ManagedProxyRecord) => Promise<void>;
 }
 export async function getManagedHeadroomVersion(runtime = DEFAULT_HEADROOM_RUNTIME): Promise<string | null> {
   return (await runtime.inspect())?.version ?? null;
-}
-export async function ensureManagedPython(onStatus: (message: string) => void, runtime = DEFAULT_HEADROOM_RUNTIME): Promise<string | null> {
-  return (await runtime.ensure(onStatus))?.python ?? null;
-}
-export async function acquireStartupLock(lockDir: string, onStatus: (message: string) => void, shouldAbort: () => boolean): Promise<(() => Promise<void>) | null> {
-  if (shouldAbort()) return null;
-  try {
-    const release = await acquireManagedLock(dirname(lockDir), basename(lockDir).replace(/\.lock$/, ""), { timeoutMs: 240_000 });
-    if (shouldAbort()) { await release(); return null; }
-    return release;
-  } catch (error) { onStatus(String(error)); return null; }
 }
 async function portFree(port: number): Promise<boolean> {
   return new Promise((done) => {
@@ -51,6 +54,8 @@ async function portFree(port: number): Promise<boolean> {
 export class ProxyManager {
   private readonly runtime: ManagedHeadroomRuntime;
   private readonly port: number;
+  private readonly requestTimeoutMs: number;
+  private readonly tuning: HeadroomProxyConfig | undefined;
   private readonly matches: (record: ManagedProxyRecord) => Promise<boolean>;
   private readonly terminate: (record: ManagedProxyRecord) => Promise<void>;
   private consumer: ConsumerLease | null = null;
@@ -62,6 +67,8 @@ export class ProxyManager {
   constructor(options: ProxyManagerOptions = {}) {
     if (options.host && options.host !== "127.0.0.1") throw new Error("Managed Headroom binds only 127.0.0.1");
     this.port = options.port ?? 8787;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? HEADROOM_REQUEST_TIMEOUT_MS;
+    this.tuning = options.tuning;
     this.runtime = options.runtime ?? DEFAULT_HEADROOM_RUNTIME;
     this.matches = options.processMatches ?? ((record) => this.matchesProcess(record));
     this.terminate = options.terminate ?? ((record) => this.terminateOwned(record));
@@ -73,7 +80,7 @@ export class ProxyManager {
   private get directory(): string { return join(this.runtime.root, "proxies", String(this.port)); }
   private get recordPath(): string { return join(this.directory, "owner.json"); }
   private async lock(): Promise<() => Promise<void>> {
-    return acquireManagedLock(join(this.runtime.root, "coordination"), `proxy-${this.port}`, { timeoutMs: 30_000 });
+    return acquireManagedLock(join(this.runtime.root, "coordination"), `proxy-${this.port}`, { timeoutMs: PROXY_LOCK_WAIT_MS });
   }
   private async record(): Promise<ManagedProxyRecord | null> {
     await assertNoSymlink(this.recordPath);
@@ -82,7 +89,8 @@ export class ProxyManager {
       if (!info.isFile() || (process.getuid && info.uid !== process.getuid()) ||
           (process.platform !== "win32" && (info.mode & 0o077))) throw new Error("Unsafe managed proxy identity record");
       const record = JSON.parse(await readFile(this.recordPath, "utf8")) as ManagedProxyRecord;
-      if (record.schema !== 1 || record.port !== this.port || !/^[0-9a-f]{64}$/.test(record.nonce) ||
+      requireSchemaVersion(record, "Managed proxy record");
+      if (record.port !== this.port || !/^[0-9a-f]{64}$/.test(record.nonce) ||
           !/^[0-9a-f-]+$/.test(record.serviceToken) || typeof record.script !== "string" || basename(record.script) !== "managed-proxy.py" || !record.descriptor) throw new Error("Invalid managed proxy record");
       assertWithin(join(this.runtime.root, "runtimes"), record.descriptor.slot);
       assertWithin(record.descriptor.slot, record.descriptor.python);
@@ -105,11 +113,11 @@ export class ProxyManager {
     // attestation establish ownership without assuming Linux /proc semantics.
     return true;
   }
-  private async healthy(record: ManagedProxyRecord): Promise<boolean> {
+  private async healthy(record: ManagedProxyRecord, timeoutMs = HEALTH_CHECK_TIMEOUT_MS): Promise<boolean> {
     if (!await this.matches(record)) return false;
     try {
       const challenge = randomUUID();
-      const response = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(3000), redirect: "error", headers: { "x-pi-workbench-challenge": challenge } });
+      const response = await fetch(`${this.baseUrl}/health`, { signal: AbortSignal.timeout(timeoutMs), redirect: "error", headers: { "x-pi-workbench-challenge": challenge } });
       if (!response.ok) return false;
       const expected = createHash("sha256").update(`${await realpath(record.descriptor.python)}|${record.descriptor.version}`).digest("hex");
       const proof = createHmac("sha256", Buffer.from(record.nonce, "hex")).update(`health:${challenge}:${expected}`).digest("hex");
@@ -118,15 +126,15 @@ export class ProxyManager {
       return health.version === record.descriptor.version && health.config?.pid === record.pid;
     } catch { return false; }
   }
-  async compressRaw(body: Record<string, unknown>): Promise<any> { return this.requestOwned("/v1/compress", body); }
-  async requestOwned(path: string, body: unknown = null, method: "GET" | "POST" = "POST"): Promise<any> {
+  async requestOwned(path: string, body: unknown = null, method: "GET" | "POST" = "POST", signal?: AbortSignal): Promise<any> {
     const target = new URL(path, this.baseUrl);
     if (!path.startsWith("/") || target.origin !== this.baseUrl || target.search || target.hash) throw new Error("Invalid owned request path");
     const record = await this.record();
     if (!this.consumer || !record || record.descriptor.slot !== this.descriptor?.slot || !await this.matches(record)) throw new Error("No owned compression consumer");
     const requestId = randomUUID();
     const response = await fetch(target, {
-      method: "POST", redirect: "error", signal: AbortSignal.timeout(15_000),
+      method: "POST", redirect: "error",
+      signal: signal ? AbortSignal.any([AbortSignal.timeout(this.requestTimeoutMs), signal]) : AbortSignal.timeout(this.requestTimeoutMs),
       headers: { "content-type": "application/json", "x-pi-workbench-encrypted": "1", "x-pi-workbench-request": requestId, "x-pi-workbench-method": method },
       body: sealOwnedJson(record.nonce, `pi-workbench:headroom:v1:request:${requestId}:${method}:${target.pathname}`, body),
     });
@@ -134,11 +142,20 @@ export class ProxyManager {
     if (!response.ok) throw new Error(`Owned compression failed with HTTP ${response.status}`);
     return result;
   }
-  async healthCheck(): Promise<boolean> {
+  /** True while the recorded proxy process still exists and is provably ours. A slow or
+   * busy proxy is still alive; only a missing/foreign process counts as gone. */
+  async processAlive(): Promise<boolean> {
     try {
       const record = await this.record();
       const selected = this.descriptor ?? await this.runtime.inspect();
-      return !!record && !!selected && record.descriptor.slot === selected.slot && await this.healthy(record);
+      return !!record && !!selected && record.descriptor.slot === selected.slot && await this.matches(record);
+    } catch { return false; }
+  }
+  async healthCheck(timeoutMs = HEALTH_CHECK_TIMEOUT_MS): Promise<boolean> {
+    try {
+      const record = await this.record();
+      const selected = this.descriptor ?? await this.runtime.inspect();
+      return !!record && !!selected && record.descriptor.slot === selected.slot && await this.healthy(record, timeoutMs);
     } catch { return false; }
   }
   async ensureRunning(onStatus: (message: string) => void): Promise<boolean> {
@@ -156,7 +173,12 @@ export class ProxyManager {
       try {
         const existing = await this.record();
         if (existing && !(await activeConsumers(this.runtime.leaseRoot, this.resource)).length && await this.matches(existing)) {
-          await this.terminate(existing); // Owned orphan only, never an old installation discovery.
+          // A healthy owned proxy on the selected runtime is adopted (session replacement hands it
+          // over): we take a lease below, which keeps its monitor from exiting. Anything else that
+          // is owned but orphaned is terminated.
+          const selected = this.descriptor ?? await this.runtime.inspect();
+          const adoptable = !!selected && existing.descriptor.slot === selected.slot && await this.healthy(existing);
+          if (!adoptable) await this.terminate(existing);
         }
         if (!await portFree(this.port) && (!existing || !await this.matches(existing))) {
           onStatus("Managed Headroom port occupied by unknown/unowned service; no context sent"); return false;
@@ -182,7 +204,7 @@ export class ProxyManager {
   }
   private async launch(onStatus: (message: string) => void): Promise<boolean> {
     const descriptor = this.descriptor!;
-    await prepareHeadroomStore(join(this.runtime.root, "proxy-state"), { schema: 1, layout: 1, headroomVersion: descriptor.version, kind: "proxy" });
+    await prepareDataStore(join(this.runtime.root, "proxy-state"), { schemaVersion: 1, layout: 1, headroomVersion: descriptor.version, kind: "proxy" });
     await ensurePrivateDirectory(this.runtime.root, this.directory);
     const nonce = randomBytes(32).toString("hex"), serviceToken = randomUUID();
     const serviceLease = join(this.runtime.leaseRoot, `${serviceToken}.json`);
@@ -192,7 +214,7 @@ export class ProxyManager {
     try {
       onStatus("Starting extension-owned Headroom proxy...");
       child = spawn(descriptor.python, [PROXY_ENTRY, String(this.port)], {
-        env: { ...this.runtime.environment(), WB_PROXY_OWNER: nonce, WB_PROXY_CONSUMERS: this.runtime.leaseRoot,
+        env: { ...this.runtime.environment(), ...proxyTuningEnvironment(this.tuning), WB_PROXY_OWNER: nonce, WB_PROXY_CONSUMERS: this.runtime.leaseRoot,
           WB_PROXY_RESOURCE: this.resource, WB_PROXY_SERVICE_LEASE: serviceLease },
         detached: process.platform !== "win32", stdio: ["ignore", log.fd, log.fd],
       });
@@ -202,9 +224,9 @@ export class ProxyManager {
     const start = await processBirth(child.pid);
     if (!start) throw new Error("Cannot establish spawned proxy process birth identity");
     const { hostname } = await import("node:os");
-    const record: ManagedProxyRecord = { schema: 1, pid: child.pid, start, host: hostname(), port: this.port,
+    const record: ManagedProxyRecord = { schemaVersion: 1, pid: child.pid, start, host: hostname(), port: this.port,
       nonce, serviceToken, script: PROXY_ENTRY, descriptor };
-    await publishJson(this.runtime.root, serviceLease, { schema: 1, token: serviceToken, resource: `service:${this.resource}`, pid: record.pid, start, host: record.host });
+    await publishJson(this.runtime.root, serviceLease, { schemaVersion: 1, token: serviceToken, resource: `service:${this.resource}`, pid: record.pid, start, host: record.host });
     await publishJson(this.runtime.root, this.recordPath, record);
     for (let attempt = 0; attempt < 120 && !this.stopping; attempt++) {
       if (await this.healthy(record)) return true;
@@ -226,17 +248,24 @@ export class ProxyManager {
     if (await this.matches(record)) throw new Error("Owned proxy has not exited; preserve runtime lease");
     await rm(join(this.runtime.leaseRoot, `${record.serviceToken}.json`), { force: true });
   }
-  async stop(): Promise<void> {
+  /**
+   * Releases this instance's lease and, when it was the last consumer, terminates the proxy.
+   * `{ terminate: false }` releases the lease only, for a session replacement (`/new`, `/resume`,
+   * `/fork`, `/reload`): the new instance adopts the running proxy. If nothing takes a lease,
+   * the proxy's own monitor exits about 10 s after the last one is gone.
+   */
+  async stop(options: { terminate?: boolean } = {}): Promise<void> {
     this.stopping = true;
-    if (!this.stoppingWork) this.stoppingWork = this.stopOnce().finally(() => { this.stoppingWork = null; });
+    if (!this.stoppingWork) this.stoppingWork = this.stopOnce(options.terminate !== false).finally(() => { this.stoppingWork = null; });
     return this.stoppingWork;
   }
-  private async stopOnce(): Promise<void> {
+  private async stopOnce(terminate: boolean): Promise<void> {
     if (this.starting) await this.starting;
     if (!this.consumer) return;
     const release = await this.lock();
     try {
       await this.consumer?.release(); this.consumer = null;
+      if (!terminate) return;
       if ((await activeConsumers(this.runtime.leaseRoot, this.resource)).length) return;
       const record = await this.record();
       if (record && await this.matches(record)) await this.terminate(record);
@@ -253,9 +282,10 @@ export class ProxyManager {
     const release = await this.lock();
     try {
       const peers = (await activeConsumers(this.runtime.leaseRoot, this.resource)).sort();
-      if (peers[0] !== this.consumer?.token) return this.healthCheck();
+      if (peers[0] !== this.consumer?.token) return this.healthCheck(WATCHDOG_HEALTH_TIMEOUT_MS);
       const record = await this.record();
-      if (record && await this.healthy(record)) return true;
+      // Re-check with the long timeout: never terminate a proxy that is merely busy.
+      if (record && await this.healthy(record, WATCHDOG_HEALTH_TIMEOUT_MS)) return true;
       if (record && record.descriptor.slot === this.descriptor?.slot && await this.matches(record)) await this.terminate(record);
       // An owned SIGKILL can precede kernel listener teardown by a few ms.
       // Wait boundedly, but never terminate a new/unknown occupant.

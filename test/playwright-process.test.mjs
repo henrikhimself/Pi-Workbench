@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
+import { EventEmitter } from "node:events";
 import { createJiti } from "jiti";
 import { playwrightFixture } from "./helpers/playwright-fixture.mjs";
 const m = await createJiti(import.meta.url).import("../src/playwright-process.ts");
@@ -51,4 +52,32 @@ test("Playwright group guard refuses unrelated/reused birth identity instead of 
   const guarded = new m.PlaywrightOwnedGroup(pgid, { pid: process.pid, start: "reused-pid", host: "fixture" });
   await assert.rejects(guarded.signal("SIGTERM"), /ownership uncertain/);
   process.kill(process.pid, 0);
+});
+
+test("LB-04: a response with U+2028, U+2029 or CR inside a JSON string is one message, split on LF only", async t => {
+  const f = await playwrightFixture(t);
+  const client = await m.PlaywrightStdioClient.connect({ command: process.execPath, args: [fake], cwd: f.workspace, env: f.env, timeoutMs: 3000 });
+  t.after(() => client.close());
+  const note = "before middle after\rend";
+  const response = await client.call("browser_snapshot", { note });
+  assert.equal(JSON.parse(response.content[0].text).args.note, note);
+});
+
+// Chunks are emitted one by one, exactly as given, so a multi-byte character can straddle two of them.
+const linesOf = async chunks => {
+  const lines = [], input = new EventEmitter();
+  m.forEachLfLine(input, line => lines.push(line));
+  for (const chunk of chunks) input.emit("data", chunk);
+  input.emit("end");
+  return lines;
+};
+
+test("LB-04: lines split on LF only; U+2028, U+2029 and CR stay inside the line, multi-byte text survives chunking, a last line needs no newline", async () => {
+  const message = JSON.stringify({ id: 1, result: "a\u2028b\u2029c" });
+  assert.deepEqual(await linesOf([Buffer.from(`${message}\n${message}\r\n{"last":true}`)]), [message, `${message}\r`, '{"last":true}']);
+  const bytes = Buffer.from(`{"text":"caf\u00e9 \u{1f600}"}\n`);
+  const split = bytes.indexOf(0xf0) + 2; // inside the 4-byte emoji
+  assert.deepEqual(await linesOf([bytes.subarray(0, split), bytes.subarray(split)]), ['{"text":"caf\u00e9 \u{1f600}"}']);
+  assert.deepEqual(await linesOf([Buffer.from('{"a":"x\ry"}\n')]), ['{"a":"x\ry"}'], "a lone CR does not split");
+  assert.deepEqual(await linesOf([Buffer.from("")]), []);
 });

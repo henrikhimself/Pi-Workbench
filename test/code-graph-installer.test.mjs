@@ -13,7 +13,6 @@ const {
   acquireInstallLock,
   decideBinaryAction,
   detectCodeGraphPlatform,
-  discoverInstalled,
   findGnuTar,
   downloadArchive,
   extractCodeGraphArchive,
@@ -33,6 +32,7 @@ async function makeTempRoot() {
     codeGraphRoot: root,
     codeGraphBin: join(root, "bin"),
     codeGraphDownloads: join(root, "downloads"),
+    codeGraphInstallLock: join(root, "coordination", "install.lock"),
   };
   await mkdir(paths.codeGraphBin, { recursive: true });
   await mkdir(paths.codeGraphDownloads, { recursive: true });
@@ -84,7 +84,6 @@ async function makeFixtureInstall(deps) {
   const installer = new CodeGraphInstaller({
     paths,
     platform: () => ({ os: "linux", arch: deps.arch ?? "arm64" }),
-    sleep: async () => {},
     download: async (url, destination) => {
       downloads.push(url);
       await writeFile(destination, state.archiveBytes);
@@ -113,8 +112,6 @@ async function makeFixtureInstall(deps) {
 function fixtureAsset(sha256, version = "v0.8.1") {
   return { version, url: LINUX_ARM64_URL, sha256 };
 }
-
-const sleep0 = async () => {};
 
 // ─── Platform detection ───────────────────────────────────────────────
 
@@ -151,20 +148,12 @@ test("decideBinaryAction: same version with changed URL or SHA is an invalid man
   assert.equal(shaChanged.action, "invalid_manifest");
 });
 
-test("decideBinaryAction: newer packaged version installs an update", () => {
-  const action = decideBinaryAction(
-    { version: "v0.8.0", resolvedUrl: "u", sha256: "s" },
-    { version: "v0.8.1", resolvedUrl: "u", sha256: "s" },
-  );
-  assert.deepEqual(action, { action: "install", reason: "update" });
-});
-
-test("decideBinaryAction: exact packaged identity wins over newer installed version", () => {
+test("decideBinaryAction: a record of another version is treated as missing (callers read only the packaged version's record)", () => {
   const action = decideBinaryAction(
     { version: "v0.8.2", resolvedUrl: "u2", sha256: "s2" },
     { version: "v0.8.1", resolvedUrl: "u", sha256: "s" },
   );
-  assert.deepEqual(action, { action: "install", reason: "pin" });
+  assert.deepEqual(action, { action: "install", reason: "missing" });
 });
 
 // ─── SHA-256 ──────────────────────────────────────────────────────────
@@ -375,10 +364,10 @@ test("download rejects redirect responses without Location", async () => {
 test("install lock: second waiter succeeds after release", async () => {
   const { root, cleanup } = await makeTempRoot();
   const lockDir = join(root, "install.lock");
-  const release1 = await acquireInstallLock(lockDir, () => {}, sleep0);
+  const release1 = await acquireInstallLock(lockDir);
   assert.ok(release1);
   let release2 = null;
-  const waiter = acquireInstallLock(lockDir, () => {}, sleep0).then((value) => {
+  const waiter = acquireInstallLock(lockDir).then((value) => {
     release2 = value;
   });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -394,11 +383,10 @@ test("install lock: stale ownership is retained for safe manual recovery", async
   const { root, cleanup } = await makeTempRoot();
   const lockDir = join(root, "install.lock");
   await mkdir(lockDir, { recursive: true, mode: 0o700 });
-  await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schema: 1, token: "stale", pid: 4194303, start: "dead", host: (await import("node:os")).hostname() }));
-  const messages = [];
-  const release = await acquireInstallLock(lockDir, message => messages.push(message), sleep0);
-  assert.equal(release, null, "never steal a stale mkdir lock with an ABA race");
-  assert.match(messages.join("\n"), /Stale managed lock/);
+  await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schemaVersion: 1, token: "stale", pid: 4194303, start: "dead", host: (await import("node:os")).hostname() }));
+  await assert.rejects(acquireInstallLock(lockDir),
+    (error) => /Stale managed lock; verify quiescence and remove manually: /.test(error.message) && error.message.includes(lockDir),
+    "never steal a stale mkdir lock with an ABA race, and name the path to remove");
   assert.ok(await stat(lockDir));
   await cleanup();
 });
@@ -406,12 +394,9 @@ test("install lock: stale ownership is retained for safe manual recovery", async
 test("install lock: times out while a live process holds it", async () => {
   const { root, cleanup } = await makeTempRoot();
   const lockDir = join(root, "install.lock");
-  const release1 = await acquireInstallLock(lockDir, () => {}, sleep0);
+  const release1 = await acquireInstallLock(lockDir);
   assert.ok(release1);
-  const messages = [];
-  const release2 = await acquireInstallLock(lockDir, (message) => messages.push(message), sleep0, 300);
-  assert.equal(release2, null);
-  assert.match(messages.join(" | "), /busy|Timed out waiting/);
+  await assert.rejects(acquireInstallLock(lockDir, 300), /busy|Timed out waiting/);
   await release1();
   await cleanup();
 });
@@ -439,24 +424,6 @@ test("readInstalledRecord validates shape and version match", async () => {
   await cleanup();
 });
 
-test("discoverInstalled returns the newest valid record", async () => {
-  const { root, paths, cleanup } = await makeTempRoot();
-  for (const [version, payload] of [
-    ["v0.8.0", { version: "v0.8.0", resolvedUrl: "u0", sha256: "s0" }],
-    ["v0.8.2", { version: "v0.8.2", resolvedUrl: "u2", sha256: "s2" }],
-  ]) {
-    const dir = join(paths.codeGraphBin, version, "linux-arm64");
-    await mkdir(dir, { recursive: true });
-    await writeFile(join(dir, "asset.json"), JSON.stringify(payload));
-  }
-  // A directory with a broken record must be skipped.
-  await mkdir(join(paths.codeGraphBin, "v0.8.1", "linux-arm64"), { recursive: true });
-  await writeFile(join(paths.codeGraphBin, "v0.8.1", "linux-arm64", "asset.json"), "not json");
-  const discovered = await discoverInstalled(paths.codeGraphBin, "linux-arm64");
-  assert.deepEqual(discovered, { version: "v0.8.2", resolvedUrl: "u2", sha256: "s2" });
-  await cleanup();
-});
-
 // ─── ensureInstalled end-to-end (fakes) ───────────────────────────────
 
 test("ensureInstalled installs a fresh, verified binary and cleans staging", async () => {
@@ -481,6 +448,51 @@ test("ensureInstalled installs a fresh, verified binary and cleans staging", asy
   assert.match(status.join(" | "), /Installed codebase-memory-mcp v0\.8\.1/);
   assert.equal(fixture.downloads.length, 1);
   await fixture.cleanup();
+});
+
+test("H2: install under umask 002 creates owner-only directories the launcher accepts", async () => {
+  const { assertNoSymlink } = await jiti.import("../src/managed-lifecycle.ts");
+  const archiveBytes = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-A" }]);
+  const sha = (await import("node:crypto")).createHash("sha256").update(archiveBytes).digest("hex");
+  const previous = process.umask(0o002);
+  let fixture;
+  try {
+    fixture = await makeFixtureInstall({ archiveBytes, reportsVersion: "0.8.1" });
+    await rm(fixture.paths.codeGraphBin, { recursive: true }); await rm(fixture.paths.codeGraphDownloads, { recursive: true });
+    const result = await fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(sha) });
+    const platformDir = join(fixture.paths.codeGraphBin, "v0.8.1", "linux-arm64");
+    for (const directory of [fixture.paths.codeGraphBin, join(fixture.paths.codeGraphBin, "v0.8.1"), platformDir, fixture.paths.codeGraphDownloads]) {
+      assert.equal((await stat(directory)).mode & 0o077, 0, `${directory} must be owner-only`);
+    }
+    await assertNoSymlink(result.path); // what managed-mcp.mjs runs before starting the server
+  } finally { process.umask(previous); await fixture?.cleanup(); }
+});
+
+test("H2: the curl deny shim directory is owner-only under umask 002", async () => {
+  const { ensureCurlDenyShim } = await jiti.import("../src/code-graph-manager.ts");
+  const { assertNoSymlink } = await jiti.import("../src/managed-lifecycle.ts");
+  const root = await mkdtemp(join(tmpdir(), "cg-shim-umask-"));
+  const previous = process.umask(0o002);
+  try {
+    const shim = join(root, "deny-shims", "curl");
+    await ensureCurlDenyShim(shim, root);
+    assert.equal((await stat(join(root, "deny-shims"))).mode & 0o077, 0);
+    await assertNoSymlink(shim);
+  } finally { process.umask(previous); await rm(root, { recursive: true, force: true }); }
+});
+
+test("L7: ensureInstalled surfaces the stale install lock error with the path to remove", async () => {
+  const archiveBytes = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-A" }]);
+  const sha = (await import("node:crypto")).createHash("sha256").update(archiveBytes).digest("hex");
+  const fixture = await makeFixtureInstall({ archiveBytes, reportsVersion: "0.8.1" });
+  try {
+    const lockDir = join(fixture.paths.codeGraphRoot, "coordination", "install.lock");
+    await mkdir(lockDir, { recursive: true, mode: 0o700 });
+    await writeFile(join(lockDir, "owner.json"), JSON.stringify({ schemaVersion: 1, token: "stale", pid: 4194303, start: "dead", host: (await import("node:os")).hostname() }));
+    await assert.rejects(fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(sha) }),
+      (error) => error.message.includes("Stale managed lock") && error.message.includes(lockDir) && !/Could not acquire/.test(error.message));
+    assert.equal(fixture.downloads.length, 0);
+  } finally { await fixture.cleanup(); }
 });
 
 test("ensureInstalled reuses a verified install without downloading", async () => {
@@ -613,7 +625,6 @@ test("ensureInstalled rejects unsupported platforms before any I/O", async () =>
   const installer = new CodeGraphInstaller({
     paths,
     platform: () => ({ os: "linux", arch: "riscv64" }),
-    sleep: sleep0,
   });
   await assert.rejects(() => installer.ensureInstalled(() => {}), /not supported on linux\/riscv64/);
   const downloads = await readdir(paths.codeGraphDownloads);
@@ -646,7 +657,6 @@ test("ensureInstalled rejects a broken packaged manifest before any I/O", async 
   const installer = new CodeGraphInstaller({
     paths,
     platform: () => ({ os: "linux", arch: "arm64" }),
-    sleep: sleep0,
   });
   await assert.rejects(
     () =>

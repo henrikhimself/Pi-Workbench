@@ -1,4 +1,5 @@
 import { basename, dirname, isAbsolute, join } from "node:path";
+import { requireSchemaVersion } from "./schema-version.js";
 import { pathToFileURL } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { assertNoSymlink, assertWithin, identityLive } from "./managed-lifecycle.js";
@@ -7,15 +8,16 @@ import { PLAYWRIGHT_VERSION, assertPlaywrightId, inspectPlaywrightPath, parsePla
 import { playwrightAssets, verifyPlaywrightPackages } from "./playwright-runtime.js";
 import { installPlaywrightTempRouting } from "./playwright-temp.js";
 
-export interface PlaywrightMcpBootstrapSpec { schema: 1; command: string; args: string[]; root: string; browser: string; home: string; tmp: string }
+export interface PlaywrightMcpBootstrapSpec { schemaVersion: 1; command: string; args: string[]; root: string; browser: string; home: string; tmp: string }
 /** Load the unmodified official CLI in its actual stdio process. The only adapter
  * preserves managed temporary placement despite Linux UNIX-socket name limits.
  */
 export async function bootstrapPlaywrightMcp(raw: unknown): Promise<void> {
-  const fields = ["schema", "command", "args", "root", "browser", "home", "tmp"];
+  requireSchemaVersion(raw, "Playwright MCP bootstrap specification");
+  const fields = ["schemaVersion", "command", "args", "root", "browser", "home", "tmp"];
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(key => !fields.includes(key)) || fields.some(key => !Object.hasOwn(raw, key))) throw new Error("Invalid Playwright MCP bootstrap");
   const spec = raw as PlaywrightMcpBootstrapSpec;
-  if (spec.schema !== 1 || spec.command !== process.execPath || ![spec.root, spec.browser, spec.home, spec.tmp].every(value => typeof value === "string" && isAbsolute(value) && !value.includes("\0")) || !Array.isArray(spec.args) || spec.args.length !== 3 || spec.args[1] !== "--config" || spec.args.some(value => typeof value !== "string")) throw new Error("Invalid Playwright MCP bootstrap paths/arguments");
+  if (spec.command !== process.execPath || ![spec.root, spec.browser, spec.home, spec.tmp].every(value => typeof value === "string" && isAbsolute(value) && !value.includes("\0")) || !Array.isArray(spec.args) || spec.args.length !== 3 || spec.args[1] !== "--config" || spec.args.some(value => typeof value !== "string")) throw new Error("Invalid Playwright MCP bootstrap paths/arguments");
   const entrypoint = spec.args[0], slot = dirname(dirname(dirname(dirname(entrypoint)))), id = basename(slot);
   assertPlaywrightId(id); assertPlaywrightId(process.env.WB_PLAYWRIGHT_SESSION_ID ?? "");
   if (slot !== join(spec.root, "runtimes", PLAYWRIGHT_VERSION, id) || entrypoint !== join(slot, "node_modules", "@playwright", "mcp", "cli.js") || process.env.WB_PLAYWRIGHT_RUNTIME_ID !== id) throw new Error("Playwright MCP bootstrap package identity mismatch");

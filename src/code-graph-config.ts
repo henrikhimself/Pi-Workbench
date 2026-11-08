@@ -1,13 +1,18 @@
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { open, rename as renamePath, rm } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { existsSync, lstatSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
+import { formatStatus } from "./command-messages.js";
+import { TOOL_NAMES } from "./tool-names.js";
 import { parseAssetVersion } from "./code-graph-assets.js";
+import { checkOptIn, readOptInFile } from "./project-opt-in.js";
+import { requireSchemaVersion } from "./schema-version.js";
+import { readStoreIdentity, STORE_MARKER, type CodeGraphStoreIdentity } from "./store-identity.js";
 
 /**
  * Standalone codebase-memory-mcp (CBM) configuration, workspace identity,
- * and per-workspace enablement state.
+ * and per-workspace enablement. A workspace is on when its directory holds `opt-in.json` (written last)
+ * and a matching `workbench-identity.json` (written first, never updated).
  *
  * The data root is `~/.pi/pi-workbench/codebase-memory-mcp` and is separate
  * from Headroom Memory data. Workspace identity reuses the Headroom Memory
@@ -15,8 +20,7 @@ import { parseAssetVersion } from "./code-graph-assets.js";
  * canonical path) without importing or sharing any Memory store.
  */
 
-export const CODE_GRAPH_STATE_SCHEMA = 1;
-export const CODE_GRAPH_STATE_FILE = "state.json";
+export const CODE_GRAPH_OPT_IN_FILE = "opt-in.json";
 export const CBM_CONFIG_FILE = "_config.db";
 
 export interface CodeGraphProject {
@@ -26,37 +30,25 @@ export interface CodeGraphProject {
   identifier: string;
   /** `projects/<identifier>` directory holding all CBM data for this workspace. */
   directory: string;
-  statePath: string;
-}
-
-export interface CodeGraphState {
-  schema: number;
-  workspacePath: string;
-  identifier: string;
-  /** Asset version installed when the workspace was activated, e.g. `v0.8.1`. */
-  version: string;
-  /** Resolved (token-substituted) archive URL used at activation. */
-  resolvedUrl: string;
-  sha256: string;
-  createdAt: string;
-  updatedAt: string;
+  /** Present means on. Written last, when activation has succeeded. */
+  optInPath: string;
+  /** Names the exact backend that wrote the data. Written first, never updated. */
+  identityPath: string;
 }
 
 export type CodeGraphStateProblem =
   | "missing"
   | "not_a_directory"
-  | "malformed_json"
-  | "unknown_schema"
   | "wrong_workspace"
   | "wrong_identifier"
+  | "missing_identity"
   | "invalid_asset_identity"
-  | "invalid_timestamps"
   | "missing_config_db"
   | "missing_index_db"
   | "read_error";
 
 export type CodeGraphStateValidation =
-  | { ok: true; state: CodeGraphState; indexDbs: string[] }
+  | { ok: true; identity: CodeGraphStoreIdentity; indexDbs: string[] }
   | { ok: false; problem: CodeGraphStateProblem; detail: string };
 
 /** Mirrors `canonicalPath` in `src/memory-config.ts`; keep the two in sync. */
@@ -94,7 +86,8 @@ export function resolveCodeGraphProject(
     projectPath,
     identifier,
     directory,
-    statePath: join(directory, CODE_GRAPH_STATE_FILE),
+    optInPath: join(directory, CODE_GRAPH_OPT_IN_FILE),
+    identityPath: join(directory, STORE_MARKER),
   };
 }
 
@@ -154,33 +147,6 @@ export function validateManagedProjectPath(
   return { ok: true };
 }
 
-/** Parse and structurally validate state.json contents. */
-export function parseCodeGraphState(raw: string): CodeGraphState {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("state.json is not valid JSON");
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error("state.json must contain a JSON object");
-  }
-  const state = parsed as Partial<CodeGraphState>;
-  if (typeof state.schema !== "number" || !Number.isInteger(state.schema)) {
-    throw new Error("state.json schema must be an integer");
-  }
-  for (const field of ["workspacePath", "identifier", "version", "resolvedUrl", "sha256", "createdAt", "updatedAt"] as const) {
-    if (typeof state[field] !== "string" || state[field] === "") {
-      throw new Error(`state.json ${field} must be a non-empty string`);
-    }
-  }
-  return state as CodeGraphState;
-}
-
-function isValidTimestamp(value: string): boolean {
-  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value) && !Number.isNaN(Date.parse(value));
-}
-
 function listIndexDbs(directory: string): string[] {
   try {
     return readdirSync(directory, { withFileTypes: true })
@@ -192,24 +158,20 @@ function listIndexDbs(directory: string): string[] {
   }
 }
 
-/**
- * Decide whether the current workspace has a valid enablement state.
- * A valid state requires: a parseable schema-1 `state.json` whose
- * workspace path and identifier match this workspace, an installed asset
- * version, `_config.db`, and at least one CBM index database.
- */
-export function validateCodeGraphState(
-  project: CodeGraphProject,
-  options: { readStateFile?: (path: string) => string | null } = {},
-): CodeGraphStateValidation {
-  const readStateFile = options.readStateFile ?? ((path) => {
-    try {
-      return readFileSync(path, "utf8");
-    } catch {
-      return null;
-    }
-  });
+const IDENTITY_KEYS = ["schemaVersion", "layout", "kind", "codeGraphVersion", "resolvedUrl", "sha256"];
 
+/** The identity this release would write for an installed backend. */
+export function codeGraphIdentity(asset: { version: string; resolvedUrl: string; sha256: string }): CodeGraphStoreIdentity {
+  return { schemaVersion: 1, layout: 1, kind: "code-graph", codeGraphVersion: asset.version, resolvedUrl: asset.resolvedUrl, sha256: asset.sha256 };
+}
+
+/**
+ * Decide whether the current workspace is on. That needs `opt-in.json` for this workspace, a
+ * well-formed `workbench-identity.json`, `_config.db`, and at least one CBM index database.
+ * Files with another `schemaVersion` or unexpected keys are refused as `read_error`; nothing is
+ * read leniently, converted or repaired.
+ */
+export async function validateCodeGraphState(project: CodeGraphProject): Promise<CodeGraphStateValidation> {
   let directoryExists = false;
   let directoryIsDirectory = false;
   try {
@@ -221,39 +183,45 @@ export function validateCodeGraphState(
   if (directoryExists && !directoryIsDirectory) {
     return { ok: false, problem: "not_a_directory", detail: `Expected a project directory at ${project.directory}` };
   }
-  const raw = readStateFile(project.statePath);
-  if (raw === null) {
+  const failure = (problem: CodeGraphStateProblem, error: unknown): CodeGraphStateValidation =>
+    ({ ok: false, problem, detail: error instanceof Error ? error.message : String(error) });
+  let optIn: unknown;
+  try { optIn = await readOptInFile(project.optInPath); } catch (error) { return failure("read_error", error); }
+  if (optIn === null) {
     return {
       ok: false,
       problem: "missing",
       detail: directoryExists
-        ? `Missing ${project.statePath}; project directory exists without a valid marker`
+        ? `No ${CODE_GRAPH_OPT_IN_FILE} in ${project.directory}; Code Graph is off for this workspace`
         : `No code graph data at ${project.directory}`,
     };
   }
-  let state: CodeGraphState;
   try {
-    state = parseCodeGraphState(raw);
-  } catch (error) {
-    return { ok: false, problem: "malformed_json", detail: error instanceof Error ? error.message : String(error) };
+    requireSchemaVersion(optIn, "Project opt-in");
+    const record = optIn as Record<string, unknown>;
+    if (record.projectPath !== project.projectPath) {
+      return { ok: false, problem: "wrong_workspace", detail: `Opt-in belongs to ${String(record.projectPath)}, not ${project.projectPath}` };
+    }
+    if (record.identifier !== project.identifier) {
+      return { ok: false, problem: "wrong_identifier", detail: `Opt-in identifier ${String(record.identifier)} does not match ${project.identifier}` };
+    }
+    checkOptIn(project, optIn);
+  } catch (error) { return failure("read_error", error); }
+  let raw: Record<string, unknown> | null;
+  try { raw = await readStoreIdentity(project.directory); } catch (error) { return failure("read_error", error); }
+  if (raw === null) {
+    return { ok: false, problem: "missing_identity", detail: `Missing ${STORE_MARKER}; the project directory has an opt-in but no record of the backend that wrote it` };
   }
-  if (state.schema !== CODE_GRAPH_STATE_SCHEMA) {
-    return { ok: false, problem: "unknown_schema", detail: `Unsupported state schema ${String(state.schema)}; supported: ${CODE_GRAPH_STATE_SCHEMA}` };
+  if (raw.layout !== 1 || raw.kind !== "code-graph" || Object.keys(raw).some((key) => !IDENTITY_KEYS.includes(key))) {
+    return { ok: false, problem: "read_error", detail: `${STORE_MARKER} is not a Code Graph identity` };
   }
-  if (state.workspacePath !== project.projectPath) {
-    return { ok: false, problem: "wrong_workspace", detail: `State belongs to ${state.workspacePath}, not ${project.projectPath}` };
+  const identity = raw as unknown as CodeGraphStoreIdentity;
+  if (typeof identity.codeGraphVersion !== "string" || !parseAssetVersion(identity.codeGraphVersion)) {
+    return { ok: false, problem: "invalid_asset_identity", detail: `Identity version ${String(identity.codeGraphVersion)} is not vMAJOR.MINOR.PATCH` };
   }
-  if (state.identifier !== project.identifier) {
-    return { ok: false, problem: "wrong_identifier", detail: `State identifier ${state.identifier} does not match ${project.identifier}` };
-  }
-  if (!parseAssetVersion(state.version)) {
-    return { ok: false, problem: "invalid_asset_identity", detail: `State version ${state.version} is not vMAJOR.MINOR.PATCH` };
-  }
-  if (!/^[0-9a-f]{64}$/.test(state.sha256) || !state.resolvedUrl.startsWith("https://")) {
-    return { ok: false, problem: "invalid_asset_identity", detail: "State asset URL/SHA-256 fields are invalid" };
-  }
-  if (!isValidTimestamp(state.createdAt) || !isValidTimestamp(state.updatedAt)) {
-    return { ok: false, problem: "invalid_timestamps", detail: "State timestamps are not valid ISO-8601 strings" };
+  if (typeof identity.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(identity.sha256) ||
+      typeof identity.resolvedUrl !== "string" || !identity.resolvedUrl.startsWith("https://")) {
+    return { ok: false, problem: "invalid_asset_identity", detail: "Identity asset URL/SHA-256 fields are invalid" };
   }
   if (!existsSync(join(project.directory, CBM_CONFIG_FILE))) {
     return { ok: false, problem: "missing_config_db", detail: `Missing ${CBM_CONFIG_FILE}; CBM was not configured for this workspace` };
@@ -266,70 +234,7 @@ export function validateCodeGraphState(
       detail: "No CBM index database found; the index may be corrupted. Check the data directory or run /wb:code-graph off.",
     };
   }
-  return { ok: true, state, indexDbs };
-}
-
-export interface WriteStateOptions {
-  rename?: (oldPath: string, newPath: string) => Promise<void>;
-}
-
-/**
- * Atomically publish state.json: write a sibling temp file, fsync it,
- * rename over state.json, then fsync the directory (best effort). Readers
- * can never observe a partial marker.
- */
-export async function writeCodeGraphStateAtomic(
-  project: CodeGraphProject,
-  state: CodeGraphState,
-  options: WriteStateOptions = {},
-): Promise<void> {
-  const rename = options.rename ?? renamePath;
-  const tempPath = `${project.statePath}.${process.pid}-${Date.now().toString(36)}.tmp`;
-  const handle = await open(tempPath, "w");
-  try {
-    await handle.writeFile(JSON.stringify(state, null, 2) + "\n", "utf8");
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    await rename(tempPath, project.statePath);
-  } catch (error) {
-    await rm(tempPath, { force: true }).catch(() => {});
-    throw error;
-  }
-  try {
-    const dirHandle = await open(dirname(project.statePath), "r");
-    try {
-      await dirHandle.sync();
-    } catch {
-      // Directory fsync is unsupported on some platforms; the rename
-      // already committed the marker.
-    } finally {
-      await dirHandle.close();
-    }
-  } catch {
-    // Directory open failure is non-fatal for the committed rename.
-  }
-}
-
-/** Build state for a freshly activated workspace. */
-export function createCodeGraphState(
-  project: CodeGraphProject,
-  asset: { version: string; resolvedUrl: string; sha256: string },
-  now: () => Date = () => new Date(),
-): CodeGraphState {
-  const timestamp = now().toISOString();
-  return {
-    schema: CODE_GRAPH_STATE_SCHEMA,
-    workspacePath: project.projectPath,
-    identifier: project.identifier,
-    version: asset.version,
-    resolvedUrl: asset.resolvedUrl,
-    sha256: asset.sha256,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
+  return { ok: true, identity, indexDbs };
 }
 
 // ─── Status and diagnostics ───────────────────────────────────────────
@@ -338,13 +243,10 @@ export type CodeGraphStateKind =
   | "off"
   | "enabled"
   | "corrupt"
-  | "unsupported_platform"
   | "binary_missing"
-  | "binary_incompatible"
-  | "index_missing"
   | "mcp_failed"
   | "upgrade_pending"
-  | "deletion_failed";
+  | "locked";
 
 export interface CodeGraphStatusReport {
   kind: CodeGraphStateKind;
@@ -364,48 +266,41 @@ export interface CodeGraphStatusReport {
   recovery?: string;
 }
 
-/** Human-readable status block for /wb:code-graph status. */
+/** Human-readable status block for /wb:code-graph status, in the layout shared by all four tools. */
 export function formatCodeGraphStatus(report: CodeGraphStatusReport): string[] {
-  const label: Record<CodeGraphStateKind, string> = {
+  const state: Record<CodeGraphStateKind, string> = {
     off: "off",
-    enabled: "enabled",
-    corrupt: "corrupt (disabled)",
-    unsupported_platform: "off (unsupported platform)",
+    enabled: "on",
+    corrupt: "off (corrupt data)",
     binary_missing: "off (binary missing)",
-    binary_incompatible: "off (binary incompatible)",
-    index_missing: "off (index missing)",
     mcp_failed: "off (MCP failed)",
-    upgrade_pending: "off (migration/reindex required)",
-    deletion_failed: "off (deletion failed)",
+    upgrade_pending: "refused (data written by another version)",
+    locked: "off (project locked)",
   };
-  const lines = [
-    "Code Graph (codebase-memory-mcp)",
-    `  State:     ${label[report.kind]}`,
-    `  Workspace: ${report.workspacePath}`,
-    `  Project:   ${report.identifier}`,
-    `  Data:      ${report.projectDirectory}`,
-    `  Platform:  ${report.platform}`,
-  ];
-  if (report.manifestVersion) lines.push(`  Packaged:  ${report.manifestVersion}`);
-  if (report.installedVersion) lines.push(`  Installed: ${report.installedVersion}`);
-  if (typeof report.mcpRegistered === "boolean") {
-    lines.push(`  MCP:       ${report.mcpRegistered ? "registered" : "not registered"}`);
-  }
-  if (report.indexSummary) lines.push(`  Index:     ${report.indexSummary}`);
+  // A refused project shows the shared refusal text as its problem; every other kind shows the last error.
+  const refused = report.kind === "upgrade_pending";
+  const problem = refused ? report.recovery : report.lastError;
+  const details = [`Platform: ${report.platform}`];
+  if (report.indexSummary) details.push(`Index: ${report.indexSummary}`);
   if (report.watcher) {
-    lines.push(
-      `  Watcher:   ${
-        report.watcher === "git"
-          ? "Git watcher enabled"
-          : report.watcher === "disabled_non_git"
-            ? "disabled (non-Git workspace)"
-            : "unknown"
-      }`,
-    );
+    details.push(`Watcher: ${
+      report.watcher === "git" ? "Git watcher enabled" : report.watcher === "disabled_non_git" ? "disabled (non-Git workspace)" : "unknown"
+    }`);
   }
-  if (report.lastError) lines.push(`  Last error: ${report.lastError}`);
-  if (report.recovery) lines.push(`  Recovery:  ${report.recovery}`);
-  return lines;
+  if (refused && report.lastError) details.push(`Last error: ${report.lastError}`);
+  if (!refused && report.recovery) details.push(`Recovery: ${report.recovery}`);
+  return formatStatus(TOOL_NAMES.codeGraph, {
+    state: state[report.kind],
+    projectPath: report.workspacePath,
+    identifier: report.identifier,
+    data: existsSync(report.projectDirectory) ? report.projectDirectory : null,
+    ...(report.manifestVersion || report.installedVersion
+      ? { version: { installed: report.installedVersion ?? null, ...(report.manifestVersion ? { expected: report.manifestVersion } : {}) } }
+      : {}),
+    ...(typeof report.mcpRegistered === "boolean" ? { link: report.mcpRegistered ? "registered" : "not registered" } : {}),
+    ...(problem ? { problem } : {}),
+    details,
+  });
 }
 
 export function isGitWorkspace(projectPath: string): boolean {

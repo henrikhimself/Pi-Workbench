@@ -17,13 +17,13 @@ async function fixture(action) {
 
 test("compression absent opt-in and off are read-only; state is per canonical workspace", async () => fixture(async (home, paths) => {
   const a = resolveCompressionProject(join(home, "a"), paths), b = resolveCompressionProject(join(home, "b"), paths);
-  assert.notEqual(a.statePath, b.statePath);
+  assert.notEqual(a.optInPath, b.optInPath);
   assert.equal(await compressionOptedIn(a), false);
   await setCompressionOptIn(a, false);
   assert.equal(existsSync(paths.root), false, "off must not create managed storage");
   await mkdir(join(home, "a"));
   await symlink(join(home, "a"), join(home, "alias"), "dir");
-  assert.equal(resolveCompressionProject(join(home, "alias"), paths).statePath, a.statePath);
+  assert.equal(resolveCompressionProject(join(home, "alias"), paths).optInPath, a.optInPath);
   await setCompressionOptIn(a, true);
   assert.equal(await compressionOptedIn(a), true);
   assert.equal(await compressionOptedIn(b), false);
@@ -55,22 +55,22 @@ for (const fault of ["malformed", "wrong workspace", "unknown schema", "false ma
   test(`compression ${fault} state fails closed without rewriting`, async () => fixture(async (home, paths) => {
     const project = resolveCompressionProject(home, paths);
     await setCompressionOptIn(project, true);
-    const original = JSON.parse(await readFile(project.statePath, "utf8"));
-    if (fault === "malformed") await writeFile(project.statePath, "not-json");
-    if (fault === "wrong workspace") await writeFile(project.statePath, JSON.stringify({ ...original, projectPath: home + "-other" }));
-    if (fault === "unknown schema") await writeFile(project.statePath, JSON.stringify({ ...original, schemaVersion: 99 }));
-    if (fault === "false marker") await writeFile(project.statePath, JSON.stringify({ ...original, enabled: false }));
-    if (fault === "unsafe permissions") await chmod(project.statePath, 0o644);
+    const original = JSON.parse(await readFile(project.optInPath, "utf8"));
+    if (fault === "malformed") await writeFile(project.optInPath, "not-json");
+    if (fault === "wrong workspace") await writeFile(project.optInPath, JSON.stringify({ ...original, projectPath: home + "-other" }));
+    if (fault === "unknown schema") await writeFile(project.optInPath, JSON.stringify({ ...original, schemaVersion: 99 }));
+    if (fault === "false marker") await writeFile(project.optInPath, JSON.stringify({ ...original, enabled: false }));
+    if (fault === "unsafe permissions") await chmod(project.optInPath, 0o644);
     if (fault === "symlink") {
-      await rm(project.statePath);
+      await rm(project.optInPath);
       const target = join(home, "unrelated.json"); await writeFile(target, JSON.stringify(original));
-      await symlink(target, project.statePath);
+      await symlink(target, project.optInPath);
     }
-    const before = await readFile(project.statePath, "utf8");
+    const before = await readFile(project.optInPath, "utf8");
     await assert.rejects(compressionOptedIn(project));
     await assert.rejects(setCompressionOptIn(project, true));
     await assert.rejects(setCompressionOptIn(project, false));
-    assert.equal(await readFile(project.statePath, "utf8"), before);
+    assert.equal(await readFile(project.optInPath, "utf8"), before);
   }));
 }
 

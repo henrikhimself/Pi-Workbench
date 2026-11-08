@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 const START = "# >>> pi-workbench Headroom Memory >>>";
 const END = "# <<< pi-workbench Headroom Memory <<<";
 const DRIVER = fileURLToPath(new URL("./memory-merge-theirs.mjs", import.meta.url));
+/** Workbench-specific name: a user's own `theirs` driver is never reused or overwritten. */
+export const MEMORY_MERGE_DRIVER = "pi-workbench-theirs";
 
 function runGit(cwd: string, args: string[]): Promise<string> {
   return new Promise((resolvePromise, reject) => {
@@ -30,7 +32,7 @@ export async function configureMemoryGit(projectPath: string, exportDirectory?: 
     try { current = await readFile(attributes, "utf8"); } catch (error: unknown) {
       if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) throw error;
     }
-    const block = `${START}\n${pattern.replaceAll("\\", "/")}/** merge=theirs\n${END}\n`;
+    const block = `${START}\n${pattern.replaceAll("\\", "/")}/** merge=${MEMORY_MERGE_DRIVER}\n${END}\n`;
     const begin = current.indexOf(START);
     const end = current.indexOf(END);
     if (begin !== -1 && end !== -1 && end >= begin) {
@@ -42,11 +44,15 @@ export async function configureMemoryGit(projectPath: string, exportDirectory?: 
       return "Malformed pi-workbench .gitattributes block; merge attributes were not changed.";
     }
     await writeFile(attributes, current, "utf8");
-    try {
-      await runGit(root, ["config", "--local", "--get", "merge.theirs.driver"]);
-    } catch {
-      const command = `"${process.execPath}" "${DRIVER}" %A %B`;
-      await runGit(root, ["config", "--local", "merge.theirs.driver", command]);
+    // The path of Node and of this extension is part of the command; refresh it whenever it changed
+    // (Node upgrade, nvm switch, extension moved), so the driver never points at a dead path.
+    const command = `"${process.execPath}" "${DRIVER}" %A %B`;
+    const key = `merge.${MEMORY_MERGE_DRIVER}.driver`;
+    let configured: string | null = null;
+    try { configured = await runGit(root, ["config", "--local", "--get", key]); } catch { /* not configured yet */ }
+    if (configured !== command) {
+      await runGit(root, ["config", "--local", key, command]);
+      await runGit(root, ["config", "--local", `merge.${MEMORY_MERGE_DRIVER}.name`, "pi-workbench Headroom Memory: keep incoming record"]);
     }
     return null;
   } catch (error) {

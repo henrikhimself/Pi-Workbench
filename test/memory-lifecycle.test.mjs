@@ -33,7 +33,7 @@ test("unmarked database in new namespace is rejected rather than adopted", () =>
   await manager.ensureRoot(); await mkdir(manager.store.directory, { recursive: true, mode: 0o700 });
   await writeFile(manager.store.databasePath, "unknown database");
   assert.equal(manager.enabled, false);
-  await assert.rejects(manager.createStore(), /Unmarked Headroom store/);
+  await assert.rejects(manager.createStore(), /Headroom Memory data was written by another version/);
   assert.equal(await readFile(manager.store.databasePath, "utf8"), "unknown database");
   assert.equal(pythonCalls(), 0);
 }));
@@ -44,7 +44,7 @@ test("incompatible Memory identity fails before Python/model/store opening", () 
   const identity = JSON.parse(await readFile(marker, "utf8")); identity.headroomVersion = "0.1.0";
   await writeFile(marker, JSON.stringify(identity)); const messages = [];
   assert.equal(await manager.prepare(message => messages.push(message)), null);
-  assert.match(messages.join("\n"), /verified staged migration/); assert.equal(pythonCalls(), 0);
+  assert.match(messages.join("\n"), /Headroom Memory data was written by another version, which this release does not read\. It was left unchanged\./); assert.equal(pythonCalls(), 0);
 }));
 
 test("live Memory peer protects store from deletion and allows later safe retry", () => fixture(async ({ manager }) => {
@@ -107,7 +107,7 @@ test("embedding asset change cannot reuse existing vectors even at same package/
   const original = await readFile(marker, "utf8");
   modelHash = "d".repeat(64); const messages = [];
   assert.equal(await manager.prepare(message => messages.push(message)), null);
-  assert.match(messages.join("\n"), /verified staged migration/);
+  assert.match(messages.join("\n"), /Headroom Memory data was written by another version, which this release does not read\. It was left unchanged\./);
   assert.equal(await readFile(marker, "utf8"), original);
   assert.equal(await readFile(manager.store.databasePath, "utf8"), "existing vector/data sentinel");
 }));

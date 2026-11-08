@@ -1,15 +1,18 @@
 import { lstat, rm } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
 import { acquireManagedLock, createConsumerLease, syncDirectory, type ConsumerLease } from "./managed-lifecycle.js";
+import { enabledMessage, formatStatus, offMessage } from "./command-messages.js";
+import { TOOL_NAMES } from "./tool-names.js";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import { createPlaywrightVisionConfigReader, ensurePlaywrightUserConfig, formatPlaywrightVisionConfig, type PlaywrightVisionConfigState } from "./playwright-vision-config.js";
-import { PLAYWRIGHT_ENGINE_VERSION, PLAYWRIGHT_SERVER_NAME, PLAYWRIGHT_VERSION, assertPlaywrightProject, inspectPlaywrightPath, playwrightChildEnvironment, playwrightOptedIn, playwrightPiEnvironment, playwrightWorkspaceLock, preparePlaywrightSession, readPlaywrightJson, resolvePlaywrightProject, resolvePlaywrightSession, setPlaywrightOptIn, type PlaywrightProject, type PlaywrightRuntimeRecord, type PlaywrightSession } from "./playwright-config.js";
+import { PLAYWRIGHT_ENGINE_VERSION, PLAYWRIGHT_SERVER_NAME, PLAYWRIGHT_VERSION, assertPlaywrightProject, inspectPlaywrightPath, playwrightChildEnvironment, playwrightOptedIn, playwrightPiEnvironment, playwrightWorkspaceLock, preparePlaywrightSession, readPlaywrightJson, resolvePlaywrightProject, resolvePlaywrightSession, enablePlaywrightOptIn, type PlaywrightProject, type PlaywrightRuntimeRecord, type PlaywrightSession } from "./playwright-config.js";
 import { PlaywrightRuntime, playwrightConsumers, type PlaywrightProgress } from "./playwright-runtime.js";
 import { attestPlaywrightWitnesses, readPlaywrightOwnership, retirePlaywrightOwnership } from "./playwright-ownership.js";
 import { PlaywrightOwnedTree } from "./playwright-tree.js";
 import { PLAYWRIGHT_NORMAL_TOOLS, PLAYWRIGHT_TOOL_EXPOSURE } from "./playwright-policy.js";
+import { escapeMcpEnv } from "./mcp-env.js";
 
 const launcher = fileURLToPath(new URL("./playwright-launcher.mjs", import.meta.url));
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -40,7 +43,10 @@ export interface PlaywrightStatus {
   tools: string[];
   selected: PlaywrightRuntimeRecord | null;
   workspace: string;
+  identifier: string;
   directory: string;
+  /** Whether the project data directory exists. */
+  dataPresent: boolean;
   session: string | null;
   consumers: number;
   failures: string[];
@@ -108,7 +114,7 @@ export class PlaywrightManager {
       if (this.current() && await this.observe()) { this.fence(epoch, signal); return; }
       this.fence(epoch, signal);
       if (this.registered) { this.unregister(); await this.stopOwned(); this.fence(epoch, signal); }
-      if (explicit) await setPlaywrightOptIn(this.project, true, signal);
+      if (explicit) await enablePlaywrightOptIn(this.project, signal);
       if (explicit) { try { await ensurePlaywrightUserConfig(this.paths.playwrightConfig); } catch { this.progress("playwright.json template could not be created; vision bridge stays off"); } }
       if (!await playwrightOptedIn(this.project)) return;
       this.fence(epoch, signal);
@@ -153,7 +159,7 @@ export class PlaywrightManager {
       this.fence(epoch, signal);
       if (!this.current()) throw new Error("Managed Playwright registration was overridden during startup");
       this.failure = undefined;
-      this.progress("Playwright registered; browser opens lazily on tool use");
+      this.progress(enabledMessage(TOOL_NAMES.playwright));
     } catch (error) {
       let cleanup: unknown;
       try { this.unregister(); await this.stopOwned(); } catch (failure) { cleanup = failure; }
@@ -163,9 +169,9 @@ export class PlaywrightManager {
     } finally { await runtimeLease?.release(); await workspaceLease?.release(); }
   }
   private serverConfig(session: PlaywrightSession, runtime: PlaywrightRuntimeRecord): McpServerConfig {
-    const spec = { schema: 1, home: dirname(dirname(this.paths.root)), workspace: this.project.projectPath, sessionId: session.id, runtimeId: runtime.id, command: runtime.node.path, args: [runtime.entrypoint, "--config", session.configPath] };
-    const env = playwrightPiEnvironment(playwrightChildEnvironment(session, runtime, this.paths.playwrightNpmCache));
-    if ([runtime.node.path, launcher, JSON.stringify(spec), this.project.projectPath, ...Object.values(env)].some(value => value.includes("${") || value.startsWith("!"))) throw new Error("Unsafe MCP interpolation in Playwright managed paths/environment");
+    const spec = { schemaVersion: 1, home: dirname(dirname(this.paths.root)), workspace: this.project.projectPath, sessionId: session.id, runtimeId: runtime.id, command: runtime.node.path, args: [runtime.entrypoint, "--config", session.configPath] };
+    // Pi interpolates `$`/`!` in registered env values: escape them all instead of rejecting paths.
+    const env = escapeMcpEnv(playwrightPiEnvironment(playwrightChildEnvironment(session, runtime, this.paths.playwrightNpmCache)));
     return { type: "stdio", command: runtime.node.path, args: [launcher, JSON.stringify(spec)], cwd: this.project.projectPath, env,
       exposure: "direct", toolExposure: { ...PLAYWRIGHT_TOOL_EXPOSURE }, timeout: 120,
       description: "Managed isolated headless Chromium; standard Playwright tools plus vision, sandbox required." };
@@ -242,7 +248,7 @@ export class PlaywrightManager {
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
         await syncDirectory(this.paths.playwrightProjects);
         this.session = undefined; this.evidence = undefined; this.config = undefined;
-        this.failure = undefined; this.progress("Playwright off; workspace data deleted, shared installation retained");
+        this.failure = undefined; this.progress(offMessage(TOOL_NAMES.playwright, "deleted"));
         return true;
       } finally { await unlock(); }
     } catch (error) { this.failure = error instanceof Error ? error.message : "Playwright off incomplete"; throw error; }
@@ -262,26 +268,34 @@ export class PlaywrightManager {
       }
     } catch { failures.push("Owned session evidence invalid or unsafe"); }
     const vision = await this.visionConfig();
+    const dataPresent = await lstat(this.project.directory).then(() => true, () => false);
     return { intent, vision, registered: this.registered, currentRegistration: this.current(), ownedChild,
       tools: this.current() ? (this.deps.tools?.() ?? []).filter(name => PLAYWRIGHT_NORMAL_TOOLS.some(tool => name === `mcp__playwright__${tool}`)) : [],
-      selected, workspace: this.project.projectPath, directory: this.project.directory, session: this.session?.directory ?? null, consumers, failures };
+      selected, workspace: this.project.projectPath, identifier: this.project.identifier, directory: this.project.directory, dataPresent, session: this.session?.directory ?? null, consumers, failures };
   }
 }
 
 export function formatPlaywrightStatus(status: PlaywrightStatus): string {
-  return [
-    `Playwright saved intent: ${status.intent}`, `Workspace: ${status.workspace}`,
+  const details = [
     `Target: @playwright/mcp ${PLAYWRIGHT_VERSION}; playwright/core ${PLAYWRIGHT_ENGINE_VERSION}`,
     `Selected runtime: ${status.selected ? `${status.selected.version} / ${status.selected.id}` : "none"}`,
-    `Managed registration: ${status.currentRegistration ? "current" : status.registered ? "overridden/unavailable" : "not registered"}`,
     `Owned MCP child: ${status.ownedChild ? "observed running" : "not observed running"}; active workspace consumers: ${status.consumers}`,
     `Observed non-hidden tool registrations: ${status.tools.length ? status.tools.join(", ") : "none"}`,
     `Last readiness: ${status.selected ? `${status.selected.validatedAt}; Chromium ${status.selected.browserVersion}` : "none"}`,
     "Policy: headless isolated Chromium; sandbox required; vision on; WebMCP off; unsafe server code hidden; idle timeout 0; unrestricted HTTP(S)",
-    ...(status.vision ? [formatPlaywrightVisionConfig(status.vision)] : []),
+    ...(status.vision ? formatPlaywrightVisionConfig(status.vision).split("\n") : []),
     "Browser state: lazy; status does not launch a browser or prove one is open",
-    `Workspace data: ${status.directory}`, `Session: ${status.session ?? "none"}`,
+    `Session: ${status.session ?? "none"}`,
     "Artifacts/diagnostics retained until confirmed workspace off; no quota, TTL, or automatic artifact/runtime GC",
-    ...status.failures.map(failure => `Failure/blocker: ${failure}`),
-  ].join("\n");
+  ];
+  return formatStatus(TOOL_NAMES.playwright, {
+    state: status.intent === "on" ? "on" : status.intent === "off" ? "off" : "refused (project opt-in invalid or unsafe)",
+    projectPath: status.workspace,
+    identifier: status.identifier,
+    data: status.dataPresent ? status.directory : null,
+    version: { installed: status.selected?.version ?? null, expected: PLAYWRIGHT_VERSION },
+    link: status.currentRegistration ? "registered" : status.registered ? "registered (overridden or unavailable)" : "not registered",
+    ...(status.failures.length ? { problem: status.failures.join("; ") } : {}),
+    details,
+  }).join("\n");
 }

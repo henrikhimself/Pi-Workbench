@@ -51,8 +51,8 @@ export async function cliAcceptance({ cwd, extension, modelId, loaded, wait, sea
   const text = () => stripVTControlCharacters(raw);
   try {
     await wait(() => text().includes(modelId) && /✓ Headroom(?! Memory)/.test(text()), "interactive real PTY owned proxy readiness", 30000);
-    terminal.stdin.write("/wb:headroom-health\r");
-    await wait(() => text().includes("online (managed)"), "interactive owned health command", 20000);
+    terminal.stdin.write("/wb:headroom-proxy status\r");
+    await wait(() => /Link:\s+running/.test(text()) && /Version:\s+\S+ \(expected \S+\)/.test(text()), "interactive owned proxy status", 20000);
     terminal.stdin.write("/wb:study-mode on\r");
     await wait(() => text().includes("Study Mode enabled."), "interactive Study Mode on", 10000);
     terminal.stdin.write("/wb:study-mode off\r");
@@ -60,7 +60,7 @@ export async function cliAcceptance({ cwd, extension, modelId, loaded, wait, sea
     terminal.stdin.write("\x04");
     await wait(() => exited, "interactive graceful exit", 15000);
     assert.equal((await exit).code, 0, errors);
-    checks.push("real interactive PTY startup, managed health, branch Study Mode on/off and graceful exit without inference");
+    checks.push("real interactive PTY startup, managed proxy status, branch Study Mode on/off and graceful exit without inference");
   } catch (error) { console.error(JSON.stringify({ terminalTail: text().slice(-8000), errors })); throw error; }
   finally { if (!exited) { terminal.kill("SIGTERM"); await Promise.race([exit, new Promise(resolve => setTimeout(resolve, 3000))]); } }
   return checks;

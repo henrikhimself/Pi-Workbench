@@ -1,8 +1,10 @@
 import { execFile } from "node:child_process";
+import { requireSchemaVersion } from "./schema-version.js";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, statfs } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, open, readFile, readdir, rename, rm, statfs } from "node:fs/promises";
 
 /** Small shared filesystem/consumer primitives, not a rollback engine. */
 export function assertWithin(root: string, target: string): void {
@@ -31,10 +33,15 @@ export async function assertNoSymlink(path: string): Promise<void> {
   }
 }
 
-/** Use a NEW private namespace. Repair self-healing group/other permission bits; */
+/**
+ * Use a NEW private namespace. Group/other permission bits inside the managed root are self-healing:
+ * every existing component is verified as an owned, real directory and tightened to owner-only, so
+ * directories an earlier version left at 775 are repaired. Ancestors of the root are never touched and
+ * must still pass `assertNoSymlink`.
+ */
 export async function ensurePrivateDirectory(root: string, target = root): Promise<void> {
   assertWithin(root, target);
-  await assertNoSymlink(target);
+  await assertNoSymlink(dirname(resolve(root)));
   await mkdir(root, { recursive: true, mode: 0o700 });
   const rel = relative(root, target);
   let current = root;
@@ -42,17 +49,27 @@ export async function ensurePrivateDirectory(root: string, target = root): Promi
     if (component) current = join(current, component);
     try { await mkdir(current, { mode: 0o700 }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const info = await lstat(current);
-    if (!info.isDirectory() || info.isSymbolicLink() ||
-        (process.getuid && info.uid !== process.getuid())) {
-      throw new Error(`Unsafe managed directory (owner, or type): ${current}`);
-    }
-    // Group/other access bits are self-healing: tighten to owner-only. Also
-    // reclaims results mkdir masked by a permissive umask.
-    if (process.platform !== "win32" && (info.mode & 0o077) !== 0) {
-      await chmod(current, 0o700);
-    }
+    await verifyAndTightenDirectory(current);
   }
+  await assertNoSymlink(target);
+}
+
+/** Owner and type check, then owner-only mode, on one directory without following a symlink swapped in meanwhile. */
+async function verifyAndTightenDirectory(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink()) throw new Error(`Symlink in managed path: ${path}`);
+  if (!info.isDirectory() || (process.getuid && info.uid !== process.getuid())) {
+    throw new Error(`Unsafe managed directory (owner, or type): ${path}`);
+  }
+  if (process.platform === "win32" || (info.mode & 0o077) === 0) return;
+  const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    const opened = await handle.stat();
+    if (opened.ino !== info.ino || opened.dev !== info.dev || (process.getuid && opened.uid !== process.getuid())) {
+      throw new Error(`Unsafe managed directory (changed during repair): ${path}`);
+    }
+    await handle.chmod(0o700);
+  } finally { await handle.close(); }
 }
 
 export async function syncDirectory(directory: string): Promise<void> {
@@ -77,6 +94,13 @@ export async function publishJson(root: string, path: string, value: unknown): P
 }
 
 export interface ProcessIdentity { pid: number; start: string; host: string }
+/** `ps -o lstart=` prints local time in the caller's locale. Node and the Python proxy monitor
+ * both compare these strings, so both must run `ps` with the same fixed locale and time zone
+ * (the monitor's own environment is filtered and has neither TZ nor LC_TIME). */
+export function psEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...source, LC_ALL: "C", TZ: "UTC" };
+}
+
 export type IdentityReader = (pid: number) => Promise<string | null>;
 
 /** OS process birth identity, not merely a reusable PID. Failure is fail-closed. */
@@ -94,7 +118,7 @@ export const processBirth: IdentityReader = async (pid) => {
     const args = process.platform === "win32"
       ? ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`]
       : ["-p", String(pid), "-o", "lstart="];
-    execFile(command, args, { timeout: 5_000, maxBuffer: 4096 }, (error, stdout) => {
+    execFile(command, args, { timeout: 5_000, maxBuffer: 4096, env: process.platform === "win32" ? process.env : psEnvironment() }, (error, stdout) => {
       done(!error && stdout.trim() ? `${process.platform}:${stdout.trim()}` : null);
     });
   });
@@ -111,9 +135,19 @@ export async function ownIdentity(readIdentity: IdentityReader = processBirth): 
   return { pid: process.pid, start, host: hostname() };
 }
 
+/** Whether the recorded process is still the same running process.
+ *
+ * `host` is recorded for diagnostics only. Managed state is local to this machine (loopback
+ * port, PID and birth-time records; shared or network-mounted state directories are
+ * unsupported), so the PID plus its birth identity is authoritative whatever the host is
+ * called now. Treating a different host name as fatal would let a renamed laptop (hostname
+ * changes between networks) block every activation until someone cleaned up by hand. A record
+ * written under another name is live only if that exact process still exists here, and stale
+ * otherwise. */
 export async function identityLive(owner: ProcessIdentity, readIdentity: IdentityReader = processBirth): Promise<boolean> {
-  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !owner.start || owner.host !== hostname()) {
-    throw new Error("Unknown or foreign managed consumer identity");
+  if (!owner || !Number.isSafeInteger(owner.pid) || owner.pid <= 0 || !owner.start ||
+      typeof owner.host !== "string" || !owner.host) {
+    throw new Error("Unknown managed consumer identity");
   }
   if (!processExists(owner.pid)) return false;
   const current = await readIdentity(owner.pid);
@@ -143,7 +177,7 @@ export async function acquireManagedLock(root: string, name: string, options: Lo
     try {
       await mkdir(path, { mode: 0o700 });
       created = true;
-      await publishJson(root, join(path, "owner.json"), { schema: 1, token, ...owner });
+      await publishJson(root, join(path, "owner.json"), { schemaVersion: 1, token, ...owner });
       return async () => {
         const record = JSON.parse(await readFile(join(path, "owner.json"), "utf8"));
         if (record.token !== token) throw new Error(`Managed lock ownership changed: ${path}`);
@@ -154,7 +188,8 @@ export async function acquireManagedLock(root: string, name: string, options: Lo
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       try {
         const record = JSON.parse(await readFile(join(path, "owner.json"), "utf8"));
-        if (record.schema !== 1 || typeof record.token !== "string") throw new Error("Invalid owner record");
+        requireSchemaVersion(record, "Managed lock owner record");
+        if (typeof record.token !== "string") throw new Error("Invalid owner record");
         if (!await identityLive(record, options.readIdentity)) {
           // Automatically rm/rename-stealing a mkdir lock has an ABA race with a
           // newly acquired lock. Preserve it; do not pretend PID checks fix that.
@@ -173,12 +208,18 @@ export interface ConsumerLease { token: string; release(): Promise<void> }
 export async function createConsumerLease(root: string, resource: string): Promise<ConsumerLease> {
   const token = randomUUID();
   const path = join(root, `${token}.json`);
-  await publishJson(root, path, { schema: 1, token, resource, ...await ownIdentity() });
+  await publishJson(root, path, { schemaVersion: 1, token, resource, ...await ownIdentity() });
   let released = false;
   return { token, release: async () => {
     if (released) return;
     await assertNoSymlink(path);
-    const record = JSON.parse(await readFile(path, "utf8"));
+    let record;
+    try { record = JSON.parse(await readFile(path, "utf8")); }
+    catch (error) {
+      // Already removed by dead-lease cleanup: nothing left to release.
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") { released = true; return; }
+      throw error;
+    }
     if (record.token !== token) throw new Error("Consumer lease ownership changed");
     await rm(path); released = true;
   } };
@@ -195,14 +236,29 @@ export async function activeConsumers(root: string, resource?: string): Promise<
     if (!/^[0-9a-f-]+\.json$/.test(name)) throw new Error(`Unknown managed lease entry: ${name}`);
     const path = join(root, name);
     await assertNoSymlink(path);
-    const info = await lstat(path);
-    if (!info.isFile() || (process.getuid && info.uid !== process.getuid()) ||
-        (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw new Error(`Unsafe lease: ${path}`);
-    const record = JSON.parse(await readFile(path, "utf8"));
-    if (record.schema !== 1 || `${record.token}.json` !== name || typeof record.resource !== "string") {
+    let record;
+    try {
+      const info = await lstat(path);
+      if (!info.isFile() || (process.getuid && info.uid !== process.getuid()) ||
+          (process.platform !== "win32" && (info.mode & 0o077) !== 0)) throw new Error(`Unsafe lease: ${path}`);
+      record = JSON.parse(await readFile(path, "utf8"));
+    } catch (error) {
+      // Its owner released the lease after the directory listing: nothing to count.
+      if ((error as NodeJS.ErrnoException)?.code === "ENOENT") continue;
+      throw error;
+    }
+    requireSchemaVersion(record, "Managed lease");
+    if (`${record.token}.json` !== name || typeof record.resource !== "string") {
       throw new Error(`Invalid managed lease: ${path}`);
     }
-    if (await identityLive(record) && (!resource || record.resource === resource)) active.push(record.token);
+    if (!await identityLive(record)) {
+      // Provably dead owner (process gone or PID reused). Leases are unique per token and only
+      // their owner releases them, so removing one has none of the ABA race that makes lock
+      // stealing unsafe. Locks are never removed this way.
+      await rm(path, { force: true });
+      continue;
+    }
+    if (!resource || record.resource === resource) active.push(record.token);
   }
   return active;
 }
@@ -226,81 +282,4 @@ export async function requireDiskSpace(path: string, requiredBytes: number,
   if (!Number.isFinite(available) || available < requiredBytes) {
     throw new Error(`Insufficient or unknown safe disk capacity: need ${requiredBytes}, available ${available}`);
   }
-}
-
-export interface SwapOptions { rename?: typeof rename }
-/** Caller must quiesce writers and validate staging first. Backup retained on success. */
-export async function promoteDirectory(root: string, live: string, staging: string,
-  backup: string, options: SwapOptions = {}): Promise<void> {
-  for (const path of [live, staging, backup]) { assertWithin(root, path); await assertNoSymlink(path); }
-  const paths = [live, staging, backup].map((path) => resolve(path));
-  if (new Set(paths).size !== 3 || paths.some((a) => paths.some((b) =>
-    a !== b && !relative(a, b).startsWith(`..${sep}`) && relative(a, b) !== ".."))) {
-    throw new Error("Overlapping promotion paths");
-  }
-  try { await lstat(backup); throw new Error(`Backup already exists: ${backup}`); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const devices = await Promise.all([live, staging, dirname(backup)].map(path => lstat(path).then(info => info.dev)));
-  if (new Set(devices).size !== 1) throw new Error("Cross-device promotion deferred; original data unchanged");
-  const move = options.rename ?? rename;
-  await move(live, backup);
-  try { await move(staging, live); }
-  catch (error) {
-    try { await move(backup, live); }
-    catch (restoreError) {
-      throw new Error(`Publication and restoration failed; preserve backup ${backup} and staging ${staging}: ${String(error)}; ${String(restoreError)}`);
-    }
-    throw new Error(`Publication failed; original restored: ${String(error)}`);
-  }
-  await syncDirectory(dirname(live));
-}
-
-/** Linux-only Code Graph guard for pre-refactor clients without our leases.
- * Inspect only same-user process metadata; never expose environment contents.
- * Registered new clients additionally use activation locks and birth-identity leases.
- */
-export async function managedCacheUsers(cache: string): Promise<number[]> {
-  if (process.platform !== "linux") throw new Error("Cannot establish Linux Code Graph writer quiescence");
-  const target = resolve(cache);
-  const users = new Set<number>();
-  for (const name of await readdir("/proc")) {
-    if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
-    const directory = `/proc/${name}`;
-    try {
-      const info = await lstat(directory);
-      if (process.getuid && info.uid !== process.getuid()) continue;
-      const argv = (await readFile(join(directory, "cmdline"), "utf8")).split("\0");
-      const isCbm = argv.some((arg) => arg.endsWith("/codebase-memory-mcp") || arg === "--cbm-daemon-internal");
-      // Arbitrary unrelated processes are not managed store consumers. Some are
-      // intentionally non-dumpable; their private FDs must not be inspected.
-      if (!isCbm) continue;
-      {
-        const environment = (await readFile(join(directory, "environ"), "utf8")).split("\0");
-        const configured = environment.find((entry) => entry.startsWith("CBM_CACHE_DIR="))?.slice(14);
-        if (configured) {
-          const configuredRoot = await realpath(configured).catch(() => resolve(configured));
-          if (configuredRoot === target) users.add(Number(name));
-          // CBM binds a single cache per daemon domain. Do not inspect FDs of
-          // unrelated workspaces (including processes concurrently exiting).
-          continue;
-        }
-      }
-      // Catch CBM database handles even when its cache env uses a path alias.
-      for (const fd of await readdir(join(directory, "fd"))) {
-        try {
-          const path = await readlink(join(directory, "fd", fd));
-          if (path === target || path.startsWith(`${target}${sep}`)) users.add(Number(name));
-        } catch (error) {
-          if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
-        }
-      }
-    } catch (error) {
-      const current = await processBirth(Number(name));
-      if (!current || current.startsWith("linux-dead:")) continue;
-      if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-        throw new Error(`Cannot establish writer quiescence for PID ${name}: ${(error as Error).message}`);
-      }
-    }
-  }
-  return [...users];
 }

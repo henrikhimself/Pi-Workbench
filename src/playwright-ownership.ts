@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { requireSchemaVersion } from "./schema-version.js";
 import { hostname } from "node:os";
 import { identityLive, syncDirectory, type ProcessIdentity } from "./managed-lifecycle.js";
 import { assertPlaywrightId, readPlaywrightJson, type PlaywrightSession } from "./playwright-config.js";
@@ -6,7 +7,7 @@ import { readFile, rm } from "node:fs/promises";
 import { PlaywrightOwnedTree, type PlaywrightTreeScope } from "./playwright-tree.js";
 
 export interface PlaywrightOwnership {
-  schema: 1; sessionId: string; runtimeId: string; runtimeVersion: string; group: number;
+  schemaVersion: 1; sessionId: string; runtimeId: string; runtimeVersion: string; group: number;
   supervisor: ProcessIdentity; child: ProcessIdentity; workspaceToken: string; runtimeToken: string;
   processes?: ProcessIdentity[]; uncertain?: boolean;
 }
@@ -33,8 +34,9 @@ export async function attestPlaywrightWitnesses(scope: PlaywrightTreeScope, witn
 export async function readPlaywrightOwnership(session: PlaywrightSession): Promise<{ record: PlaywrightOwnership; scope: PlaywrightTreeScope; roots: ProcessIdentity[] } | null> {
   const raw = await readPlaywrightJson(session.project.root, join(session.directory, "ownership.json")) as any;
   if (raw === null) return null;
-  const fields = ["schema", "sessionId", "runtimeId", "runtimeVersion", "group", "supervisor", "child", "workspaceToken", "runtimeToken", "processes", "uncertain"];
-  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(key => !fields.includes(key)) || raw.schema !== 1 || raw.sessionId !== session.id || typeof raw.runtimeVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(raw.runtimeVersion)) throw new Error("Invalid Playwright ownership record");
+  requireSchemaVersion(raw, "Playwright ownership record");
+  const fields = ["schemaVersion", "sessionId", "runtimeId", "runtimeVersion", "group", "supervisor", "child", "workspaceToken", "runtimeToken", "processes", "uncertain"];
+  if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(key => !fields.includes(key)) || raw.sessionId !== session.id || typeof raw.runtimeVersion !== "string" || !/^\d+\.\d+\.\d+$/.test(raw.runtimeVersion)) throw new Error("Invalid Playwright ownership record");
   assertPlaywrightId(raw.runtimeId); assertPlaywrightId(raw.workspaceToken); assertPlaywrightId(raw.runtimeToken);
   const supervisor = identity(raw.supervisor), child = identity(raw.child);
   if (raw.group !== supervisor.pid || raw.processes !== undefined && !Array.isArray(raw.processes) || raw.uncertain !== undefined && typeof raw.uncertain !== "boolean") throw new Error("Invalid Playwright ownership group/processes");
@@ -44,6 +46,24 @@ export async function readPlaywrightOwnership(session: PlaywrightSession): Promi
   return { record: { ...raw, supervisor, child, processes }, scope, roots };
 }
 
+/** A new launcher for the same session stops whatever the previous launcher left running (Pi reconnects a
+ * server in about 2.5 s, less than the old launcher's own cleanup needs, so detached Chromium can outlive it).
+ * Only processes the tree attests are signalled: birth identity of the recorded witnesses, ancestry/group of
+ * those, or the private session+runtime tags. Anything unattested is never signalled; if ownership stays
+ * uncertain `stop` throws and the caller fails closed.
+ */
+export async function stopPriorPlaywrightRuntime(evidence: NonNullable<Awaited<ReturnType<typeof readPlaywrightOwnership>>>, protectedPid: number = process.pid, supervisorWaitMs = 3000): Promise<void> {
+  // A live previous supervisor is a duplicate owner of this session, not an orphan: give it time to finish
+  // its own shutdown, and leave it alone (the caller then refuses) if it does not.
+  const deadline = Date.now() + supervisorWaitMs;
+  while (await identityLive(evidence.record.supervisor)) {
+    if (Date.now() >= deadline) return;
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+  const tree = new PlaywrightOwnedTree(evidence.scope, evidence.roots);
+  if ((await tree.capture()).processes.some(row => row.pid !== protectedPid)) await tree.stop(protectedPid);
+}
+
 /** Retire only matching completed leases, after independently verified quiescence. */
 export async function retirePlaywrightOwnership(session: PlaywrightSession, evidence: NonNullable<Awaited<ReturnType<typeof readPlaywrightOwnership>>>): Promise<void> {
   const snapshot = await new PlaywrightOwnedTree(evidence.scope, evidence.roots).capture();
@@ -51,7 +71,8 @@ export async function retirePlaywrightOwnership(session: PlaywrightSession, evid
   for (const [token, resource] of [[evidence.record.workspaceToken, `workspace:${session.project.identifier}`], [evidence.record.runtimeToken, `runtime:${evidence.record.runtimeId}`]]) {
     const path = join(session.project.root, "consumers", `${token}.json`), record = await readPlaywrightJson(session.project.root, path) as any;
     if (record === null) continue;
-    if (record.schema !== 1 || record.token !== token || record.resource !== resource || record.sessionId !== session.id || record.runtimeId !== evidence.record.runtimeId || record.workspace !== session.project.projectPath || record.group !== evidence.record.group) throw new Error("Playwright completed lease identity mismatch");
+    requireSchemaVersion(record, "Playwright consumer record");
+    if (record.token !== token || record.resource !== resource || record.sessionId !== session.id || record.runtimeId !== evidence.record.runtimeId || record.workspace !== session.project.projectPath || record.group !== evidence.record.group) throw new Error("Playwright completed lease identity mismatch");
     const owner = identity(record);
     if (![evidence.record.child, evidence.record.supervisor].some(expected => expected.pid === owner.pid && expected.start === owner.start) || await identityLive(owner)) throw new Error("Playwright lease still live or ownership changed");
     await rm(path);

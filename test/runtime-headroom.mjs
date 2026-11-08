@@ -2,11 +2,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm } from "node:fs/promises";
 import { verifyCompressionBridge } from "./helpers/compression-acceptance.mjs";
 import { FixtureMcpClient } from "./helpers/mcp-client.mjs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer } from "node:net";
 import { createJiti } from "jiti";
@@ -31,7 +31,7 @@ try {
   assert.equal(await b.ensureRunning(status), true, "peer B must attach to attested process");
   const ownerPath = join(runtime.root, "proxies", String(port), "owner.json");
   const originalOwner = JSON.parse(await readFile(ownerPath, "utf8"));
-  const compressed = await a.compressRaw({ model: "gpt-4o", messages: [{ role: "user", content: "Synthetic Workbench context. ".repeat(120) }] });
+  const compressed = await a.requestOwned("/v1/compress", { model: "gpt-4o", messages: [{ role: "user", content: "Synthetic Workbench context. ".repeat(120) }] });
   report.bridge = await verifyCompressionBridge(a);
   assert.ok(Array.isArray(compressed.messages)); report.checks.push("owned sealed compression endpoint");
   assert.equal((await fetch(a.baseUrl + "/v1/retrieve/stats")).status, 403, "unauthenticated content routes remain private");
@@ -84,9 +84,10 @@ try {
   const graphPath = join(memory.store.directory, "memory_graph.db");
   await promisify(execFile)(python, [relationshipHelper, "seed", graphPath], { env: runtime.environment(), timeout: 10000 });
   const exported = JSON.parse(await memory.exportBundle(python)); assert.ok(exported.memories >= 1); assert.ok(exported.entities >= 2); assert.ok(exported.relationships >= 1);
-  const imported = await memory.importBundle(python); assert.ok(await readFile(join(imported.backupDirectory, "memory.db")));
+  await memory.importBundle(python);
+  assert.deepEqual((await readdir(dirname(memory.store.directory))).filter(name => /\.backup-|\.pi-workbench-memory-/.test(name)), [], "import leaves no backup or staging beside the store");
   await promisify(execFile)(python, [relationshipHelper, "assert", graphPath], { env: runtime.environment(), timeout: 10000 });
-  report.checks.push("Memory peers protect data; logical export/import preserves native relationships and physical backups");
+  report.checks.push("Memory peers protect data; logical export/import preserves native relationships and leaves no backup behind");
   await b.stop(); assert.equal(await b.healthCheck(), false); report.checks.push("last proxy consumer shutdown");
   const memoryOnly = new FixtureMcpClient(memory.getMcpConfig(python)); clients.push(memoryOnly); await memoryOnly.initialize();
   assert.match(JSON.stringify(await memoryOnly.tool("memory_search", { query: "Workbench fixture sentinel", top_k: 3 })), /sentinel/i);

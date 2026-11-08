@@ -30,7 +30,7 @@ test("resolveMemoryStore: projects receive stable isolated paths", async () => {
     const handle = await open(first.databasePath, "a");
     await handle.close();
     assert.equal(hasMemoryStore(first), false, "database alone is not fresh opt-in");
-    await writeFile(join(first.directory, "workbench-identity.json"), JSON.stringify({ schema: 1, layout: 1, headroomVersion: "0.41.0", kind: "memory", model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384 }));
+    await writeFile(join(first.directory, "workbench-identity.json"), JSON.stringify({ schemaVersion: 1, layout: 1, headroomVersion: "0.41.0", kind: "memory", model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384 }));
     assert.equal(hasMemoryStore(first), true);
   } finally {
     await rm(tempDir, { recursive: true, force: true });

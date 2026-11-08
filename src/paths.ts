@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-/** Canonical extension-owned state. No legacy discovery or migration aliases. */
+/** Canonical extension-owned state. */
 export interface WorkbenchPaths {
   root: string;
   headroomRoot: string;

@@ -24,15 +24,15 @@ export async function managedPlaywrightFixture(t) {
   const browser = join(slot, "browsers", "synthetic", "chrome"), npm = join(f.root, "npm-cli.js");
   await mkdir(join(slot, "browsers", "synthetic"), { recursive: true, mode: 0o700 });
   await writeFile(browser, "never execute a real browser", { mode: 0o700 }); await writeFile(npm, "synthetic npm, never execute", { mode: 0o700 });
-  const record = { schema: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: assets.sha256, slot,
+  const record = { schemaVersion: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: assets.sha256, slot,
     node: { path: nodePath, version: process.versions.node, sha256: nodeSha }, npm: { path: npm, version: "10.9.7", sha256: sha("synthetic npm, never execute") },
     entrypoint: join(slot, "node_modules", "@playwright", "mcp", "cli.js"), browser, browserVersion: "synthetic", tools: [...config.PLAYWRIGHT_REQUIRED_TOOLS], validatedAt: new Date().toISOString() };
   await publishJson(paths.playwrightRoot, join(slot, "ready.json"), record);
-  await publishJson(paths.playwrightRoot, paths.playwrightSelected, { schema: 1, id, version: record.version, slot });
-  await config.setPlaywrightOptIn(project, true);
+  await publishJson(paths.playwrightRoot, paths.playwrightSelected, { schemaVersion: 1, id, version: record.version, slot });
+  await config.enablePlaywrightOptIn(project);
   async function session() {
     const session = config.resolvePlaywrightSession(project); await config.preparePlaywrightSession(session, record);
-    const spec = { schema: 1, home: f.home, workspace: f.workspace, sessionId: session.id, runtimeId: id, command: nodePath, args: [record.entrypoint, "--config", session.configPath] };
+    const spec = { schemaVersion: 1, home: f.home, workspace: f.workspace, sessionId: session.id, runtimeId: id, command: nodePath, args: [record.entrypoint, "--config", session.configPath] };
     const env = config.playwrightPiEnvironment(config.playwrightChildEnvironment(session, record, paths.playwrightNpmCache));
     return { session, spec, env };
   }

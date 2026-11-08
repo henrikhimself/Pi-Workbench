@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createInterface } from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import { hostname } from "node:os";
 import { identityLive, processBirth, type ProcessIdentity } from "./managed-lifecycle.js";
@@ -104,6 +104,32 @@ export const runPlaywrightCommand: PlaywrightCommandRunner = async spec => {
   } finally { clearTimeout(timer); spec.signal?.removeEventListener("abort", abort); }
 };
 
+const MAX_LINE_CHARACTERS = 16 * 1024 * 1024;
+
+/**
+ * Calls `handle` for every LF-terminated line, plus a final line without a newline when the stream ends.
+ * Lines are split on LF only, as the Pi RPC docs require: `node:readline` has split on other separators on some
+ * runtimes, and U+2028 or U+2029 inside a JSON string must stay inside that message. A trailing CR stays in the
+ * line (JSON.parse accepts it). A line longer than the limit is handed over unterminated so the caller can fail.
+ */
+export function forEachLfLine(input: NodeJS.ReadableStream, handle: (line: string) => void): void {
+  const decoder = new StringDecoder("utf8");
+  let buffer = "";
+  input.on("data", (chunk: Buffer | string) => {
+    buffer += typeof chunk === "string" ? chunk : decoder.write(chunk);
+    for (let end = buffer.indexOf("\n"); end >= 0; end = buffer.indexOf("\n")) {
+      const line = buffer.slice(0, end);
+      buffer = buffer.slice(end + 1);
+      handle(line);
+    }
+    if (buffer.length > MAX_LINE_CHARACTERS) { const oversized = buffer; buffer = ""; handle(oversized); }
+  });
+  input.on("end", () => {
+    buffer += decoder.end();
+    if (buffer) { const last = buffer; buffer = ""; handle(last); }
+  });
+}
+
 export class PlaywrightStdioClient {
   private nextId = 0;
   private pending = new Map<number, { resolve(value: any): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
@@ -115,10 +141,9 @@ export class PlaywrightStdioClient {
   private constructor(private child: ChildProcessWithoutNullStreams, readonly group: PlaywrightOwnedGroup, readonly timeoutMs: number, closed: Promise<number>) {
     this.exited = closed.then(() => { clearInterval(this.heartbeat); this.fail(new Error("Playwright MCP connection closed")); });
     child.stderr.resume(); // No raw page/server output is persisted as a durable diagnostic.
-    const lines = createInterface({ input: child.stdout });
-    lines.on("line", line => {
+    forEachLfLine(child.stdout, line => {
       try {
-        if (line.length > 16 * 1024 * 1024) throw new Error("Oversized Playwright MCP response");
+        if (line.length > MAX_LINE_CHARACTERS) throw new Error("Oversized Playwright MCP response");
         const response = JSON.parse(line);
         if (response.id === undefined) return;
         const pending = this.pending.get(response.id);

@@ -67,7 +67,7 @@ test("template creation writes null model once and never overwrites any existing
 
 async function managerFixture(t) {
   const f = await playwrightFixture(t), paths = resolveWorkbenchPaths(f.home), id = randomUUID(), slot = join(paths.playwrightRuntimes, config.PLAYWRIGHT_VERSION, id);
-  const ready = { schema: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: "0".repeat(64), slot,
+  const ready = { schemaVersion: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: "0".repeat(64), slot,
     node: { path: process.execPath, version: process.versions.node, sha256: "0".repeat(64) }, npm: { path: join(f.root, "npm-cli.js"), version: "10.9.7", sha256: "0".repeat(64) },
     entrypoint: join(slot, "node_modules", "@playwright", "mcp", "cli.js"), browser: join(slot, "browsers", "synthetic", "chrome"), browserVersion: "synthetic", tools: [...config.PLAYWRIGHT_REQUIRED_TOOLS], validatedAt: new Date().toISOString() };
   let registry, alive = false;

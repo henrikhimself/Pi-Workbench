@@ -11,6 +11,7 @@ const config = await jiti.import("../src/playwright-config.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 const { publishJson, createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
 const sha = data => createHash("sha256").update(data).digest("hex");
+const runtimeValidate = (f, record) => f.runtime.validate(record);
 async function fixture(t, changes = {}) {
   const f = await playwrightFixture(t), paths = resolveWorkbenchPaths(f.home), calls = [], progress = [];
   const node = join(f.root, "host-node"), npm = join(f.root, "npm-cli.js");
@@ -40,10 +41,10 @@ async function fixture(t, changes = {}) {
 }
 async function oldSelection(f) {
   const id = randomUUID(), version = "0.0.83", slot = join(f.paths.playwrightRuntimes, version, id);
-  const record = { schema: 1, policy: 1, id, version, engineVersion: "older-pin", manifestSha256: "a".repeat(64), slot, ...f.host,
+  const record = { schemaVersion: 1, policy: 1, id, version, engineVersion: "older-pin", manifestSha256: "a".repeat(64), slot, ...f.host,
     entrypoint: join(slot, "node_modules", "@playwright", "mcp", "cli.js"), browser: join(slot, "browsers", "chrome"), browserVersion: "older-browser", tools: ["browser_snapshot"], validatedAt: new Date().toISOString() };
   await publishJson(f.paths.playwrightRoot, join(slot, "ready.json"), record);
-  await publishJson(f.paths.playwrightRoot, f.paths.playwrightSelected, { schema: 1, id, version, slot });
+  await publishJson(f.paths.playwrightRoot, f.paths.playwrightSelected, { schemaVersion: 1, id, version, slot });
   return record;
 }
 
@@ -109,7 +110,8 @@ test("Playwright unsafe browser path is rejected before readiness", async t => {
 test("Playwright missing selected browser and changed host identity fail without repairing active slot", async t => {
   const f = await fixture(t), record = await f.ensure();
   await writeFile(record.node.path, "changed host");
-  await assert.rejects(f.ensure(), /host executable identity changed/);
+  const { PlaywrightHostChangedError } = m;
+  await assert.rejects(runtimeValidate(f, record), PlaywrightHostChangedError); // ensure() now repairs this; see the M10 tests below
   await writeFile(record.node.path, "synthetic node");
   const { rm } = await import("node:fs/promises"); await rm(record.browser);
   const calls = f.calls.length; await assert.rejects(f.ensure()); assert.equal(f.calls.length, calls);
@@ -226,4 +228,46 @@ for (const failure of [null, "tools", "snapshot", "evaluate", "screenshot"]) tes
   if (failure) await assert.rejects(m.probePlaywrightRuntime(options), /Sandboxed Chromium readiness failed/);
   else { const result = await m.probePlaywrightRuntime(options); assert.equal(result.browserVersion, "150.0.1.2"); assert.ok(calls.includes("browser_close")); }
   assert.equal(closed, 1);
+});
+
+// ── M10: a Node/npm update on the host no longer breaks Playwright permanently ──
+async function hostChangeFixture(t) {
+  let host; const f = await fixture(t, { host: async () => host });
+  host = f.host; return { ...f, setHost: next => { host = next; }, currentHost: () => host };
+}
+test("M10: with no live consumer, a changed host node is rediscovered and a new runtime is selected", async t => {
+  const f = await hostChangeFixture(t), first = await f.ensure();
+  await writeFile(first.node.path, "upgraded node");
+  f.setHost({ ...f.host, node: { ...f.host.node, version: "22.30.0", sha256: sha("upgraded node") } });
+  const second = await f.ensure();
+  assert.notEqual(second.id, first.id, "a new runtime was provisioned");
+  assert.equal(second.node.sha256, sha("upgraded node"));
+  assert.equal((await f.runtime.selected()).id, second.id, "and selected");
+  assert.ok(f.progress.some(message => /host Node\/npm changed/.test(message)));
+  await f.runtime.validate(second);
+  assert.equal((await f.ensure()).id, second.id, "the next call just validates it");
+});
+test("M10: a host node that was removed (nvm switch) is also re-provisioned", async t => {
+  const f = await hostChangeFixture(t), first = await f.ensure();
+  const { rm } = await import("node:fs/promises"); await rm(first.node.path);
+  const replacement = join(f.root, "host-node-2"); await writeFile(replacement, "other node", { mode: 0o700 });
+  f.setHost({ ...f.host, node: { path: replacement, version: "24.0.0", sha256: sha("other node") } });
+  assert.notEqual((await f.ensure()).id, first.id);
+});
+test("M10: with a live consumer the error says what happened and what to do, and nothing is replaced", async t => {
+  const f = await hostChangeFixture(t), first = await f.ensure();
+  const lease = await createConsumerLease(f.paths.playwrightConsumers, `runtime:${first.id}`);
+  try {
+    await writeFile(first.node.path, "upgraded node");
+    f.setHost({ ...f.host, node: { ...f.host.node, sha256: sha("upgraded node") } });
+    await assert.rejects(f.ensure(), error => /host Node or npm was updated/.test(error.message) && /Another Pi session is still using/.test(error.message) && /\/wb:playwright on again/.test(error.message));
+    assert.equal((await f.runtime.selected()).id, first.id, "the selection is untouched");
+  } finally { await lease.release(); }
+});
+test("M10: other validation failures are not treated as a host change", async t => {
+  const f = await hostChangeFixture(t), first = await f.ensure();
+  const { rm } = await import("node:fs/promises"); await rm(first.browser);
+  const before = (await f.runtime.selected()).id; const calls = f.calls.length;
+  await assert.rejects(f.ensure(), error => !(error instanceof m.PlaywrightHostChangedError));
+  assert.equal(f.calls.length, calls); assert.equal((await f.runtime.selected()).id, before);
 });

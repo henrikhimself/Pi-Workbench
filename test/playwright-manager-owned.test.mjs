@@ -49,7 +49,7 @@ test("Playwright manager forced cleanup reaches owned detached fixture groups wi
     await c.manager.on(); const client = await c.client();
     const info = JSON.parse((await client.call("browser_snapshot")).content[0].text);
     await c.manager.shutdown(); assert.equal(await dead(info.pid), true); assert.equal(await dead(info.descendant), true); process.kill(process.pid, 0);
-    await access(f.project.statePath); await c.manager.off(true);
+    await access(f.project.optInPath); await c.manager.off(true);
   } finally { await c.manager.shutdown(); await (await c.client())?.close(); }
 });
 test("Playwright peer-busy owned-manager off neither kills peer nor schedules deferred deletion", { timeout: 40000 }, async t => {
@@ -58,7 +58,7 @@ test("Playwright peer-busy owned-manager off neither kills peer nor schedules de
     await first.manager.on(); await peer.manager.on(); const peerClient = await peer.client();
     const info = JSON.parse((await peerClient.call("browser_snapshot")).content[0].text);
     await assert.rejects(first.manager.off(true), /same-workspace peers/);
-    process.kill(info.pid, 0); process.kill(info.descendant, 0); await access(f.project.statePath);
+    process.kill(info.pid, 0); process.kill(info.descendant, 0); await access(f.project.optInPath);
     await peer.manager.shutdown(); await access(f.project.directory); // No deferred off after peer exits.
     await first.manager.off(true); await assert.rejects(access(f.project.directory), { code: "ENOENT" });
   } finally { await first.manager.shutdown(); await peer.manager.shutdown(); await (await first.client())?.close(); await (await peer.client())?.close(); }
