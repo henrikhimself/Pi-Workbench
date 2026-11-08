@@ -102,6 +102,16 @@ for (const source of ["extension", "user", "project", "invalid"]) test(`Playwrig
   await f.command("on"); assert.match(f.notifications.at(-1).message, /same-name|invalid/); assert.equal(f.notifications.at(-1).message.includes("synthetic-private-value"), false);
   assert.equal(f.registry.get("playwright"), source === "extension" ? external : undefined);
 });
+test("Playwright: an untrusted project's mcp.json is ignored (Pi ignores it too); a trusted one with a '_' spelling blocks registration", async t => {
+  const f = await fixture(t), directory = join(f.workspace, ".pi"); await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(join(directory, "mcp.json"), "\ufeff" + JSON.stringify({ mcpServers: { playwright: { command: "/synthetic-external" } } }));
+  f.ctx.isProjectTrusted = () => false; await f.command("on");
+  assert.equal(f.registry.get("playwright") !== undefined, true, "untrusted project file does not block");
+  await f.command("off");
+  f.registry.clear(); f.ctx.isProjectTrusted = () => true;
+  await f.command("on"); assert.match(f.notifications.at(-1).message, /same-name MCP declaration "playwright" in .*mcp\.json/);
+  assert.equal(f.registry.get("playwright"), undefined);
+});
 test("Playwright unavailable public MCP APIs fail without unmanaged fallback", async t => {
   const f = await fixture(t); f.pi.registerMcpServer = undefined; await f.command("on"); assert.match(f.notifications.at(-1).message, /public Pi MCP APIs unavailable/); assert.equal(f.registry.size, 0);
 });

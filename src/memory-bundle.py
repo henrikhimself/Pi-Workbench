@@ -9,12 +9,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
-import shutil
 import sqlite3
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+
+@contextmanager
+def connect(database: Path):
+    """Commit on success, roll back on error, and always close. `with sqlite3.connect(...)` never closes,
+    which on Windows keeps the files locked so the later unlink of the WAL/SHM files can fail."""
+    conn = sqlite3.connect(database)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
 
 BUNDLE_VERSION = 1
 MEMORY_COLUMNS = (
@@ -59,7 +71,7 @@ def logical_row(row: sqlite3.Row, columns: tuple[str, ...]) -> dict[str, Any]:
 def db_rows(database: Path, query: str, namespace: str, columns: tuple[str, ...]) -> list[dict[str, Any]]:
     if not database.exists():
         return []
-    with sqlite3.connect(database) as conn:
+    with connect(database) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, (namespace,)).fetchall()
     return [logical_row(row, columns) for row in rows]
@@ -121,7 +133,32 @@ def require_bundle_file(bundle: Path, root: Path, relative_path: str) -> Path:
     return current
 
 
-def read_bundle(bundle: Path, namespace: str) -> dict[str, list[dict[str, Any]]]:
+def derived_entries(bundle: Path, root: Path) -> list[dict[str, str]]:
+    """Manifest entries derived from the record files that are actually present.
+
+    A git merge of two exports can combine record files cleanly while `manifest.json`
+    (one canonical line) conflicts and keeps one side, so the merged manifest no longer
+    describes the merged files. Checksums are taken from the files themselves; every
+    record is still checked for identity, namespace and canonical form by `read_bundle`.
+    """
+    entries = []
+    for kind in ("memories", "entities", "relationships"):
+        directory = require_bundle_directory(bundle, root, kind)
+        for child in sorted(directory.iterdir()):
+            relative_path = f"{kind}/{child.name}"
+            if child.is_dir() and not child.is_symlink():
+                raise ValueError("bundle contains unlisted or missing owned files")
+            if not child.name.endswith(".json"):
+                raise ValueError("bundle contains unlisted or missing owned files")
+            record_path = require_bundle_file(bundle, root, relative_path)
+            entries.append({"path": relative_path, "sha256": hashlib.sha256(record_path.read_bytes()).hexdigest()})
+    return entries
+
+
+def read_bundle(bundle: Path, namespace: str, derive_manifest: bool = False) -> dict[str, list[dict[str, Any]]]:
+    """Strict by default. `derive_manifest` is only for bundles produced by a git merge
+    (the `merge` and `replace` operations and their pre-check): the file list and checksums come from the
+    record files, while version and namespace still come from `manifest.json`."""
     root = validate_bundle_root(bundle)
     manifest_path = require_bundle_file(bundle, root, "manifest.json")
     manifest = json.loads(manifest_path.read_text("utf-8"))
@@ -130,6 +167,11 @@ def read_bundle(bundle: Path, namespace: str) -> dict[str, list[dict[str, Any]]]
     files = manifest.get("files")
     if not isinstance(files, list):
         raise ValueError("bundle manifest files must be a list")
+    result_kinds = ("memories", "entities", "relationships")
+    for kind in result_kinds:
+        require_bundle_directory(bundle, root, kind)
+    if derive_manifest:
+        files = derived_entries(bundle, root)
     expected = {"manifest.json"}
     result: dict[str, list[dict[str, Any]]] = {"memories": [], "entities": [], "relationships": []}
     for kind in result:
@@ -230,14 +272,14 @@ def merge_rows(conn: sqlite3.Connection, table: str, columns: tuple[str, ...], r
 
 def merge_namespace(stage: Path, records: dict[str, list[dict[str, Any]]], namespace: str) -> dict[str, dict[str, int]]:
     memory_db, graph_db = stage / "memory.db", stage / "memory_graph.db"
-    with sqlite3.connect(memory_db) as conn:
+    with connect(memory_db) as conn:
         conn.row_factory = sqlite3.Row
         # Preserve local retrieval telemetry when incoming logical record wins.
         access = {row["id"]: (row["access_count"], row["last_accessed"]) for row in conn.execute("SELECT id, access_count, last_accessed FROM memories WHERE user_id = ?", (namespace,))}
         stats = merge_rows(conn, "memories", MEMORY_COLUMNS, records["memories"])
         for memory_id, (access_count, last_accessed) in access.items():
             conn.execute("UPDATE memories SET access_count = ?, last_accessed = ? WHERE id = ?", (access_count, last_accessed, memory_id))
-    with sqlite3.connect(graph_db) as conn:
+    with connect(graph_db) as conn:
         conn.row_factory = sqlite3.Row
         entity_stats = merge_rows(conn, "entities", ENTITY_COLUMNS, records["entities"])
         relationship_stats = merge_rows(conn, "relationships", RELATIONSHIP_COLUMNS, records["relationships"])
@@ -246,10 +288,10 @@ def merge_namespace(stage: Path, records: dict[str, list[dict[str, Any]]], names
 
 def replace_namespace(stage: Path, records: dict[str, list[dict[str, Any]]], namespace: str) -> None:
     memory_db, graph_db = stage / "memory.db", stage / "memory_graph.db"
-    with sqlite3.connect(memory_db) as conn:
+    with connect(memory_db) as conn:
         conn.execute("DELETE FROM memories WHERE user_id = ?", (namespace,))
         insert_rows(conn, "memories", MEMORY_COLUMNS, records["memories"])
-    with sqlite3.connect(graph_db) as conn:
+    with connect(graph_db) as conn:
         conn.execute("DELETE FROM relationships WHERE user_id = ?", (namespace,))
         conn.execute("DELETE FROM entities WHERE user_id = ?", (namespace,))
         insert_rows(conn, "entities", ENTITY_COLUMNS, records["entities"])
@@ -266,7 +308,7 @@ def rebuild_indexes(store: Path) -> None:
 
     async def rebuild() -> None:
         backend = LocalBackend(LocalBackendConfig(db_path=str(store / "memory.db"), embedder_backend="onnx"))
-        with sqlite3.connect(store / "memory.db") as conn:
+        with connect(store / "memory.db") as conn:
             ids = [row[0] for row in conn.execute("SELECT id FROM memories")]
         for memory_id in ids:
             await backend.refresh_memory_indexes(memory_id)
@@ -280,13 +322,16 @@ def main() -> None:
     parser.add_argument("--store", required=True, type=Path)
     parser.add_argument("--bundle", required=True, type=Path)
     parser.add_argument("--namespace", required=True)
+    parser.add_argument("--derive-manifest", action="store_true", help="validate/merge/replace: derive the file list from the record files (git-merged bundles)")
     args = parser.parse_args()
+    if args.derive_manifest and args.operation not in ("validate", "merge", "replace"):
+        raise ValueError("--derive-manifest is only valid for validate, merge and replace")
     if args.operation == "export":
         result = export_bundle(args.store, args.bundle, args.namespace)
     elif args.operation == "show":
         result = show_memories(args.store, args.namespace)
     else:
-        records = read_bundle(args.bundle, args.namespace)
+        records = read_bundle(args.bundle, args.namespace, derive_manifest=args.derive_manifest)
         if args.operation == "replace":
             replace_namespace(args.store, records, args.namespace)
             rebuild_indexes(args.store)

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { requireSchemaVersion } from "./schema-version.js";
 import { readFile, rm } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { hostname } from "node:os";
@@ -7,18 +8,19 @@ import { isDeepStrictEqual } from "node:util";
 import { resolveWorkbenchPaths } from "./paths.js";
 import { acquireManagedLock, assertNoSymlink, assertWithin, createConsumerLease, identityLive, ownIdentity, processBirth, publishJson, type ConsumerLease } from "./managed-lifecycle.js";
 import { assertPlaywrightId, assertPlaywrightMcpConfiguration, assertPlaywrightSession, inspectPlaywrightPath, parsePlaywrightSession, playwrightChildEnvironment, playwrightOptedIn, playwrightWorkspaceLock, preparePlaywrightTransient, readPlaywrightJson, resolvePlaywrightProject, resolvePlaywrightSession } from "./playwright-config.js";
-import { PlaywrightRuntime } from "./playwright-runtime.js";
+import { PlaywrightHostChangedError, PlaywrightRuntime } from "./playwright-runtime.js";
 import { playwrightGroupMembers } from "./playwright-process.js";
 import { PlaywrightOwnedTree } from "./playwright-tree.js";
-import { readPlaywrightOwnership, retirePlaywrightOwnership } from "./playwright-ownership.js";
+import { readPlaywrightOwnership, retirePlaywrightOwnership, stopPriorPlaywrightRuntime } from "./playwright-ownership.js";
 const MCP_BOOTSTRAP = fileURLToPath(new URL("./playwright-mcp-bootstrap.mjs", import.meta.url));
 
-export interface PlaywrightLauncherSpec { schema: 1; home: string; workspace: string; sessionId: string; runtimeId: string; command: string; args: string[] }
+export interface PlaywrightLauncherSpec { schemaVersion: 1; home: string; workspace: string; sessionId: string; runtimeId: string; command: string; args: string[] }
 export function parsePlaywrightLauncherSpec(raw: unknown): PlaywrightLauncherSpec {
-  const fields = ["schema", "home", "workspace", "sessionId", "runtimeId", "command", "args"];
+  requireSchemaVersion(raw, "Playwright launcher specification");
+  const fields = ["schemaVersion", "home", "workspace", "sessionId", "runtimeId", "command", "args"];
   if (!raw || typeof raw !== "object" || Array.isArray(raw) || Object.keys(raw).some(key => !fields.includes(key)) || fields.some(key => !Object.hasOwn(raw, key))) throw new Error("Invalid Playwright launcher specification");
   const spec = raw as PlaywrightLauncherSpec;
-  if (spec.schema !== 1 || ![spec.home, spec.workspace, spec.command].every(path => typeof path === "string" && isAbsolute(path) && resolve(path) === path && !path.includes("\0")) || !Array.isArray(spec.args) || !spec.args.every(arg => typeof arg === "string")) throw new Error("Invalid Playwright launcher paths/arguments");
+  if (![spec.home, spec.workspace, spec.command].every(path => typeof path === "string" && isAbsolute(path) && resolve(path) === path && !path.includes("\0")) || !Array.isArray(spec.args) || !spec.args.every(arg => typeof arg === "string")) throw new Error("Invalid Playwright launcher paths/arguments");
   assertPlaywrightId(spec.sessionId); assertPlaywrightId(spec.runtimeId);
   return spec;
 }
@@ -30,11 +32,11 @@ export async function assertPlaywrightLauncherGroup(): Promise<void> {
   const raw = await readFile(`/proc/${process.pid}/stat`, "utf8");
   if (Number(raw.slice(raw.lastIndexOf(")") + 2).trim().split(/\s+/)[2]) !== process.pid) throw new Error("Playwright launcher requires an isolated owned process group");
 }
-async function stopOtherGroupMembers(): Promise<void> {
+async function stopOtherGroupMembers({ termMs = 1500, killMs = 1500 } = {}): Promise<void> {
   // The supervisor itself stays alive and anchors this group throughout cleanup.
   await assertPlaywrightLauncherGroup();
   const others = async () => (await playwrightGroupMembers(process.pid)).filter(owner => owner.pid !== process.pid);
-  for (const [signal, budget] of [["SIGTERM", 1500], ["SIGKILL", 1500]] as const) {
+  for (const [signal, budget] of [["SIGTERM", termMs], ["SIGKILL", killMs]] as const) {
     const deadline = Date.now() + budget;
     do {
       const members = await others();
@@ -90,7 +92,10 @@ export async function launchPlaywrightMcp(raw: unknown): Promise<void> {
         assertPlaywrightMcpConfiguration(await readPlaywrightJson(paths.playwrightRoot, session.configPath), session, selected.browser);
         const prior = await readPlaywrightOwnership(session);
         if (prior) {
-          await retirePlaywrightOwnership(session, prior); // Refuses a second active owner of this session.
+          // The previous launcher for this session is gone or going (the marker owner is this Pi process), and
+          // what it left behind is attested as ours: stop it rather than refusing to start (M11).
+          await stopPriorPlaywrightRuntime(prior);
+          await retirePlaywrightOwnership(session, prior); // Still refuses if anything remains or is uncertain.
           for (const path of [session.home, session.cache, session.tmp]) { assertWithin(session.directory, path); await assertNoSymlink(path); await rm(path, { recursive: true, force: true }); }
         }
         await preparePlaywrightTransient(session);
@@ -98,7 +103,7 @@ export async function launchPlaywrightMcp(raw: unknown): Promise<void> {
         workspaceLease = await createConsumerLease(paths.playwrightConsumers, `workspace:${project.identifier}`);
         runtimeLease = await createConsumerLease(paths.playwrightConsumers, `runtime:${selected.id}`);
         startup.signal.throwIfAborted();
-        child = spawn(selected.node.path, [MCP_BOOTSTRAP, JSON.stringify({ schema: 1, command: selected.node.path, args: spec.args, root: paths.playwrightRoot, browser: selected.browser, home: session.home, tmp: session.tmp })], { cwd: project.projectPath, env, detached: false, stdio: ["pipe", "pipe", "pipe"] });
+        child = spawn(selected.node.path, [MCP_BOOTSTRAP, JSON.stringify({ schemaVersion: 1, command: selected.node.path, args: spec.args, root: paths.playwrightRoot, browser: selected.browser, home: session.home, tmp: session.tmp })], { cwd: project.projectPath, env, detached: false, stdio: ["pipe", "pipe", "pipe"] });
         child.stdin.on("error", close);
         closed = new Promise<void>(resolve => child!.once("close", exitCode => { code = exitCode ?? 1; wake(); resolve(); }));
         await new Promise<void>((resolve, reject) => { child!.once("spawn", resolve); child!.once("error", reject); });
@@ -106,14 +111,16 @@ export async function launchPlaywrightMcp(raw: unknown): Promise<void> {
         if (!start) throw new Error("Cannot establish Playwright MCP child birth identity");
         const owner = { pid: child.pid!, start, host: hostname() };
         for (const [lease, resource] of [[workspaceLease, `workspace:${project.identifier}`], [runtimeLease, `runtime:${selected.id}`]] as const) {
-          await publishJson(paths.playwrightRoot, join(paths.playwrightConsumers, `${lease.token}.json`), { schema: 1, token: lease.token, resource, ...owner, supervisor, group: process.pid, sessionId: session.id, runtimeId: selected.id, runtimeVersion: selected.version, workspace: project.projectPath });
+          await publishJson(paths.playwrightRoot, join(paths.playwrightConsumers, `${lease.token}.json`), { schemaVersion: 1, token: lease.token, resource, ...owner, supervisor, group: process.pid, sessionId: session.id, runtimeId: selected.id, runtimeVersion: selected.version, workspace: project.projectPath });
         }
-        const ownership = { schema: 1, sessionId: session.id, runtimeId: selected.id, runtimeVersion: selected.version, supervisor, child: owner, group: process.pid, workspaceToken: workspaceLease.token, runtimeToken: runtimeLease.token };
+        const ownership = { schemaVersion: 1, sessionId: session.id, runtimeId: selected.id, runtimeVersion: selected.version, supervisor, child: owner, group: process.pid, workspaceToken: workspaceLease.token, runtimeToken: runtimeLease.token };
         await publishJson(paths.playwrightRoot, join(session.directory, "ownership.json"), ownership);
         tree = new PlaywrightOwnedTree({ sessionId: session.id, runtimeId: selected.id, browserRoot: join(selected.slot, "browsers"), directory: session.directory }, [supervisor, owner], async snapshot => {
           await publishJson(paths.playwrightRoot, join(session.directory, "ownership.json"), { ...ownership, processes: snapshot.processes, uncertain: snapshot.uncertain });
         });
         await tree.capture(); tree.start(error => { failure = error; close(); });
+        // The background pulse is slow (M12); a child exit is the moment detached descendants appear, so scan then.
+        child.once("exit", () => { void tree?.capture().catch(() => {}); });
         startup.signal.throwIfAborted();
         child.stdout.pipe(process.stdout); child.stderr.pipe(process.stderr);
         process.stdin.removeListener("data", buffer);
@@ -123,29 +130,37 @@ export async function launchPlaywrightMcp(raw: unknown): Promise<void> {
       } finally { await releaseWorkspace(); }
     } finally { await releaseRuntime(); }
     await request;
-  } catch (error) { if (!parentCancelled) failure = error; }
+  } catch (error) {
+    if (!parentCancelled) failure = error;
+    // The one startup failure the user can fix, and the generic line below would hide it.
+    if (error instanceof PlaywrightHostChangedError) process.stderr.write(`${error.message} Run /wb:playwright on to provision a runtime for the new host.\n`);
+  }
   finally {
     process.stdin.removeListener("data", buffer); process.stdin.unpipe(); process.stdin.pause();
     child?.stdin.end();
     try {
-      // EOF first; then bounded group cleanup, including descendants after MCP exit.
-      const deadline = Date.now() + 1000;
+      // Pi closes stdin, signals this group after about 0.5 s and SIGKILLs it after about 2.5 s, and cannot reach
+      // Chromium (its own detached group). So the whole path below must finish well inside that window, and the
+      // attested browser groups are stopped before anything else: a short EOF grace for a graceful MCP/browser
+      // close (200 ms), browser groups (up to 900 ms), leftover group members (up to 500 ms), child close (250 ms).
+      // Anything that still survives keeps its leases and ownership record, and the next launcher stops it
+      // (see stopPriorPlaywrightRuntime) instead of leaving it to chance.
+      const deadline = Date.now() + 200;
       while (Date.now() < deadline && (await playwrightGroupMembers(process.pid)).some(owner => owner.pid !== process.pid)) await delay(20);
-      await tree?.stop(process.pid);
-      await stopOtherGroupMembers();
+      await tree?.stop(process.pid, { termMs: 500, killMs: 400 });
+      await stopOtherGroupMembers({ termMs: 250, killMs: 250 });
       if (closed) await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error("Playwright child close unconfirmed")), 1000);
+        const timer = setTimeout(() => reject(new Error("Playwright child close unconfirmed")), 250);
         void closed!.then(() => { clearTimeout(timer); resolve(); }, reject);
       });
       await runtimeLease?.release(); await workspaceLease?.release();
       if (child) {
-        await publishJson(paths.playwrightRoot, join(session.directory, "stopped.json"), { schema: 1, sessionId: session.id, runtimeId: spec.runtimeId, group: process.pid, clean: true, stoppedAt: new Date().toISOString() });
+        await publishJson(paths.playwrightRoot, join(session.directory, "stopped.json"), { schemaVersion: 1, sessionId: session.id, runtimeId: spec.runtimeId, group: process.pid, clean: true, stoppedAt: new Date().toISOString() });
         for (const path of [session.home, session.cache, session.tmp]) { assertWithin(session.directory, path); await assertNoSymlink(path); await rm(path, { recursive: true, force: true }); }
       }
     } catch (error) {
       failure = error;
       child?.stdin.destroy(); child?.stdout.destroy(); child?.stderr.destroy(); child?.unref();
-      try { await publishJson(paths.playwrightRoot, join(session.directory, "cleanup-pending.json"), { schema: 1, sessionId: session.id, runtimeId: spec.runtimeId, group: process.pid, detail: "Owned process cleanup uncertain; preserve leases and data", createdAt: new Date().toISOString() }); } catch { /* Never erase existing evidence to mask failed cleanup. */ }
     }
     process.stdin.destroy();
     if (failure) { process.stderr.write("Managed Playwright startup/cleanup failed; inspect owned session state before retrying.\n"); process.exitCode = 1; }

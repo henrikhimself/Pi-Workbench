@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, mkdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { access, mkdir, rm, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createJiti } from "jiti";
 import { managedPlaywrightFixture as fixture, nodePath } from "./helpers/playwright-managed-fixture.mjs";
 const jiti = createJiti(import.meta.url);
@@ -17,7 +17,6 @@ const { publishJson, processBirth } = await jiti.import("../src/managed-lifecycl
 const dead = async pid => { const birth = await processBirth(pid); return !birth || birth.startsWith("linux-dead:"); };
 const { parsePlaywrightLauncherSpec } = await jiti.import("../src/playwright-launcher.ts");
 const launcher = fileURLToPath(new URL("../src/playwright-launcher.mjs", import.meta.url));
-const sha = data => createHash("sha256").update(data).digest("hex");
 
 async function waitFor(fn, timeout = 10000) {
   const deadline = Date.now() + timeout;
@@ -30,7 +29,7 @@ async function connect(f, selected) {
 
 test("Playwright launcher rejects malformed and arbitrary-script specifications", () => {
   assert.throws(() => parsePlaywrightLauncherSpec(null));
-  assert.throws(() => parsePlaywrightLauncherSpec({ schema: 1, command: nodePath, args: ["/arbitrary.js"] }));
+  assert.throws(() => parsePlaywrightLauncherSpec({ schemaVersion: 1, command: nodePath, args: ["/arbitrary.js"] }));
 });
 test("Playwright Pi environment blanks inherited loaders, backend overrides and credentials before Node startup", () => {
   const env = config.playwrightPiEnvironment({ HOME: "/private", PATH: "/private/bin" }, { NODE_OPTIONS: "--require=/unowned.js", LD_PRELOAD: "/unowned.so", PLAYWRIGHT_MCP_WEBMCP: "true", API_KEY: "synthetic-not-a-secret" });
@@ -138,11 +137,46 @@ for (const mutation of ["entrypoint", "selection", "opt-in", "configuration"]) t
     selected.spec.args = [unowned, "--config", selected.session.configPath];
   }
   if (mutation === "selection") selected.spec.runtimeId = randomUUID();
-  if (mutation === "opt-in") await config.setPlaywrightOptIn(f.project, false);
+  if (mutation === "opt-in") await rm(f.project.optInPath);
   if (mutation === "configuration") { const cfg = JSON.parse(await readFile(selected.session.configPath, "utf8")); cfg.webmcp = true; await writeFile(selected.session.configPath, JSON.stringify(cfg)); }
   let connected;
   try { await assert.rejects(async () => { connected = await connect(f, selected); }, /closed|closing/); }
   finally { await connected?.close(); }
   assert.equal((await runtimeModule.playwrightConsumers(f.paths)).length, 0);
   await assert.rejects(access(join(selected.session.directory, "ownership.json")), { code: "ENOENT" });
+});
+test("M11: a new launcher stops the attested orphans of the previous launcher instead of refusing to start", { timeout: 30000 }, async t => {
+  const f = await fixture(t), selected = await f.session(); let client, next;
+  try {
+    client = await connect(f, selected);
+    const info = JSON.parse((await client.call("browser_snapshot")).content[0].text);
+    const evidence = await waitFor(async () => { const value = await readPlaywrightOwnership(selected.session); return value?.record.processes?.some(owner => owner.pid === info.descendant) ? value : null; });
+    process.kill(evidence.record.child.pid, "SIGKILL"); process.kill(evidence.record.supervisor.pid, "SIGKILL");
+    await client.close(); client = null;
+    await waitFor(async () => (await dead(evidence.record.child.pid)) && (await dead(evidence.record.supervisor.pid)));
+    assert.equal(await dead(info.descendant), false, "the detached browser outlived the old launcher");
+    next = await connect(f, selected);
+    assert.equal(await dead(info.descendant), true, "the previous runtime's detached browser was stopped");
+    const again = JSON.parse((await next.call("browser_snapshot")).content[0].text);
+    assert.notEqual(again.descendant, info.descendant);
+  } finally {
+    await client?.close(); await next?.close();
+    const owned = await readPlaywrightOwnership(selected.session);
+    if (owned) await new PlaywrightOwnedTree(owned.scope, owned.roots).stop();
+  }
+});
+test("M11: after the MCP server dies, a detached browser that ignores SIGTERM is gone well inside Pi's 2.5 s window", { timeout: 30000 }, async t => {
+  const f = await fixture(t), selected = await f.session(); let client;
+  try {
+    client = await connect(f, selected);
+    const info = JSON.parse((await client.call("browser_snapshot")).content[0].text);
+    await waitFor(async () => (await readPlaywrightOwnership(selected.session))?.record.processes?.some(owner => owner.pid === info.descendant));
+    const started = Date.now();
+    process.kill(info.pid, "SIGKILL");
+    await waitFor(() => dead(info.descendant), 5000);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 1500, `browser stopped after ${elapsed} ms; the old 1.5 s SIGTERM wait alone exceeded this`);
+    await client.close(); client = null;
+    assert.equal((await runtimeModule.playwrightConsumers(f.paths)).length, 0);
+  } finally { await client?.close(); }
 });

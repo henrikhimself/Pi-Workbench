@@ -1,15 +1,15 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, readdir, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
-import { assertNoSymlink, assertWithin, acquireManagedLock, requireDiskSpace } from "./managed-lifecycle.js";
+import { chmod, lstat, mkdir, open, readFile, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
+import { execWithKillEscalation } from "./exec-escalating.js";
+import { assertNoSymlink, assertWithin, acquireManagedLock, ensurePrivateDirectory, requireDiskSpace } from "./managed-lifecycle.js";
 import { basename, delimiter, dirname, join, resolve } from "node:path";
 import https from "node:https";
-import type { WorkbenchPaths } from "./paths.js";
+import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import {
   CODE_GRAPH_ASSETS,
   CODE_GRAPH_BINARY_MEMBER,
-  compareAssetVersions,
   getAsset,
   parseAssetVersion,
   resolveAssetUrl,
@@ -39,8 +39,6 @@ export const DEFAULT_MAX_REDIRECTS = 3;
 export const SOCKET_TIMEOUT_MS = 30_000;
 export const VERSION_TIMEOUT_MS = 15_000;
 export const INSTALL_LOCK_TIMEOUT_MS = 10 * 60_000;
-export const INSTALL_LOCK_RETRY_MS = 500;
-export const INSTALL_LOCK_STALE_MS = 30 * 60_000;
 
 const ASSET_RECORD_FILE = "asset.json";
 
@@ -64,7 +62,7 @@ export interface InstalledBinary {
 
 export type BinaryAction =
   | { action: "reuse"; reason: "verified" }
-  | { action: "install"; reason: "missing" | "update" | "integrity" | "pin" }
+  | { action: "install"; reason: "missing" }
   | { action: "invalid_manifest"; detail: string };
 
 export type StatusReporter = (message: string) => void;
@@ -78,7 +76,7 @@ export interface ProcessResult {
 export type ProcessRunner = (
   command: string,
   args: string[],
-  options: { env: NodeJS.ProcessEnv; timeoutMs: number; cwd: string; signal?: AbortSignal },
+  options: { env: NodeJS.ProcessEnv; timeoutMs: number; cwd: string; signal?: AbortSignal; killGraceMs?: number },
 ) => Promise<ProcessResult>;
 
 export interface DownloadResponse {
@@ -91,14 +89,13 @@ export interface DownloadResponse {
 export type ArchiveFetcher = (url: string) => Promise<DownloadResponse>;
 
 export interface InstallerDeps {
-  paths: Pick<WorkbenchPaths, "codeGraphRoot" | "codeGraphBin" | "codeGraphDownloads">;
+  paths: Pick<WorkbenchPaths, "codeGraphRoot" | "codeGraphBin" | "codeGraphDownloads" | "codeGraphInstallLock">;
   platform?: () => { os: string; arch: string };
   download?: (url: string, destination: string, onStatus: StatusReporter) => Promise<void>;
   extract?: (archivePath: string, stagingDir: string, tarPath: string) => Promise<{ binaryPath: string }>;
   runProcess?: ProcessRunner;
   fetchResponse?: ArchiveFetcher;
   signal?: AbortSignal;
-  sleep?: (ms: number) => Promise<void>;
 }
 
 // ─── Platform detection ───────────────────────────────────────────────
@@ -144,20 +141,20 @@ export function decideBinaryAction(
         `(resolved URL or SHA-256 changed). The package manifest is invalid; the installed binary is retained and not replaced.`,
     };
   }
-  if (compareAssetVersions(installed.version, packaged.version) < 0) {
-    return { action: "install", reason: "update" };
-  }
-  return { action: "install", reason: "pin" };
+  // Callers only look up the packaged version's own record, so an installed version never differs.
+  return { action: "install", reason: "missing" };
 }
 
 // ─── Install lock ─────────────────────────────────────────────────────
+/**
+ * Acquires the install lock. A busy or stale lock throws the original error unchanged, so the
+ * "Stale managed lock; verify quiescence and remove manually: <path>" recovery path reaches the user.
+ */
 export async function acquireInstallLock(
-  lockDir: string, onStatus: StatusReporter, _sleep: (ms: number) => Promise<void>,
+  lockDir: string,
   timeoutMs = INSTALL_LOCK_TIMEOUT_MS, signal?: AbortSignal,
-): Promise<(() => Promise<void>) | null> {
-  try {
-    return await acquireManagedLock(dirname(lockDir), (basename(lockDir).endsWith(".lock") ? basename(lockDir).slice(0, -5) : basename(lockDir)), { timeoutMs, signal });
-  } catch (error) { onStatus(String(error)); return null; }
+): Promise<() => Promise<void>> {
+  return acquireManagedLock(dirname(lockDir), (basename(lockDir).endsWith(".lock") ? basename(lockDir).slice(0, -5) : basename(lockDir)), { timeoutMs, signal });
 }
 
 // ─── Download ─────────────────────────────────────────────────────────
@@ -202,7 +199,7 @@ export async function downloadArchive(
   const maxBytes = options.maxBytes ?? MAX_DOWNLOAD_BYTES;
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const fetchResponse = options.fetchResponse ?? ((current: string) => defaultFetchResponse(current, options.signal));
-  await mkdir(dirname(destination), { recursive: true });
+  await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   const partPath = `${destination}.${process.pid}-${Date.now().toString(36)}.part`;
 
   try {
@@ -301,7 +298,7 @@ export async function extractCodeGraphArchive(
   stagingDir: string,
   tarPath: string,
 ): Promise<{ binaryPath: string }> {
-  await mkdir(stagingDir, { recursive: true });
+  await mkdir(stagingDir, { recursive: true, mode: 0o700 });
   const binaryPath = join(stagingDir, CODE_GRAPH_BINARY_MEMBER);
   const partPath = `${binaryPath}.${process.pid}-${Date.now().toString(36)}.part`;
   const handle = await open(partPath, "wx", 0o700);
@@ -324,7 +321,8 @@ export async function extractCodeGraphArchive(
         }
         child.stdout.pause();
         writes = writes.then(() => handle.write(chunk)).then(() => { child.stdout.resume(); });
-        void writes.catch(reject);
+        // A failed write must not leave tar blocked on a paused pipe.
+        void writes.catch((error) => { child.kill("SIGKILL"); reject(error); });
       });
       child.on("close", (code) => {
         void writes.then(
@@ -361,22 +359,9 @@ export function parseBinaryVersionOutput(raw: string, binaryName = "codebase-mem
 }
 
 export function defaultProcessRunner(): ProcessRunner {
-  return (command, args, options) =>
-    new Promise<ProcessResult>((resolve) => {
-      execFile(
-        command,
-        args,
-        { env: options.env, timeout: options.timeoutMs, cwd: options.cwd, signal: options.signal, maxBuffer: 4 * 1024 * 1024 },
-        (error, stdout, stderr) => {
-          let code = 0;
-          if (error) {
-            const errno = (error as NodeJS.ErrnoException).code;
-            code = typeof errno === "number" ? errno : 1;
-          }
-          resolve({ code, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") });
-        },
-      );
-    });
+  return (command, args, options) => execWithKillEscalation(command, args, {
+    env: options.env, timeoutMs: options.timeoutMs, cwd: options.cwd, signal: options.signal, killGraceMs: options.killGraceMs,
+  });
 }
 
 /** Minimal environment for verifying the managed binary: no CBM variables. */
@@ -452,55 +437,23 @@ export async function readInstalledRecord(
   }
 }
 
-/**
- * Discover the newest verified install for a platform by scanning
- * `bin/<version>/<platform>/asset.json`. The update policy compares the
- * packaged manifest against this installed version, so a packaged downgrade
- * is not mistaken for a missing install.
- */
-export async function discoverInstalled(
-  binRoot: string,
-  platform: CodeGraphPlatform,
-): Promise<InstalledAssetRecord | null> {
-  let versions: string[];
-  try {
-    versions = (await readdir(binRoot))
-      .filter((name) => parseAssetVersion(name) !== null)
-      .sort((a, b) => compareAssetVersions(a, b));
-  } catch {
-    return null;
-  }
-  for (let i = versions.length - 1; i >= 0; i--) {
-    const record = await readInstalledRecord(binRoot, versions[i], platform);
-    if (record) return record;
-  }
-  return null;
-}
-
 export class CodeGraphInstaller {
   private readonly paths: InstallerDeps["paths"];
   private readonly platformSource: () => { os: string; arch: string };
   private readonly download: (url: string, destination: string, onStatus: StatusReporter) => Promise<void>;
   private readonly extract: (archivePath: string, stagingDir: string, tarPath: string) => Promise<{ binaryPath: string }>;
   private readonly runProcess: ProcessRunner;
-  private readonly sleep: (ms: number) => Promise<void>;
   private cancellation?: AbortSignal;
   setSignal(signal: AbortSignal): void { this.cancellation = signal; }
 
   constructor(deps: Partial<InstallerDeps> = {}) {
     this.cancellation = deps.signal;
-    this.paths =
-      deps.paths ?? {
-        codeGraphRoot: "",
-        codeGraphBin: "",
-        codeGraphDownloads: "",
-      };
+    this.paths = deps.paths ?? WORKBENCH_PATHS;
     this.platformSource = deps.platform ?? (() => ({ os: process.platform, arch: process.arch }));
     this.download = deps.download ?? ((url, destination, onStatus) => downloadArchive(url, destination, onStatus, { fetchResponse: deps.fetchResponse, signal: this.cancellation }));
     this.extract = deps.extract ?? extractCodeGraphArchive;
     const runner = deps.runProcess ?? defaultProcessRunner();
     this.runProcess = (command, args, options) => runner(command, args, { ...options, signal: this.cancellation });
-    this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   get binRoot(): string {
@@ -564,8 +517,7 @@ export class CodeGraphInstaller {
       onStatus(`Installed binary failed verification (${verified.detail}); reinstalling the packaged version.`);
     }
 
-    const release = await acquireInstallLock(join(this.paths.codeGraphRoot, "coordination", "install.lock"), onStatus, this.sleep, INSTALL_LOCK_TIMEOUT_MS, this.cancellation);
-    if (!release) throw new Error("Could not acquire the code graph install lock");
+    const release = await acquireInstallLock(this.paths.codeGraphInstallLock, INSTALL_LOCK_TIMEOUT_MS, this.cancellation);
     try {
       // Re-check under the lock: another session may have finished while we waited.
       const underLock = await readInstalledRecord(this.binRoot, asset.version, platform);
@@ -614,7 +566,7 @@ export class CodeGraphInstaller {
     try {
       this.cancellation?.throwIfAborted();
       await requireDiskSpace(this.paths.codeGraphRoot, MAX_DOWNLOAD_BYTES + MAX_MEMBER_BYTES + 64 * 1024 * 1024);
-      await mkdir(stagingRoot, { recursive: true });
+      await ensurePrivateDirectory(this.paths.codeGraphRoot, stagingRoot);
       const tarPath = await findGnuTar(this.runProcess);
       onStatus(`Downloading codebase-memory-mcp ${asset.version}...`);
       await this.download(resolvedUrl, archivePath, onStatus);
@@ -633,7 +585,7 @@ export class CodeGraphInstaller {
       if (!verified.ok) throw new Error(`Binary verification failed: ${verified.detail}`);
 
       // Stage the final directory beside its destination, then rename.
-      await mkdir(stagedFinal, { recursive: true });
+      await ensurePrivateDirectory(this.paths.codeGraphRoot, stagedFinal);
       await fsRename(stagedBinary, join(stagedFinal, CODE_GRAPH_BINARY_MEMBER));
       await writeFile(
         join(stagedFinal, ASSET_RECORD_FILE),
@@ -644,7 +596,7 @@ export class CodeGraphInstaller {
           2,
         ) + "\n",
       );
-      await mkdir(dirname(finalDir), { recursive: true });
+      await ensurePrivateDirectory(this.paths.codeGraphRoot, dirname(finalDir));
       this.cancellation?.throwIfAborted();
       await this.quarantineBrokenInstall(finalDir);
       await fsRename(stagedFinal, finalDir);

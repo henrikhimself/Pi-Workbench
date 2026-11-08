@@ -1,13 +1,13 @@
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, open, readFile, readdir, rename as renamePath, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { ManagedHeadroomRuntime, DEFAULT_HEADROOM_RUNTIME, getHeadroomAiVersion, type ManagedHeadroomDescriptor } from "./headroom-runtime.js";
 import { acquireManagedLock, activeConsumers, assertNoSymlink, ensurePrivateDirectory, publishJson, requireDiskSpace, treeBytes } from "./managed-lifecycle.js";
-import { prepareHeadroomStore, HEADROOM_STORE_MARKER, type HeadroomStoreIdentity } from "./headroom-state.js";
+import { prepareDataStore, STORE_MARKER, type HeadroomStoreIdentity } from "./store-identity.js";
 import { fileURLToPath } from "node:url";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
-import { ensureManagedPython } from "./proxy-manager.js";
 import { hasMemoryStore, resolveMemoryStore, type MemoryStore } from "./memory-config.js";
 
 export const MEMORY_SERVER_NAME = "headroom-memory";
@@ -98,9 +98,9 @@ export class MemoryManager {
     const version = await getHeadroomAiVersion();
     if (!version) throw new Error("Missing pinned Memory package identity");
     if (this.identity?.headroomVersion === version) return this.identity;
-    const base: HeadroomStoreIdentity = { schema: 1, layout: 1, headroomVersion: version, kind: "memory",
+    const base: HeadroomStoreIdentity = { schemaVersion: 1, layout: 1, headroomVersion: version, kind: "memory",
       model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384 };
-    const marker = join(this.store.directory, HEADROOM_STORE_MARKER); await assertNoSymlink(marker);
+    const marker = join(this.store.directory, STORE_MARKER); await assertNoSymlink(marker);
     try {
       const owned = JSON.parse(await readFile(marker, "utf8"));
       if (owned.modelSha256 !== undefined) {
@@ -124,8 +124,8 @@ export class MemoryManager {
           if (Date.now() >= deadline) throw new Error("Memory store busy in another/closing session; operation deferred");
           await new Promise(done => setTimeout(done, 50));
         }
-        if (!options.create && !this.enabled) throw new Error("Memory is not opted in for this fresh namespace");
-        await prepareHeadroomStore(this.store.directory, await this.expectedIdentity());
+        if (!options.create && !this.enabled) throw new Error("Memory is not opted in for this new namespace");
+        await prepareDataStore(this.store.directory, await this.expectedIdentity());
         const bytes = await treeBytes(this.store.directory);
         if (!options.readOnly) await requireDiskSpace(this.store.root, bytes * 3 + 32 * 1024 * 1024);
         this.signal?.throwIfAborted();
@@ -168,7 +168,7 @@ export class MemoryManager {
       this.signal?.throwIfAborted();
       await this.ensureRoot();
       const release = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
-      try { await prepareHeadroomStore(this.store.directory, await this.expectedIdentity()); }
+      try { await prepareDataStore(this.store.directory, await this.expectedIdentity()); }
       finally { await release(); }
       const python = await this.ensurePython(onStatus);
       if (!python) return null;
@@ -188,9 +188,9 @@ export class MemoryManager {
           tokenizerSha256: model.tokenizerSha256, modelRevision: model.modelRevision };
         const release = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
         try {
-          if ((await readdir(this.store.directory)).every(name => name === HEADROOM_STORE_MARKER)) {
-            await publishJson(this.store.directory, join(this.store.directory, HEADROOM_STORE_MARKER), identity);
-          } else await prepareHeadroomStore(this.store.directory, identity);
+          if ((await readdir(this.store.directory)).every(name => name === STORE_MARKER)) {
+            await publishJson(this.store.directory, join(this.store.directory, STORE_MARKER), identity);
+          } else await prepareDataStore(this.store.directory, identity);
           this.identity = identity;
         } finally { await release(); }
       }
@@ -211,7 +211,8 @@ export class MemoryManager {
     const stagingRoot = await mkdtemp(join(parent, ".pi-workbench-memory-export-"));
     const stagedBundle = join(stagingRoot, "bundle");
     const generatedBundle = join(stagingRoot, "generated");
-    const backupDirectory = `${bundle}.backup-${utcTimestamp()}`;
+    // The old bundle waits inside the staging directory, which is removed on success; the export is in git, so nothing stays beside it.
+    const backupDirectory = join(stagingRoot, "previous");
     let preserveStaging = false;
     try {
       if (existsSync(bundle)) await cp(bundle, stagedBundle, { recursive: true, force: true });
@@ -246,12 +247,14 @@ export class MemoryManager {
     const parent = dirname(this.store.directory);
     const staging = await mkdtemp(join(parent, ".pi-workbench-memory-merge-"));
     const stagedStore = join(staging, "store");
-    const backupDirectory = `${this.store.directory}.merge-backup-${utcTimestamp()}`;
+    const backupDirectory = `${this.store.directory}.merge-backup-${utcTimestamp()}-${randomUUID().slice(0, 8)}`;
     let preserveStaging = false;
     try {
-      await this.runBundle(python, "validate", this.store.directory, bundle);
+      // Merge and import consume a bundle that may have been merged by git, whose manifest can
+      // disagree with the merged record files (M8): list and checksums come from the files.
+      await this.runBundle(python, "validate", this.store.directory, bundle, { deriveManifest: true });
       await cp(this.store.directory, stagedStore, { recursive: true, force: true });
-      const result = await this.runBundle(python, "merge", stagedStore, bundle);
+      const result = await this.runBundle(python, "merge", stagedStore, bundle, { deriveManifest: true });
       await this.swapStagedDirectory(stagedStore, this.store.directory, backupDirectory);
       return result;
     } catch (error) {
@@ -262,23 +265,24 @@ export class MemoryManager {
     }
   }
 
-  /** Validate bundle, stage namespace replacement, retain current store as UTC backup, then swap. */
-  async importBundle(python: string): Promise<{ result: string; backupDirectory: string }> {
+  /** Validate bundle, stage namespace replacement, then swap; the old store is set aside in staging and deleted on success. */
+  async importBundle(python: string): Promise<string> {
     return this.transaction(() => this.importBundleUnlocked(python));
   }
-  private async importBundleUnlocked(python: string): Promise<{ result: string; backupDirectory: string }> {
+  private async importBundleUnlocked(python: string): Promise<string> {
     const bundle = this.requireExportDirectory();
     const parent = dirname(this.store.directory);
     const staging = await mkdtemp(join(parent, ".pi-workbench-memory-import-"));
     const stagedStore = join(staging, "store");
-    const backupDirectory = `${this.store.directory}.backup-${utcTimestamp()}`;
+    // The old store waits inside the staging directory and is deleted with it on success: import is a deliberate replace.
+    const backupDirectory = join(staging, "previous");
     let preserveStaging = false;
     try {
-      await this.runBundle(python, "validate", this.store.directory, bundle);
+      await this.runBundle(python, "validate", this.store.directory, bundle, { deriveManifest: true });
       await cp(this.store.directory, stagedStore, { recursive: true, force: true });
-      const result = await this.runBundle(python, "replace", stagedStore, bundle);
+      const result = await this.runBundle(python, "replace", stagedStore, bundle, { deriveManifest: true });
       await this.swapStagedDirectory(stagedStore, this.store.directory, backupDirectory);
-      return { result, backupDirectory };
+      return result;
     } catch (error) {
       preserveStaging = error instanceof SwapRecoveryError;
       throw error;
@@ -296,7 +300,7 @@ export class MemoryManager {
     await this.rename(join(generatedBundle, BUNDLE_MANIFEST), join(stagedBundle, BUNDLE_MANIFEST));
   }
 
-  /** Swap only same-parent directories. Original remains at backup until replacement is installed. */
+  /** Swap only same-filesystem directories. The original stays at `backupDirectory` until the replacement is installed, and stays there afterwards; callers that don't want a retained copy pass a path inside their own staging directory. */
   private async swapStagedDirectory(
     stagedDirectory: string,
     destination: string,
@@ -313,7 +317,7 @@ export class MemoryManager {
     this.signal?.throwIfAborted();
     const physicalStore = destination === this.store.directory;
     if (physicalStore) await publishJson(this.coordinationRoot, this.pendingPath, {
-      schema: 1, live: destination, staging: stagedDirectory, backup: backupDirectory,
+      schemaVersion: 1, live: destination, staging: stagedDirectory, backup: backupDirectory,
     });
     try { await this.rename(destination, backupDirectory); }
     catch (error) { if (physicalStore) await rm(this.pendingPath, { force: true }); throw error; }
@@ -334,8 +338,6 @@ export class MemoryManager {
       throw installError;
     }
     if (physicalStore) await rm(this.pendingPath, { force: true });
-
-    // Every published backup is retained until explicit manual cleanup.
   }
 
   private requireExportDirectory(): string {
@@ -343,23 +345,28 @@ export class MemoryManager {
     return this.store.exportDirectory;
   }
 
-  private async runBundle(python: string, operation: "export" | "validate" | "replace" | "merge" | "show", store: string, bundle: string): Promise<string> {
-    return runProcessOutput(python, [MEMORY_BUNDLE_SCRIPT, operation, "--store", store, "--bundle", bundle, "--namespace", this.store.userId], {
+  private async runBundle(python: string, operation: "export" | "validate" | "replace" | "merge" | "show", store: string, bundle: string, options: { deriveManifest?: boolean } = {}): Promise<string> {
+    return runProcessOutput(python, [MEMORY_BUNDLE_SCRIPT, operation, "--store", store, "--bundle", bundle, "--namespace", this.store.userId, ...(options.deriveManifest ? ["--derive-manifest"] : [])], {
       env: createMcpEnvironment(this.runtime.environment()),
       timeoutMs: 180_000, signal: this.signal,
+      ...(operation === "show" ? { maxBuffer: MEMORY_SHOW_MAX_BUFFER } : {}),
     });
   }
 
   getMcpConfig(python: string): McpServerConfig {
     this.signal?.throwIfAborted();
     if (!this.identity) throw new Error("Memory must be prepared before MCP registration");
+    // The launcher gives the server exactly this environment. It is deliberately not registered
+    // through `McpServerConfig.env`: Pi merges that over its own full environment and
+    // interpolates `$`/`!` in values.
     const spec = {
-      schema: 1, command: python,
+      schemaVersion: 1, command: python,
+      env: createMcpEnvironment(this.runtime.environment()),
       args: ["-m", "headroom.memory.mcp_server", "--db", this.store.databasePath, "--user", this.store.userId],
       cwd: this.store.projectPath, installRoot: this.descriptor?.slot ?? dirname(python),
       coordinationRoot: this.coordinationRoot, lockName: this.store.identifier,
       leaseRoot: this.leaseRoot, resource: this.store.directory,
-      markerPath: join(this.store.directory, HEADROOM_STORE_MARKER), expectedMarker: this.identity,
+      markerPath: join(this.store.directory, STORE_MARKER), expectedMarker: this.identity,
       ...(this.descriptor ? { runtime: {
         root: this.runtime.root, coordinationRoot: join(this.runtime.root, "coordination"),
         selectionPath: this.runtime.selectionPath, slot: this.descriptor.slot,
@@ -368,7 +375,7 @@ export class MemoryManager {
     };
     return {
       command: process.execPath, args: [MCP_LAUNCHER, JSON.stringify(spec)],
-      cwd: this.store.projectPath, env: createMcpEnvironment(this.runtime.environment()),
+      cwd: this.store.projectPath,
       exposure: "direct", timeout: 60,
       description: "Search and save project-scoped persistent Headroom Memory.",
     };
@@ -399,13 +406,16 @@ function utcTimestamp(date = new Date()): string {
   return date.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 }
 
+/** `show` dumps every record; Node's default 1 MiB `execFile` buffer made large stores fail. */
+export const MEMORY_SHOW_MAX_BUFFER = 64 * 1024 * 1024;
+
 async function runProcessOutput(
   command: string,
   args: string[],
-  options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
+  options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal; maxBuffer?: number },
 ): Promise<string> {
   return new Promise<string>((resolvePromise, reject) => {
-    execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal }, (error, stdout, stderr) => {
+    execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal, ...(options.maxBuffer ? { maxBuffer: options.maxBuffer } : {}) }, (error, stdout, stderr) => {
       if (error) reject(new Error(stderr || error.message));
       else resolvePromise(stdout.trim());
     });

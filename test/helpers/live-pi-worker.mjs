@@ -67,10 +67,16 @@ try {
   await wait(() => proxy.healthCheck(), "owned proxy readiness");
   const { resolveCodeGraphProject } = await jiti.import("../../src/code-graph-config.ts");
   const project = resolveCodeGraphProject(join(home, "a"), WORKBENCH_PATHS);
-  assert.equal(JSON.parse(await readFile(project.statePath, "utf8")).version, "v0.12.1");
-  const backups = await (await import("node:fs/promises")).readdir(join(WORKBENCH_PATHS.codeGraphRuntime, "backups"));
-  assert.ok(backups.some(name => name.startsWith(project.identifier + ".backup-")), "startup upgrades opted-in controlled fixture without approval");
-  checks.push("real Pi startup automatically upgrades controlled incompatible opt-in fixture with backup");
+  assert.equal(JSON.parse(await readFile(project.identityPath, "utf8")).codeGraphVersion, "v0.12.1");
+  assert.equal(JSON.parse(await readFile(project.optInPath, "utf8")).enabled, true);
+  // Workspace "m" holds Code Graph data written by another version: refused, no MCP, data unchanged.
+  const mismatched = resolveCodeGraphProject(join(home, "m"), WORKBENCH_PATHS);
+  const mismatchedState = await readFile(mismatched.identityPath, "utf8");
+  const m = await session(join(home, "m"));
+  await wait(() => notices.some(message => /Code graph upgrade_pending: .*does not read/.test(message)), "mismatched data refusal notice");
+  assert.equal(named(m.session, "search_graph"), undefined, "mismatched data must not start Code Graph MCP");
+  assert.equal(await readFile(mismatched.identityPath, "utf8"), mismatchedState);
+  checks.push("real Pi startup refuses Code Graph data from another version, starts no MCP and leaves it unchanged");
   for (const runtime of [a,b,c]) assert.equal(runtime.session.getAllTools().filter(item => item.name.endsWith("__search_graph")).length, 1);
   checks.push("three real SDK sessions register direct compatible MCP across same/different workspaces");
   const saved = await tool(a.session, "memory_save", { facts: ["Workbench live fixture sentinel violet_978163."] }); assert.ok(saved.content);
@@ -113,7 +119,7 @@ try {
   await b.session.prompt("/wb:headroom-proxy off"); assert.ok(named(b.session, "memory_search"));
   assert.equal(await proxy.healthCheck(), true, "different-workspace peer still consumes proxy");
   checks.push("persisted project compression off/creator disposal preserve already-active Memory and proxy peers");
-  await b.dispose(); await c.dispose();
+  await b.dispose(); await c.dispose(); await m.dispose();
   await wait(async () => !await proxy.healthCheck(), "last consumer shutdown", 15000);
   checks.push("last real Pi consumers release owned proxy");
   console.log(JSON.stringify({ checks, directTools: { memory: search }, model: model.provider + "/" + model.id, sdk: true }, null, 2));

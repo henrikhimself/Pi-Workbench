@@ -1,3 +1,5 @@
+import { offMessage } from "./command-messages.js";
+import { TOOL_NAMES } from "./tool-names.js";
 import { formatPlaywrightStatus, type PlaywrightManager } from "./playwright-manager.js";
 export const PLAYWRIGHT_COMMAND_USAGE = "Usage: /wb:playwright [on|off [--confirm-delete]|status]";
 export function parsePlaywrightCommand(raw: string): { action: "on" | "off" | "status"; confirmDelete: boolean } {
@@ -21,7 +23,7 @@ export async function executePlaywrightCommand(raw: string, context: {
       : command.confirmDelete;
     if (!confirmed) return context.hasUI ? "Playwright off cancelled; session, intent, and data unchanged." : "Playwright off requires --confirm-delete without interactive UI; nothing changed.";
     await context.manager.off(true);
-    return "Playwright off. Workspace data deleted; shared installation retained.";
+    return offMessage(TOOL_NAMES.playwright, "deleted");
   }
   return formatPlaywrightStatus(await context.manager.status());
 }

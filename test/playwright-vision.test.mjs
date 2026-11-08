@@ -75,6 +75,25 @@ test("require-loaded: only a GET of /models, never a load; unloaded or unlisted 
   const f = fixture(); await v.describeImage(f.request, f.deps);
   assert.equal(f.calls.fetch[0].init.headers.authorization, `Bearer ${KEY}`, "listing is authenticated through registry-resolved credentials");
 });
+test("LB-03 L4: listing headers drop null values and never duplicate authorization or accept in any case", async () => {
+  const sent = async auth => {
+    const f = fixture({ auth: async () => ({ ok: true, baseUrl: visionModel.baseUrl, ...auth }) });
+    await v.describeImage(f.request, f.deps); return f.calls.fetch[0].init.headers;
+  };
+  const nulls = await sent({ apiKey: KEY, headers: { "x-tenant": "acme", "x-null": null, "x-undefined": undefined } });
+  assert.deepEqual(Object.keys(nulls).sort(), ["accept", "authorization", "x-tenant"]);
+  assert.equal(nulls["x-tenant"], "acme");
+  for (const name of ["Authorization", "AUTHORIZATION", "authorization"]) {
+    const headers = await sent({ apiKey: KEY, headers: { [name]: "Basic dXNlcjpwdw==" } });
+    const names = Object.keys(headers).filter(key => key.toLowerCase() === "authorization");
+    assert.deepEqual(names, [name], `${name}: one authorization header`);
+    assert.equal(headers[name], "Basic dXNlcjpwdw==", `${name}: the configured value is kept`);
+  }
+  const accept = await sent({ apiKey: KEY, headers: { Accept: "application/vnd.router+json" } });
+  assert.deepEqual(Object.keys(accept).filter(key => key.toLowerCase() === "accept"), ["Accept"]);
+  assert.equal((await sent({ apiKey: KEY })).authorization, `Bearer ${KEY}`, "the key is still sent as Bearer when none is configured");
+  assert.equal(Object.keys(await sent({ headers: { "x-tenant": "acme" } })).includes("authorization"), false, "no key, no authorization header");
+});
 test("auth failures resolved by the registry do not send anything", async () => {
   for (const auth of [async () => ({ ok: false, error: "no key" }), async () => { throw new Error(`boom ${KEY}`); }]) {
     const f = fixture({ auth }), result = await v.describeImage(f.request, f.deps);

@@ -40,13 +40,7 @@ if (args.length > 0) {
       const projectName = String(root).replace(/^\\//, "").replace(/\\//g, "-");
       fs.mkdirSync(cacheDir, { recursive: true });
       const indexPath = path.join(cacheDir, projectName + ".db");
-      if (CONFIG.sqliteIndex) {
-        const {DatabaseSync} = require("node:sqlite");
-        const db = new DatabaseSync(indexPath);
-        db.exec("CREATE TABLE IF NOT EXISTS project_summaries(project TEXT PRIMARY KEY,summary TEXT NOT NULL,source_hash TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS observed_calls(project TEXT NOT NULL,caller_qn TEXT NOT NULL,callee_qn TEXT NOT NULL,label TEXT NOT NULL DEFAULT '',count INTEGER NOT NULL DEFAULT 1,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,PRIMARY KEY(project,caller_qn,callee_qn,label)); CREATE TABLE IF NOT EXISTS observed_paths(project TEXT NOT NULL,label TEXT NOT NULL DEFAULT '',path_json TEXT NOT NULL,count INTEGER NOT NULL DEFAULT 1,first_seen TEXT NOT NULL,last_seen TEXT NOT NULL,PRIMARY KEY(project,label,path_json));");
-        if (CONFIG.dropAuthored) for (const table of ["project_summaries", "observed_calls", "observed_paths"]) db.exec("DELETE FROM " + table);
-        db.close();
-      } else fs.writeFileSync(indexPath, "INDEX");
+      fs.writeFileSync(indexPath, "INDEX");
       console.log(JSON.stringify({ project: projectName, status: "indexed", nodes: 3, edges: 2 })); process.exit(0);
     }
     if (args[1] === "list_projects") {

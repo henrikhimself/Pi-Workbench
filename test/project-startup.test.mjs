@@ -9,7 +9,7 @@ const jiti = createJiti(import.meta.url);
 const { default: extension } = await jiti.import("../src/index.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 const { MemoryManager } = await jiti.import("../src/memory-manager.ts");
-const { HEADROOM_STORE_MARKER } = await jiti.import("../src/headroom-state.ts");
+const { STORE_MARKER } = await jiti.import("../src/store-identity.ts");
 const { compressionOptedIn, resolveCompressionProject, setCompressionOptIn } = await jiti.import("../src/headroom-project.ts");
 
 async function wait(condition) {
@@ -65,7 +65,7 @@ test("opted-out startup never prepares Memory or compression, creates config, or
 test("Memory store opt-in still validates root and warns independently of off compression", async () => fixture(async ({ home, paths, make }) => {
   const manager = new MemoryManager({ cwd: home, defaultRoot: paths.headroomMemory });
   await mkdir(manager.store.directory, { recursive: true, mode: 0o700 });
-  await writeFile(manager.store.databasePath, "fixture"); await writeFile(join(manager.store.directory, HEADROOM_STORE_MARKER), "{}");
+  await writeFile(manager.store.databasePath, "fixture"); await writeFile(join(manager.store.directory, STORE_MARKER), "{}");
   const original = MemoryManager.prototype.ensureRoot;
   let checks = 0;
   MemoryManager.prototype.ensureRoot = async () => { checks++; throw new Error("fixture unsafe opted-in root"); };
@@ -91,7 +91,9 @@ test("compression commands persist project choice; restart restores it, other pr
   assert.equal(peer.calls.stop, 0, "off must not stop already-active peer");
   const restart = make(); await restart.start(); await new Promise(resolve => setTimeout(resolve, 30));
   assert.equal(restart.calls.start, 0, "off persists across sessions");
-  assert.ok(first.notices.some(item => item.message.includes("disabled for this project and session")));
+  assert.ok(first.notices.some(item => item.message === "Headroom compression disabled for this project"));
+  await first.command("off");
+  assert.ok(first.notices.some(item => item.message === "Headroom compression already off for this project"), "a second off has nothing to do");
 }));
 
 test("failed compression activation retains explicit opt-in for later startup retry", async () => fixture(async ({ home, paths, make }) => {
@@ -112,10 +114,10 @@ test("explicit compression on still rejects symlinked root without creating conf
 
 test("failed project opt-out disables this session but preserves unsafe marker and reports unsaved choice", async () => fixture(async ({ home, paths, make }) => {
   const s = make(); await s.start(); await s.command("on");
-  const project = resolveCompressionProject(home, paths), before = await readFile(project.statePath, "utf8");
-  await chmod(project.statePath, 0o644);
+  const project = resolveCompressionProject(home, paths), before = await readFile(project.optInPath, "utf8");
+  await chmod(project.optInPath, 0o644);
   await s.command("off");
-  assert.equal(await readFile(project.statePath, "utf8"), before);
+  assert.equal(await readFile(project.optInPath, "utf8"), before);
   assert.ok(s.notices.some(item => item.message.includes("project opt-out could not be saved")));
   assert.equal(await s.handlers.get("context")({ messages: [] }, s.ctx), undefined);
 }));

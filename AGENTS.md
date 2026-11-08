@@ -24,7 +24,7 @@ pi --mode rpc --no-session --no-extensions -e builtin:mcp -e ./src/index.ts \
 
 # Explicit isolated runtime acceptance; never current user proxy/stores
 WORKBENCH_RUNTIME_TESTS=1 node test/e2e-check.mjs
-WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs --old-fixture --debian11
+WORKBENCH_RUNTIME_TESTS=1 node test/runtime-code-graph.mjs
 
 # Playwright runtime only after approved host-specific authorization; no Pi/model
 WORKBENCH_RUNTIME_TESTS=1 node test/runtime-playwright.mjs --keep

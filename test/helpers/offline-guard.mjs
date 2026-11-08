@@ -87,7 +87,7 @@ function checkCommand(command, args = [], options = {}) {
   }
   for (const arg of args) {
     if (typeof arg !== "string" || !arg.startsWith("{")) continue;
-    try { const spec = JSON.parse(arg); if (spec.schema === 1 && typeof spec.command === "string") checkCommand(spec.command, spec.args, options); }
+    try { const spec = JSON.parse(arg); if (spec.schemaVersion === 1 && typeof spec.command === "string") checkCommand(spec.command, spec.args, options); }
     catch (error) { if (error.message.startsWith("Offline policy")) throw error; }
   }
 }

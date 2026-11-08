@@ -42,7 +42,7 @@ export function createScreenshotDescribeTool(deps: ScreenshotDescribeDependencie
       const note = text ? `\n\nScreenshot details:\n${text}` : "";
       const described = await describeImage({ image: { data: image.data, mimeType: image.mimeType }, question: params.question, signal }, { registry: ctx.modelRegistry, target: vision.target });
       if (!described.ok) throw new Error(`Vision description unavailable (${described.reason}): ${described.message} Use browser_snapshot instead.${note}`);
-      return { content: [{ type: "text", text: `${described.text}${note}` }], details: { model: described.model, elapsedMs: described.elapsedMs, mimeType: image.mimeType } };
+      return { content: [{ type: "text", text: `${described.text}${note}` }], details: { model: described.model, elapsedMs: described.elapsedMs, mimeType: image.mimeType }, ...(described.usage ? { usage: described.usage } : {}) };
     },
   };
 }

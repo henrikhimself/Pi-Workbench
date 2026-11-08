@@ -13,6 +13,8 @@
  *   ToolMessage     { role: "tool", content: string, tool_call_id: string }
  */
 
+import { isDeepStrictEqual } from "node:util";
+
 import type {
   Message,
   UserMessage as PiUserMessage,
@@ -139,15 +141,15 @@ function convertToolResultMessage(msg: PiToolResultMessage): OpenAIMessage {
  *
  * Strategy: positional alignment with the original messages.
  * - If message counts match, copy structural metadata from originals, take text from compressed.
- * - If counts differ (compression merged/dropped messages), build fresh Pi messages.
- *
- * Note: The returned messages are used as a deep copy for a single LLM call,
- * so losing metadata (timestamps, usage) is acceptable.
+ * - Messages Headroom did not change are returned as the original object.
+ * - If counts differ (compression merged/dropped messages), match tool results and
+ *   tool-calling assistant messages to their originals by tool-call id. If any cannot
+ *   be matched, report an unapplied outcome instead of inventing metadata.
  */
 export interface OpenAIToPiOutcome {
   messages: Message[];
   applied: boolean;
-  reason?: "image-count-mismatch";
+  reason?: "image-count-mismatch" | "unmatched-after-count-change";
 }
 
 export function openAIToPiWithOutcome(compressed: OpenAIMessage[], original: Message[]): OpenAIToPiOutcome {
@@ -162,13 +164,75 @@ export function openAIToPiWithOutcome(compressed: OpenAIMessage[], original: Mes
     return { messages: compressed.map((compMsg, i) => alignMessage(compMsg, original[i])), applied: true };
   }
 
-  // Counts differ without images: build fresh messages.
-  return { messages: compressed.map((compMsg) => buildFreshMessage(compMsg)), applied: true };
+  // Counts differ without images: positional alignment is impossible, so match
+  // tool results and tool-calling assistant messages to their originals by
+  // tool-call id. Never invent tool names, error flags or provider metadata:
+  // when something cannot be matched, keep the original transcript instead.
+  const messages = rebuildAfterCountChange(compressed, original);
+  if (!messages) return { messages: original, applied: false, reason: "unmatched-after-count-change" };
+  return { messages, applied: true };
 }
 
-/** @deprecated Use openAIToPiWithOutcome when caller needs compression accounting. */
-export function openAIToPi(compressed: OpenAIMessage[], original: Message[]): Message[] {
-  return openAIToPiWithOutcome(compressed, original).messages;
+function rebuildAfterCountChange(compressed: OpenAIMessage[], original: Message[]): Message[] | null {
+  const toolResults = new Map<string, PiToolResultMessage>();
+  const assistantsByCallId = new Map<string, PiAssistantMessage>();
+  for (const msg of original) {
+    if (msg.role === "toolResult") toolResults.set(msg.toolCallId, msg);
+    else if (msg.role === "assistant") {
+      for (const part of msg.content) if (part.type === "toolCall") assistantsByCallId.set(part.id, msg);
+    }
+  }
+
+  const usedAssistants = new Set<PiAssistantMessage>();
+  const usedResults = new Set<string>();
+  const result: Message[] = [];
+  for (const comp of compressed) {
+    if (comp.role === "tool") {
+      const orig = toolResults.get(comp.tool_call_id);
+      if (!orig || usedResults.has(comp.tool_call_id)) return null;
+      usedResults.add(comp.tool_call_id);
+      result.push({ ...orig, content: replaceTextPreservingImages(orig.content, comp.content) });
+    } else if (comp.role === "assistant" && comp.tool_calls?.length) {
+      let orig: PiAssistantMessage | undefined;
+      for (const tc of comp.tool_calls) orig ??= assistantsByCallId.get(tc.id);
+      if (!orig || usedAssistants.has(orig)) return null;
+      usedAssistants.add(orig);
+      result.push(alignAssistantMessage(comp, orig));
+    } else {
+      // User/system text and assistant text without tool calls carry no
+      // metadata that a tool-call id could restore.
+      result.push(buildFreshMessage(comp));
+    }
+  }
+  return result;
+}
+
+/**
+ * Map compressed LLM messages back onto the agent messages they came from, so
+ * later `context` handlers still see custom, bash-execution and summary roles.
+ *
+ * `agentMessages[i]` must be the source of `llmMessages[i]`, and `compressed`
+ * must be position-aligned with `llmMessages` (equal length). Otherwise the
+ * compressed messages are returned as they are.
+ *
+ * - Unchanged message: the original agent message object.
+ * - Changed `custom` message: the original with only `content` replaced.
+ * - Changed bash-execution/summary message: the converted user message, because
+ *   their structured fields cannot be rebuilt from compressed text.
+ * - user/assistant/toolResult: the aligned message (already built from the original).
+ */
+export function restoreAgentMessages<T extends { role: string }>(
+  agentMessages: readonly T[],
+  llmMessages: readonly Message[],
+  compressed: readonly Message[],
+): Array<T | Message> {
+  if (agentMessages.length !== llmMessages.length || compressed.length !== llmMessages.length) return [...compressed];
+  return compressed.map((msg, i) => {
+    const agent = agentMessages[i];
+    if (msg === llmMessages[i] || isDeepStrictEqual(msg, llmMessages[i])) return agent;
+    if (agent.role === "custom" && msg.role === "user") return { ...agent, content: msg.content } as T;
+    return msg;
+  });
 }
 
 /**
@@ -193,6 +257,7 @@ function alignUserMessage(comp: OpenAIMessage & { role: "system" | "user" }, ori
   const content = openAIUserContentToPi(comp.content);
 
   if (orig.role === "user") {
+    if (comp.role === "user" && isDeepStrictEqual(comp.content, convertUserMessage(orig).content)) return orig;
     return {
       ...orig,
       // Headroom may return string content even when input had images. Keep the
@@ -212,41 +277,66 @@ function alignUserMessage(comp: OpenAIMessage & { role: "system" | "user" }, ori
 }
 
 function alignAssistantMessage(comp: OpenAIMessage & { role: "assistant" }, orig: Message): Message {
-  const contentParts: PiAssistantMessage["content"] = [];
-
-  // Add text content
-  const text = typeof comp.content === "string" ? comp.content : null;
-  if (text) {
-    contentParts.push({ type: "text", text });
-  }
-
-  // Add tool calls
-  if (comp.tool_calls) {
-    for (const tc of comp.tool_calls) {
-      contentParts.push({
-        type: "toolCall",
-        id: tc.id,
-        name: tc.function.name,
-        arguments: safeJsonParse(tc.function.arguments),
-      });
-    }
-  }
-
-  // Preserve thinking content from original if it was an assistant message
-  if (orig.role === "assistant") {
-    const thinkingParts = orig.content.filter((p) => p.type === "thinking");
-    return {
-      ...orig,
-      content: [...thinkingParts, ...contentParts],
-    };
-  }
-
   // Role mismatch: build fresh
-  return buildFreshAssistantMessage(comp);
+  if (orig.role !== "assistant") return buildFreshAssistantMessage(comp);
+
+  const compText = typeof comp.content === "string" ? comp.content : "";
+  const compCalls = comp.tool_calls ?? [];
+  const origCalls = orig.content.filter((p): p is PiToolCall => p.type === "toolCall");
+  const origText = orig.content.filter((p): p is TextContent => p.type === "text").map((p) => p.text).join("");
+
+  const textSame = compText === origText;
+  const callsSame =
+    compCalls.length === origCalls.length &&
+    compCalls.every((tc, i) =>
+      tc.id === origCalls[i].id &&
+      tc.function.name === origCalls[i].name &&
+      isDeepStrictEqual(safeJsonParse(tc.function.arguments), origCalls[i].arguments),
+    );
+  // Keep the original untouched when Headroom did not change it: providers
+  // replay signatures, thinking order and tool-call metadata from these blocks.
+  if (textSame && callsSame) return orig;
+
+  // Merge into the original blocks in place. Only text and tool-call arguments
+  // are replaced; thinking blocks, signatures, namespaces and order stay.
+  const compCallById = new Map(compCalls.map((tc) => [tc.id, tc]));
+  const seenCalls = new Set<string>();
+  const content: PiAssistantMessage["content"] = [];
+  let textPlaced = textSame;
+  for (const block of orig.content) {
+    if (block.type === "text" && !textSame) {
+      if (!textPlaced) {
+        textPlaced = true;
+        if (compText) content.push({ ...block, text: compText });
+      }
+      continue;
+    }
+    if (block.type === "toolCall") {
+      const tc = compCallById.get(block.id);
+      if (!tc) continue; // Headroom dropped this call
+      seenCalls.add(block.id);
+      content.push({ ...block, arguments: safeJsonParse(tc.function.arguments) });
+      continue;
+    }
+    content.push(block);
+  }
+
+  if (!textPlaced && compText) {
+    const firstCall = content.findIndex((p) => p.type === "toolCall");
+    content.splice(firstCall === -1 ? content.length : firstCall, 0, { type: "text", text: compText });
+  }
+  // Tool calls that did not exist in the original are appended as plain calls.
+  for (const tc of compCalls) {
+    if (seenCalls.has(tc.id)) continue;
+    content.push({ type: "toolCall", id: tc.id, name: tc.function.name, arguments: safeJsonParse(tc.function.arguments) });
+  }
+
+  return { ...orig, content };
 }
 
 function alignToolResultMessage(comp: OpenAIMessage & { role: "tool" }, orig: Message): Message {
   if (orig.role === "toolResult") {
+    if (comp.content === convertToolResultMessage(orig).content) return orig;
     return {
       ...orig,
       // OpenAI tool messages only support string content, so retain original

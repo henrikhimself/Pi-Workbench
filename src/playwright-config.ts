@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
+import { requireSchemaVersion } from "./schema-version.js";
 import { isDeepStrictEqual } from "node:util";
 import { constants } from "node:fs";
-import { lstat, mkdir, open, rm } from "node:fs/promises";
+import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { resolveCodeGraphProject } from "./code-graph-config.js";
-import { acquireManagedLock, assertNoSymlink, assertWithin, ensurePrivateDirectory, ownIdentity, publishJson, syncDirectory, type ProcessIdentity } from "./managed-lifecycle.js";
+import { acquireManagedLock, assertNoSymlink, assertWithin, ensurePrivateDirectory, ownIdentity, publishJson, type ProcessIdentity } from "./managed-lifecycle.js";
+import { readOptIn, writeOptIn } from "./project-opt-in.js";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 
 export const PLAYWRIGHT_VERSION = "0.0.84";
@@ -16,22 +18,22 @@ export const PLAYWRIGHT_REQUIRED_TOOLS = ["browser_navigate", "browser_snapshot"
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const hash = /^[0-9a-f]{64}$/;
 
-export interface PlaywrightProject { root: string; projectPath: string; identifier: string; directory: string; statePath: string }
+export interface PlaywrightProject { root: string; projectPath: string; identifier: string; directory: string; optInPath: string }
 export interface PlaywrightSession {
   project: PlaywrightProject; id: string; directory: string; configPath: string; markerPath: string;
   artifacts: string; home: string; cache: string; tmp: string; diagnostics: string;
 }
 export interface PlaywrightHostExecutable { path: string; version: string; sha256: string }
 export interface PlaywrightRuntimeRecord {
-  schema: 1; policy: number; id: string; version: string; engineVersion: string; manifestSha256: string;
+  schemaVersion: 1; policy: number; id: string; version: string; engineVersion: string; manifestSha256: string;
   slot: string; node: PlaywrightHostExecutable; npm: PlaywrightHostExecutable;
   entrypoint: string; browser: string; browserVersion: string; tools: string[]; validatedAt: string;
 }
 export interface PlaywrightSessionRecord {
-  schema: 1; sessionId: string; runtimeId: string; workspace: string; identifier: string;
+  schemaVersion: 1; sessionId: string; runtimeId: string; workspace: string; identifier: string;
   owner: ProcessIdentity; createdAt: string;
 }
-export interface PlaywrightRecoveryRecord { schema: 1; operation: "publication" | "cleanup"; runtimeId: string; detail: string; createdAt: string }
+export interface PlaywrightRecoveryRecord { schemaVersion: 1; operation: "publication" | "cleanup"; runtimeId: string; detail: string; createdAt: string }
 
 function object(value: unknown, fields: string[]): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.keys(value).some(key => !fields.includes(key)) || fields.some(key => !Object.hasOwn(value, key))) {
@@ -47,11 +49,11 @@ export function resolvePlaywrightProject(cwd: string, paths: WorkbenchPaths = WO
   // Reuse canonical workspace/basename-hash semantics, never the graph's store.
   const project = resolveCodeGraphProject(cwd, { codeGraphRoot: paths.playwrightRoot, codeGraphProjects: paths.playwrightProjects });
   return { root: resolve(paths.playwrightRoot), projectPath: project.projectPath, identifier: project.identifier,
-    directory: project.directory, statePath: join(project.directory, "opt-in.json") };
+    directory: project.directory, optInPath: join(project.directory, "opt-in.json") };
 }
 export function assertPlaywrightProject(project: PlaywrightProject): void {
   const expected = resolvePlaywrightProject(project.projectPath, { ...WORKBENCH_PATHS, playwrightRoot: project.root, playwrightProjects: join(project.root, "projects") });
-  for (const key of ["root", "projectPath", "identifier", "directory", "statePath"] as const) {
+  for (const key of ["root", "projectPath", "identifier", "directory", "optInPath"] as const) {
     if (expected[key] !== project[key]) throw new Error("Playwright workspace identity/path mismatch");
   }
   assertWithin(project.root, project.directory);
@@ -84,13 +86,8 @@ export async function readPlaywrightJson(root: string, path: string): Promise<un
 }
 export async function playwrightOptedIn(project: PlaywrightProject): Promise<boolean> {
   assertPlaywrightProject(project);
-  const raw = await readPlaywrightJson(project.root, project.statePath);
-  if (raw === null) return false;
-  const state = object(raw, ["schema", "enabled", "workspace", "identifier"]);
-  if (state.schema !== 1 || state.enabled !== true || state.workspace !== project.projectPath || state.identifier !== project.identifier) {
-    throw new Error("Invalid Playwright opt-in; existing data left unchanged");
-  }
-  return true;
+  // The shared check is strict; the Playwright read adds containment and ancestry safety.
+  return readOptIn(project, path => readPlaywrightJson(project.root, path));
 }
 export async function preparePlaywrightRoot(paths: WorkbenchPaths): Promise<void> {
   await ensurePrivateDirectory(paths.root, paths.playwrightRoot);
@@ -99,23 +96,22 @@ export async function playwrightWorkspaceLock(project: PlaywrightProject, signal
   assertPlaywrightProject(project);
   return acquireManagedLock(join(project.root, "coordination"), `workspace-${project.identifier}`, { signal });
 }
-export async function setPlaywrightOptIn(project: PlaywrightProject, enabled: boolean, signal?: AbortSignal): Promise<void> {
+export async function enablePlaywrightOptIn(project: PlaywrightProject, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   assertPlaywrightProject(project);
-  if (!enabled && !await playwrightOptedIn(project)) return;
   await ensurePrivateDirectory(project.root);
   const unlock = await playwrightWorkspaceLock(project, signal);
   try {
     signal?.throwIfAborted();
     await playwrightOptedIn(project); // Refuse to overwrite incompatible/unsafe intent.
-    if (enabled) await publishJson(project.root, project.statePath, { schema: 1, enabled: true, workspace: project.projectPath, identifier: project.identifier });
-    else { await rm(project.statePath); await syncDirectory(project.directory); }
+    await writeOptIn(project, project.root);
   } finally { await unlock(); }
 }
 
 export function parsePlaywrightRuntime(raw: unknown, paths: WorkbenchPaths): PlaywrightRuntimeRecord {
-  const record = object(raw, ["schema", "policy", "id", "version", "engineVersion", "manifestSha256", "slot", "node", "npm", "entrypoint", "browser", "browserVersion", "tools", "validatedAt"]);
-  if (record.schema !== 1 || record.policy !== PLAYWRIGHT_POLICY || typeof record.id !== "string") throw new Error("Unsupported Playwright runtime schema/policy");
+  requireSchemaVersion(raw, "Playwright runtime record");
+  const record = object(raw, ["schemaVersion", "policy", "id", "version", "engineVersion", "manifestSha256", "slot", "node", "npm", "entrypoint", "browser", "browserVersion", "tools", "validatedAt"]);
+  if (record.policy !== PLAYWRIGHT_POLICY || typeof record.id !== "string") throw new Error("Unsupported Playwright runtime policy");
   assertPlaywrightId(record.id);
   if (!nonempty(record.version) || !/^\d+\.\d+\.\d+$/.test(record.version) || !nonempty(record.engineVersion) || !nonempty(record.manifestSha256) || !hash.test(record.manifestSha256)) throw new Error("Invalid Playwright runtime package identity");
   if (record.slot !== join(paths.playwrightRuntimes, record.version, record.id)) throw new Error("Invalid Playwright runtime slot");
@@ -129,24 +125,27 @@ export function parsePlaywrightRuntime(raw: unknown, paths: WorkbenchPaths): Pla
   if (!nonempty(record.browserVersion) || !timestamp(record.validatedAt) || !Array.isArray(record.tools) || !record.tools.length || record.tools.some(tool => !nonempty(tool)) || new Set(record.tools).size !== record.tools.length) throw new Error("Invalid Playwright readiness evidence");
   return record as unknown as PlaywrightRuntimeRecord;
 }
-export function parsePlaywrightSelection(raw: unknown, paths: WorkbenchPaths): { schema: 1; id: string; version: string; slot: string } {
-  const record = object(raw, ["schema", "id", "version", "slot"]);
-  if (record.schema !== 1 || typeof record.id !== "string" || typeof record.version !== "string" || !/^\d+\.\d+\.\d+$/.test(record.version)) throw new Error("Invalid Playwright selection");
+export function parsePlaywrightSelection(raw: unknown, paths: WorkbenchPaths): { schemaVersion: 1; id: string; version: string; slot: string } {
+  requireSchemaVersion(raw, "Playwright runtime selection");
+  const record = object(raw, ["schemaVersion", "id", "version", "slot"]);
+  if (typeof record.id !== "string" || typeof record.version !== "string" || !/^\d+\.\d+\.\d+$/.test(record.version)) throw new Error("Invalid Playwright selection");
   assertPlaywrightId(record.id);
   if (record.slot !== join(paths.playwrightRuntimes, record.version, record.id)) throw new Error("Invalid Playwright selection path");
-  return record as unknown as { schema: 1; id: string; version: string; slot: string };
+  return record as unknown as { schemaVersion: 1; id: string; version: string; slot: string };
 }
 export function parsePlaywrightSession(raw: unknown): PlaywrightSessionRecord {
-  const record = object(raw, ["schema", "sessionId", "runtimeId", "workspace", "identifier", "owner", "createdAt"]);
-  if (record.schema !== 1 || !nonempty(record.sessionId) || !nonempty(record.runtimeId) || !nonempty(record.workspace) || !isAbsolute(record.workspace) || !nonempty(record.identifier) || !timestamp(record.createdAt)) throw new Error("Invalid Playwright session record");
+  requireSchemaVersion(raw, "Playwright session record");
+  const record = object(raw, ["schemaVersion", "sessionId", "runtimeId", "workspace", "identifier", "owner", "createdAt"]);
+  if (!nonempty(record.sessionId) || !nonempty(record.runtimeId) || !nonempty(record.workspace) || !isAbsolute(record.workspace) || !nonempty(record.identifier) || !timestamp(record.createdAt)) throw new Error("Invalid Playwright session record");
   assertPlaywrightId(record.sessionId); assertPlaywrightId(record.runtimeId);
   const owner = object(record.owner, ["pid", "start", "host"]);
   if (!Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !nonempty(owner.start) || !nonempty(owner.host)) throw new Error("Invalid Playwright session owner");
   return record as unknown as PlaywrightSessionRecord;
 }
 export function parsePlaywrightRecovery(raw: unknown): PlaywrightRecoveryRecord {
-  const record = object(raw, ["schema", "operation", "runtimeId", "detail", "createdAt"]);
-  if (record.schema !== 1 || !["publication", "cleanup"].includes(String(record.operation)) || !nonempty(record.runtimeId) || !nonempty(record.detail) || !timestamp(record.createdAt)) throw new Error("Invalid Playwright recovery record");
+  requireSchemaVersion(raw, "Playwright recovery record");
+  const record = object(raw, ["schemaVersion", "operation", "runtimeId", "detail", "createdAt"]);
+  if (!["publication", "cleanup"].includes(String(record.operation)) || !nonempty(record.runtimeId) || !nonempty(record.detail) || !timestamp(record.createdAt)) throw new Error("Invalid Playwright recovery record");
   assertPlaywrightId(record.runtimeId);
   return record as unknown as PlaywrightRecoveryRecord;
 }
@@ -194,7 +193,7 @@ export async function preparePlaywrightSession(session: PlaywrightSession, runti
   await mkdir(session.directory, { mode: 0o700 }); // EEXIST is not permission to reuse prior login state.
   for (const path of [session.artifacts, session.diagnostics]) await ensurePrivateDirectory(session.project.root, path);
   await preparePlaywrightTransient(session);
-  await publishJson(session.project.root, session.markerPath, { schema: 1, sessionId: session.id, runtimeId: runtime.id,
+  await publishJson(session.project.root, session.markerPath, { schemaVersion: 1, sessionId: session.id, runtimeId: runtime.id,
     workspace: session.project.projectPath, identifier: session.project.identifier, owner: await ownIdentity(), createdAt: new Date().toISOString() });
   await publishJson(session.project.root, session.configPath, playwrightMcpConfiguration(session, runtime.browser));
 }

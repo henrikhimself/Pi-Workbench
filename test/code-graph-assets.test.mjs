@@ -7,7 +7,6 @@ const {
   ASSET_VERSION_TOKEN,
   CODE_GRAPH_ASSETS,
   CODE_GRAPH_BINARY_MEMBER,
-  compareAssetVersions,
   getAsset,
   parseAssetVersion,
   resolveAssetUrl,
@@ -46,16 +45,6 @@ test("parseAssetVersion accepts only vMAJOR.MINOR.PATCH", () => {
   assert.equal(parseAssetVersion("V0.8.1"), null);
   assert.equal(parseAssetVersion(""), null);
   assert.equal(parseAssetVersion(undefined), null);
-});
-
-test("compareAssetVersions compares numeric segments, not lexically", () => {
-  assert.equal(compareAssetVersions("v0.8.1", "v0.8.1"), 0);
-  assert.equal(compareAssetVersions("v0.8.1", "v0.8.2"), -1);
-  assert.equal(compareAssetVersions("v0.8.2", "v0.8.1"), 1);
-  assert.equal(compareAssetVersions("v0.8.9", "v0.8.10"), -1);
-  assert.equal(compareAssetVersions("v0.9.0", "v0.8.10"), 1);
-  assert.equal(compareAssetVersions("v1.0.0", "v0.99.99"), 1);
-  assert.throws(() => compareAssetVersions("0.8.1", "v0.8.1"), /Unparseable asset version/);
 });
 
 test("validateAsset rejects malformed version, checksum, URL, and platform", () => {

@@ -44,7 +44,7 @@ try {
   const runtime = new ManagedHeadroomRuntime({ paths }); assert.ok(await runtime.ensure(message => console.error(message)));
   const installer = new CodeGraphInstaller({ paths });
   const { resolveCompressionProject, setCompressionOptIn } = await jiti.import("../src/headroom-project.ts");
-  for (const name of ["a", "b"]) {
+  for (const name of ["a", "b", "m"]) {
     const cwd = join(home, name); await mkdir(cwd); await run("git", ["init", "--quiet"], { cwd });
     await writeFile(join(cwd, "fixture.ts"), "export function liveSentinel() { return 978163; }\n");
     await setCompressionOptIn(resolveCompressionProject(cwd, paths), true);
@@ -52,7 +52,7 @@ try {
     assert.ok(await memory.prepare(message => console.error(message))); await memory.createStore();
     const graph = new CodeGraphManager({ paths, ensureInstalled: cb => installer.ensureInstalled(cb), registerMcp: () => {}, unregisterMcp: () => {} });
     const project = resolveCodeGraphProject(cwd, paths); const activated = await graph.activate(project); assert.equal(activated.ok, true, activated.detail); await graph.shutdown();
-    if (name === "a") { const state = JSON.parse(await readFile(project.statePath, "utf8")); state.version = "v0.8.1"; state.resolvedUrl = "https://fixture.invalid/controlled-old-identity"; state.sha256 = "a".repeat(64); await writeFile(project.statePath, JSON.stringify(state)); }
+    if (name === "m") { const identity = JSON.parse(await readFile(project.identityPath, "utf8")); identity.codeGraphVersion = "v0.8.1"; identity.resolvedUrl = "https://fixture.invalid/mismatched-identity"; identity.sha256 = "a".repeat(64); await writeFile(project.identityPath, JSON.stringify(identity)); }
   }
   // Do not share real Pi agent resources or paid provider credentials with worker.
   const env = { PATH: process.env.PATH, LANG: "C.UTF-8", HOME: userHome, USERPROFILE: userHome,

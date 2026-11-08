@@ -17,6 +17,7 @@ const runtime = new ManagedHeadroomRuntime({ paths, requiredVersion: version, sy
     if (args.includes("--report")) {
       await writeFile(args[args.indexOf("--report") + 1], JSON.stringify({ install: ["headroom-ai", "cryptography"].map(name => ({ metadata: { name, version: name === "cryptography" ? "50.0.2" : version }, download_info: { archive_info: { hashes: { sha256: "a".repeat(64) } } } })) })); return "";
     }
+    if (args.includes("--version")) return "pip 24.0 from /fixture/pip (python 3)";
     if (args.includes("pip")) {
       await appendFile(join(home, "installs.jsonl"), JSON.stringify({ pid: process.pid, version }) + "\n");
       await new Promise(resolve => setTimeout(resolve, 100)); return "";

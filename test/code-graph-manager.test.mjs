@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readdirSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -10,21 +11,20 @@ import { fakeCbmSource } from "./helpers/fake-cbm.mjs";
 const jiti = createJiti(import.meta.url);
 const {
   CodeGraphManager,
-  CODE_GRAPH_EXPECTED_TOOL_COUNT,
+  CODE_GRAPH_EXPECTED_TOOLS,
   CODE_GRAPH_GUIDANCE_MESSAGE,
   CODE_GRAPH_MCP_SERVER_NAME,
   createCbmEnvironment,
-  createCodeGraphManager,
   curlShimDirectory,
   defaultMcpHandshakeRunner,
   ensureCurlDenyShim,
 } = await jiti.import("../src/code-graph-manager.ts");
 const {
-  createCodeGraphState,
+  codeGraphIdentity,
   resolveCodeGraphProject,
   validateCodeGraphState,
-  writeCodeGraphStateAtomic,
 } = await jiti.import("../src/code-graph-config.ts");
+const { writeOptIn } = await jiti.import("../src/project-opt-in.ts");
 const { detectCodeGraphPlatform, installedBinaryPath } = await jiti.import("../src/code-graph-installer.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 
@@ -71,22 +71,20 @@ async function makeFixture() {
   };
 }
 
-async function writeValidState(project, paths, fakeDir, { version = "v0.12.1" } = {}) {
-  const binary = await writeFakeCbm(fakeDir, `cbm-state-${version.replace(/\./g, "-")}.cjs`, {});
-  await mkdir(project.directory, { recursive: true });
-  await writeFile(join(project.directory, "_config.db"), "auto_index = true\n", "utf8");
-  await writeFile(join(project.directory, "derived-project.db"), "INDEX", "utf8");
-  const state = createCodeGraphState(project, {
-    version,
-    resolvedUrl: "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64.tar.gz",
-    sha256: "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091",
-  });
-  await writeCodeGraphStateAtomic(project, state);
-  return { binary, state };
-}
-
 const FAKE_SHA = "d2f842d1365da5c35d9c5796f57a821c9745267350994346735e1e6e04d46091";
 const FAKE_URL = "https://github.com/abseil/codebase-memory-mcp/releases/download/v0.12.1/codebase-memory-mcp-linux-arm64.tar.gz";
+
+/** The files `on` leaves behind: identity first, CBM data, opt-in last. Overrides make mismatched data. */
+async function writeValidState(project, paths, fakeDir, { version = "v0.12.1", sha256 = FAKE_SHA, resolvedUrl = FAKE_URL } = {}) {
+  const binary = await writeFakeCbm(fakeDir, `cbm-state-${version.replace(/\./g, "-")}.cjs`, {});
+  await mkdir(project.directory, { recursive: true });
+  const identity = codeGraphIdentity({ version, resolvedUrl, sha256 });
+  await writeFile(project.identityPath, JSON.stringify(identity), { mode: 0o600 });
+  await writeFile(join(project.directory, "_config.db"), "auto_index = true\n", "utf8");
+  await writeFile(join(project.directory, "derived-project.db"), "INDEX", "utf8");
+  await writeOptIn(project, project.directory);
+  return { binary, identity };
+}
 
 function installResult(binaryPath) {
   return { path: binaryPath, version: "v0.12.1", resolvedUrl: FAKE_URL, sha256: FAKE_SHA, reused: true };
@@ -95,7 +93,7 @@ function installResult(binaryPath) {
 function okHandshake(overrides = {}) {
   return async () => ({
     ok: true,
-    tools: Array.from({ length: CODE_GRAPH_EXPECTED_TOOL_COUNT }, (_, i) => `tool_${i}`),
+    tools: Array.from({ length: CODE_GRAPH_EXPECTED_TOOLS.length }, (_, i) => `tool_${i}`),
     ...overrides,
   });
 }
@@ -188,7 +186,6 @@ test("handshake probe validates initialize + 17 tools and kills the probe", asyn
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, true);
     assert.equal(result.tools.length, 17);
@@ -216,7 +213,6 @@ test("handshake probe rejects wrong tool count", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /tool count mismatch: got 13, expected 17/);
@@ -238,7 +234,6 @@ test("handshake probe rejects noisy (non-JSON-RPC) stdout", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /non-JSON-RPC/);
@@ -260,7 +255,6 @@ test("handshake probe rejects protocol version mismatch", async () => {
       cwd: workspace,
       env,
       timeoutMs: 15_000,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /protocol mismatch/);
@@ -282,7 +276,6 @@ test("handshake probe times out on a hanging server", async () => {
       cwd: workspace,
       env,
       timeoutMs: 700,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /timed out/);
@@ -306,7 +299,6 @@ test("handshake probe reports early exit", async () => {
       cwd: workspace,
       env,
       timeoutMs: 10_000,
-      expectedToolCount: 17,
     });
     assert.equal(result.ok, false);
     assert.match(result.detail ?? "", /exited before handshake/);
@@ -337,13 +329,14 @@ test("activate: full transaction publishes state, registers MCP, reports tools",
     assert.equal(result.ok, true);
     assert.equal(result.alreadyOn, false);
     assert.equal(result.tools.length, 17);
-    assert.equal(result.state.version, "v0.12.1");
+    assert.equal(result.identity.codeGraphVersion, "v0.12.1");
 
     // State + CBM data published below the project directory only.
-    const stateCheck = validateCodeGraphState(fx.project);
+    const stateCheck = await validateCodeGraphState(fx.project);
     assert.equal(stateCheck.ok, true);
     const listing = await readdir(fx.project.directory);
-    assert.ok(listing.includes("state.json"));
+    assert.ok(listing.includes("opt-in.json") && listing.includes("workbench-identity.json"));
+    assert.equal(listing.includes("state.json"), false);
     assert.ok(listing.includes("_config.db"));
     assert.ok(listing.some((name) => name.endsWith(".db") && name !== "_config.db"));
     // Curl deny shim materialized under the managed root.
@@ -358,10 +351,13 @@ test("activate: full transaction publishes state, registers MCP, reports tools",
     assert.deepEqual(JSON.parse(config.args[1]).args, ["--ui=false", "--quiet", "--repo-path", fx.project.projectPath]);
     assert.equal(config.cwd, fx.project.projectPath);
     assert.equal(config.exposure, "direct");
-    assert.equal(config.env.CBM_CACHE_DIR, fx.project.directory);
-    assert.equal(config.env.CBM_LOG_LEVEL, "error");
-    assert.ok(config.env.PATH.startsWith(`${curlShimDirectory(fx.paths.codeGraphCurlShim)}:`));
-    assert.equal("CBM_DOWNLOAD_URL" in config.env, false);
+    assert.deepEqual(config.toolExposure, { delete_project: "hidden", index_repository: "hidden" }, "destructive tools are not offered to the model");
+    assert.equal(config.env, undefined, "nothing is registered through Pi's merged, interpolated env");
+    const specEnv = JSON.parse(config.args[1]).env;
+    assert.equal(specEnv.CBM_CACHE_DIR, fx.project.directory);
+    assert.equal(specEnv.CBM_LOG_LEVEL, "error");
+    assert.ok(specEnv.PATH.startsWith(`${curlShimDirectory(fx.paths.codeGraphCurlShim)}:`));
+    assert.equal("CBM_DOWNLOAD_URL" in specEnv, false);
 
     const callLog = await readFile(join(fx.fakeDir, "calls.log"), "utf8");
     assert.ok(callLog.includes("index-repository"));
@@ -469,9 +465,9 @@ test("activate: index failure rolls back staging, publishes no state, registers 
     assert.equal(result.kind, "mcp_failed");
     assert.match(result.detail, /index_repository failed/);
     assert.equal(registered.length, 0);
-    // Staging directory rolled back; no state.json survived.
+    // Staging directory rolled back; no opt-in.json survived.
     await assert.rejects(stat(fx.project.directory));
-    await assert.rejects(stat(fx.project.statePath));
+    await assert.rejects(stat(fx.project.optInPath));
   } finally {
     await fx.cleanup();
   }
@@ -490,7 +486,7 @@ test("activate: handshake failure keeps the transaction unpublished", async () =
     const result = await manager.activate(fx.project);
     assert.equal(result.ok, false);
     assert.match(result.detail, /tool count mismatch/);
-    await assert.rejects(stat(fx.project.statePath));
+    await assert.rejects(stat(fx.project.optInPath));
     await assert.rejects(stat(fx.project.directory));
   } finally {
     await fx.cleanup();
@@ -501,7 +497,7 @@ test("activate: corrupt pre-existing state is reported, never auto-repaired or d
   const fx = await makeFixture();
   try {
     await mkdir(fx.project.directory, { recursive: true });
-    await writeFile(fx.project.statePath, "{not json", "utf8");
+    await writeFile(fx.project.optInPath, "{not json", { encoding: "utf8", mode: 0o600 });
     const binary = await writeFakeCbm(fx.fakeDir, "cbm-unused.cjs", {});
     let installerCalls = 0;
     const manager = new CodeGraphManager(
@@ -518,7 +514,7 @@ test("activate: corrupt pre-existing state is reported, never auto-repaired or d
     assert.equal(installerCalls, 0);
     // Pre-existing directory preserved.
     await stat(fx.project.directory);
-    assert.equal(await readFile(fx.project.statePath, "utf8"), "{not json");
+    assert.equal(await readFile(fx.project.optInPath, "utf8"), "{not json");
   } finally {
     await fx.cleanup();
   }
@@ -630,17 +626,17 @@ test("restore: _config.db without auto_index=true is corrupt, not auto-repaired"
 test("restore: packaged update failure never executes prior binary", { skip: detectCodeGraphPlatform({ os: process.platform, arch: process.arch }) === null ? "host platform outside approved scope" : false }, async () => {
   const fx = await makeFixture();
   try {
-    const { state } = await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    const { identity } = await writeValidState(fx.project, fx.paths, fx.fakeDir);
     // Seed a prior verified install at the state version.
     const platform = detectCodeGraphPlatform({ os: process.platform, arch: process.arch });
-    const priorDir = join(fx.paths.codeGraphBin, state.version, platform);
+    const priorDir = join(fx.paths.codeGraphBin, identity.codeGraphVersion, platform);
     await mkdir(priorDir, { recursive: true });
     const priorBinary = await writeFakeCbm(fx.fakeDir, "cbm-prior.cjs", {});
     await import("node:fs/promises").then((fsp) => fsp.copyFile(priorBinary, join(priorDir, "codebase-memory-mcp")));
     await import("node:fs/promises").then((fsp) => fsp.chmod(join(priorDir, "codebase-memory-mcp"), 0o755));
     await writeFile(
       join(priorDir, "asset.json"),
-      JSON.stringify({ version: state.version, resolvedUrl: FAKE_URL, sha256: FAKE_SHA, installedAt: new Date().toISOString() }),
+      JSON.stringify({ version: identity.codeGraphVersion, resolvedUrl: FAKE_URL, sha256: FAKE_SHA, installedAt: new Date().toISOString() }),
       "utf8",
     );
 
@@ -789,7 +785,7 @@ test("buildStatusReport reflects state without side effects", async () => {
     assert.equal(enabled.mcpRegistered, false);
     assert.ok(enabled.watcher === "git" || enabled.watcher === "disabled_non_git");
 
-    await writeFile(fx.project.statePath, "{broken", "utf8");
+    await writeFile(fx.project.optInPath, "{broken", { encoding: "utf8", mode: 0o600 });
     const corrupt = await manager.buildStatusReport({ project: fx.project, platform: "linux-arm64" });
     assert.equal(corrupt.kind, "corrupt");
     assert.match(corrupt.recovery ?? "", /off to clear/);
@@ -803,35 +799,6 @@ test("guidance message exists and mentions verification", () => {
   assert.match(CODE_GRAPH_GUIDANCE_MESSAGE, /verify/i);
 });
 
-// ─── Real binary integration (gated on spike artifact) ────────────────
-
-// Real artifacts belong in the explicit opt-in runtime harness.
-
-test("createCodeGraphManager builds a production-bound manager", async () => {
-  const fx = await makeFixture();
-  try {
-    const binary = await writeFakeCbm(fx.fakeDir, "cbm-prod.cjs", {});
-    let registered = false;
-    const manager = createCodeGraphManager({
-      paths: fx.paths,
-      installer: async () => installResult(binary),
-      registerMcp: () => {
-        registered = true;
-      },
-      unregisterMcp: () => {},
-    });
-    assert.ok(manager instanceof CodeGraphManager);
-    const result = await manager.activate(fx.project);
-    assert.equal(result.ok, true);
-    assert.equal(registered, true);
-    await manager.shutdown();
-    assert.equal(registered, true);
-  } finally {
-    await fx.cleanup();
-  }
-});
-
-
 test("failed unregister retains intent lease and prevents data deletion until successful retry", async () => {
   const fixture = await makeFixture(); let broken = true;
   const { activeConsumers } = await jiti.import("../src/managed-lifecycle.ts");
@@ -840,12 +807,12 @@ test("failed unregister retains intent lease and prevents data deletion until su
     registerMcp: () => {}, unregisterMcp: () => { if (broken) throw new Error("injected unregister failure"); } }));
   try {
     assert.equal((await manager.restore(fixture.project)).ok, true);
-    const original = await readFile(fixture.project.statePath, "utf8");
+    const original = await readFile(fixture.project.optInPath, "utf8");
     await assert.rejects(manager.stop(fixture.project), /injected unregister/);
     assert.equal(manager.isMcpRegistered, true);
     assert.equal((await activeConsumers(join(fixture.paths.codeGraphRuntime, "consumers", fixture.project.identifier))).length, 1);
-    await assert.rejects(manager.removeProject(fixture.project), /Active workspace consumers/);
-    assert.equal(await readFile(fixture.project.statePath, "utf8"), original);
+    await assert.rejects(manager.removeProject(fixture.project, { timeoutMs: 0 }), /Active workspace consumers/);
+    assert.equal(await readFile(fixture.project.optInPath, "utf8"), original);
     broken = false; await manager.stop(fixture.project); await manager.removeProject(fixture.project);
   } finally { broken = false; await manager.shutdown(); await fixture.cleanup(); }
 });
@@ -856,7 +823,7 @@ test("owned CBM environment isolates HOME and bounds canonical private IPC paths
   try {
     const binary = await writeFakeCbm(fx.fakeDir, "fixture.cjs");
     const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: () => {} }));
-    const env = manager.getMcpConfig(fx.project, binary).env;
+    const env = JSON.parse(manager.getMcpConfig(fx.project, installResult(binary)).args[1]).env;
     assert.equal(env.HOME, join(fx.paths.codeGraphRuntime, "homes", fx.project.identifier));
     assert.equal(env.XDG_CONFIG_HOME, join(env.HOME, "config"));
     assert.ok(env.CBM_RUNTIME_DIR.startsWith(fx.paths.codeGraphIpc + "/"));
@@ -865,4 +832,151 @@ test("owned CBM environment isolates HOME and bounds canonical private IPC paths
     assert.equal(failed.ok, false); assert.match(failed.detail, /Unix-socket limit/);
     assert.equal(manager.isMcpRegistered, false); await manager.shutdown();
   } finally { await fx.cleanup(); }
+});
+
+// ─── Mismatched data is refused, never converted (premise: no migration) ───
+
+test("mismatched identity is refused as upgrade_pending by activate, restore and reindex; nothing runs and no byte changes", async () => {
+  const mismatches = [{ version: "v0.8.1" }, { sha256: "b".repeat(64) }, { version: "v0.13.0" }, { resolvedUrl: "https://elsewhere.invalid/cbm.tar.gz" }];
+  for (const [index, mismatch] of mismatches.entries()) {
+    const fx = await makeFixture();
+    try {
+      await writeValidState(fx.project, fx.paths, fx.fakeDir, mismatch);
+      const callLog = join(fx.fakeDir, `calls-${index}.log`);
+      const binary = await writeFakeCbm(fx.fakeDir, `cbm-${index}.cjs`, { callLog });
+      const registered = [];
+      const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: (name) => registered.push(name), runMcpHandshake: okHandshake() }));
+      const snapshot = async () => JSON.stringify(await Promise.all(["workbench-identity.json", "opt-in.json", "_config.db", "derived-project.db"].map((name) => readFile(join(fx.project.directory, name), "utf8"))));
+      const before = await snapshot();
+      for (const action of ["activate", "restore", "reindex"]) {
+        const result = await manager[action](fx.project);
+        assert.equal(result.ok, false, `${action} ${JSON.stringify(mismatch)}`);
+        assert.equal(result.kind, "upgrade_pending", `${action} ${JSON.stringify(mismatch)}`);
+        assert.equal(result.detail, "Code Graph data was written by another version, which this release does not read. It was left unchanged.");
+        assert.doesNotMatch(result.detail, /migration|reindex workflow|fresh/i);
+      }
+      assert.equal(await snapshot(), before);
+      assert.deepEqual(registered, []);
+      assert.equal(await readFile(callLog, "utf8").catch(() => ""), "", "no CBM process ran");
+      await manager.shutdown();
+    } finally { await fx.cleanup(); }
+  }
+});
+
+test("a directory the guard did not mark is refused: leftover state.json, or another backend's identity without an opt-in", async () => {
+  for (const setup of ["leftover state.json", "mismatched identity, no opt-in"]) {
+    const fx = await makeFixture();
+    try {
+      if (setup === "leftover state.json") {
+        await mkdir(fx.project.directory, { recursive: true });
+        await writeFile(join(fx.project.directory, "state.json"), JSON.stringify({ schema: 1 }));
+      } else {
+        await writeValidState(fx.project, fx.paths, fx.fakeDir, { version: "v0.8.1" });
+        await rm(fx.project.optInPath);
+      }
+      const callLog = join(fx.fakeDir, "guard.log");
+      const binary = await writeFakeCbm(fx.fakeDir, "cbm-guard.cjs", { callLog });
+      const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: () => assert.fail("must not register") }));
+      const before = (await readdir(fx.project.directory)).sort();
+      const result = await manager.activate(fx.project);
+      assert.equal(result.ok, false, setup);
+      assert.equal(result.kind, "upgrade_pending", setup);
+      assert.equal(result.detail, "Code Graph data was written by another version, which this release does not read. It was left unchanged.");
+      assert.deepEqual((await readdir(fx.project.directory)).sort(), before, "nothing was added, changed or deleted");
+      assert.equal(await readFile(callLog, "utf8").catch(() => ""), "", "no CBM process ran");
+      await manager.shutdown();
+    } finally { await fx.cleanup(); }
+  }
+});
+
+test("a crash after the identity and index but before the opt-in leaves the project off with its data intact; the next activation continues", async () => {
+  const fx = await makeFixture();
+  try {
+    await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    await rm(fx.project.optInPath);
+    const before = await Promise.all(["workbench-identity.json", "_config.db", "derived-project.db"].map((name) => readFile(join(fx.project.directory, name), "utf8")));
+    const binary = await writeFakeCbm(fx.fakeDir, "cbm-continue.cjs", {});
+    const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: () => {}, runMcpHandshake: okHandshake() }));
+    assert.equal((await validateCodeGraphState(fx.project)).problem, "missing");
+    const restored = await manager.restore(fx.project);
+    assert.equal(restored.ok, false); assert.equal(restored.kind, "off");
+    assert.deepEqual(await Promise.all(["workbench-identity.json", "_config.db", "derived-project.db"].map((name) => readFile(join(fx.project.directory, name), "utf8"))), before);
+    const result = await manager.activate(fx.project);
+    assert.equal(result.ok, true, result.detail);
+    assert.equal((await validateCodeGraphState(fx.project)).ok, true);
+    assert.equal(await readFile(join(fx.project.directory, "workbench-identity.json"), "utf8"), before[0], "the identity file was never rewritten");
+    await manager.shutdown();
+  } finally { await fx.cleanup(); }
+});
+
+test("activation writes the identity first and the opt-in last", async () => {
+  const fx = await makeFixture();
+  try {
+    const seen = [];
+    const binary = await writeFakeCbm(fx.fakeDir, "cbm-order.cjs", {});
+    const manager = new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), runMcpHandshake: okHandshake(),
+      registerMcp: () => { seen.push(readdirSync(fx.project.directory).sort()); } }));
+    assert.equal((await manager.activate(fx.project)).ok, true);
+    // By the time MCP registers, both files exist; the opt-in was the last file written before registering.
+    assert.ok(seen[0].includes("opt-in.json") && seen[0].includes("workbench-identity.json"));
+    const info = async (name) => (await stat(join(fx.project.directory, name))).mtimeMs;
+    assert.ok(await info("workbench-identity.json") <= await info("_config.db"));
+    assert.ok(await info("opt-in.json") >= await info("_config.db"));
+    await manager.shutdown();
+  } finally { await fx.cleanup(); }
+});
+
+test("removeProject deletes a directory with mismatched identity and one with only a leftover state.json", async () => {
+  for (const files of [["workbench-identity.json", "opt-in.json", "_config.db", "derived-project.db"], ["state.json"]]) {
+    const fx = await makeFixture();
+    try {
+      await writeValidState(fx.project, fx.paths, fx.fakeDir, { version: "v0.8.1" });
+      for (const name of ["workbench-identity.json", "opt-in.json", "_config.db", "derived-project.db"]) if (!files.includes(name)) await rm(join(fx.project.directory, name));
+      if (files.includes("state.json")) await writeFile(join(fx.project.directory, "state.json"), "{}");
+      const manager = new CodeGraphManager(fx.makeDeps());
+      await manager.removeProject(fx.project, { timeoutMs: 100, intervalMs: 10 });
+      await assert.rejects(stat(fx.project.directory), { code: "ENOENT" });
+      await manager.shutdown();
+    } finally { await fx.cleanup(); }
+  }
+});
+
+test("M15: removeProject waits for a lease that is released a moment later, and still refuses past the deadline", async () => {
+  const { createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
+  const fx = await makeFixture();
+  try {
+    await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    const manager = new CodeGraphManager(fx.makeDeps());
+    const lease = await createConsumerLease(join(fx.paths.codeGraphRuntime, "consumers", fx.project.identifier), fx.project.directory);
+    setTimeout(() => { void lease.release(); }, 700);
+    const started = Date.now();
+    await manager.removeProject(fx.project, { timeoutMs: 5000, intervalMs: 50 });
+    assert.ok(Date.now() - started >= 600, "it polled instead of failing on the first check");
+    await assert.rejects(readFile(fx.project.optInPath), { code: "ENOENT" });
+  } finally { await fx.cleanup(); }
+});
+
+test("M15: a lease that never goes away still blocks deletion after the deadline and nothing is deleted", async () => {
+  const { createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
+  const fx = await makeFixture();
+  try {
+    await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    const manager = new CodeGraphManager(fx.makeDeps());
+    const lease = await createConsumerLease(join(fx.paths.codeGraphRuntime, "consumers", fx.project.identifier), fx.project.directory);
+    try {
+      await assert.rejects(manager.removeProject(fx.project, { timeoutMs: 300, intervalMs: 50 }), /Active workspace consumers/);
+      assert.equal(JSON.parse(await readFile(fx.project.optInPath, "utf8")).enabled, true);
+      assert.equal(JSON.parse(await readFile(fx.project.identityPath, "utf8")).codeGraphVersion, "v0.12.1");
+    } finally { await lease.release(); }
+  } finally { await fx.cleanup(); }
+});
+
+test("L15: loading the extension does not load node:sqlite (no ExperimentalWarning at startup)", async () => {
+  const { execFile } = await import("node:child_process");
+  const body = `import { createJiti } from "jiti"; const jiti = createJiti(process.cwd() + "/x.mjs");
+    await jiti.import("./src/index.ts"); await jiti.import("./src/code-graph-manager.ts"); console.log("LOADED");`;
+  const result = await new Promise((resolve) => execFile(process.execPath, ["--input-type=module", "-e", body], { cwd: process.cwd(), timeout: 30000 },
+    (error, stdout, stderr) => resolve({ error, stdout, stderr })));
+  assert.match(result.stdout, /LOADED/, result.stderr);
+  assert.doesNotMatch(result.stderr, /SQLite is an experimental feature|ExperimentalWarning/);
 });

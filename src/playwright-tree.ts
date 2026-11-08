@@ -6,6 +6,15 @@ import { identityLive, type ProcessIdentity } from "./managed-lifecycle.js";
 export interface PlaywrightTreeScope { sessionId: string; runtimeId: string; browserRoot: string; directory?: string }
 interface Row extends ProcessIdentity { parent: number; group: number }
 export interface PlaywrightTreeSnapshot { processes: Row[]; uncertain: boolean }
+/** Background rescan period. Detached browsers are found by session tags and ancestry at every capture, and `stop()` and the
+ * launcher's child-exit hook capture again right before anything is signalled, so a slow pulse costs no attestation. */
+export const PLAYWRIGHT_TREE_PULSE_MS = 1500;
+/** How long an executable known to be outside the browser runtime is trusted without re-reading it. An exec in place changes
+ * `/proc/<pid>/exe` while the birth identity stays the same, so the entry expires; it is also dropped when the pid goes away. */
+export const PLAYWRIGHT_TREE_EXE_CACHE_MS = 30_000;
+/** Time allowed for each signal phase of `stop()`. */
+export interface PlaywrightTreeStopBudgets { termMs?: number; killMs?: number }
+export interface PlaywrightTreeOptions { readExecutable?: (pid: number) => Promise<string>; now?: () => number }
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 function inside(root: string, path: string): boolean { const rel = relative(root, path); return isAbsolute(path) && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel); }
 async function rows(): Promise<Row[]> {
@@ -30,7 +39,12 @@ export class PlaywrightOwnedTree {
   private pulse?: ReturnType<typeof setInterval>;
   private scanning: Promise<PlaywrightTreeSnapshot> | null = null;
   private last = "";
-  constructor(readonly scope: PlaywrightTreeScope, roots: ProcessIdentity[] = [], private changed?: (snapshot: PlaywrightTreeSnapshot) => Promise<void>) {
+  private outside = new Map<string, number>();
+  private readonly readExecutable: (pid: number) => Promise<string>;
+  private readonly now: () => number;
+  constructor(readonly scope: PlaywrightTreeScope, roots: ProcessIdentity[] = [], private changed?: (snapshot: PlaywrightTreeSnapshot) => Promise<void>, options: PlaywrightTreeOptions = {}) {
+    this.readExecutable = options.readExecutable ?? (pid => readlink(`/proc/${pid}/exe`));
+    this.now = options.now ?? Date.now;
     if (!/^[0-9a-f-]{36}$/.test(scope.sessionId) || !/^[0-9a-f-]{36}$/.test(scope.runtimeId) || !isAbsolute(scope.browserRoot) || scope.directory !== undefined && !isAbsolute(scope.directory)) throw new Error("Invalid Playwright process-tree scope");
     for (const root of roots) {
       if (!Number.isSafeInteger(root.pid) || root.pid <= 0 || !root.start || root.host !== hostname()) throw new Error("Invalid/foreign Playwright process-tree witness");
@@ -55,19 +69,22 @@ export class PlaywrightOwnedTree {
     };
     expand();
     let unreadable = false;
+    const time = this.now(), seen = new Set<string>();
     // Only browser executables under this immutable runtime are environment-tag candidates.
     for (const row of processes) {
       if (owned.has(row.pid)) continue;
+      const key = `${row.pid}:${row.start}`; seen.add(key);
+      if ((this.outside.get(key) ?? 0) > time) continue;
       try {
         let executable: string;
-        try { executable = (await readlink(`/proc/${row.pid}/exe`)).replace(/ \(deleted\)$/, ""); }
+        try { executable = (await this.readExecutable(row.pid)).replace(/ \(deleted\)$/, ""); }
         catch (error) {
           if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
           if (!["EACCES", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
           try { executable = (await readFile(`/proc/${row.pid}/cmdline`, "utf8")).split("\0")[0]; }
           catch (error) { if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) unreadable = true; continue; }
         }
-        if (!inside(this.scope.browserRoot, executable)) continue;
+        if (!inside(this.scope.browserRoot, executable)) { this.outside.set(key, time + PLAYWRIGHT_TREE_EXE_CACHE_MS); continue; }
         if (this.scope.directory) {
           try {
             const args = (await readFile(`/proc/${row.pid}/cmdline`, "utf8")).split("\0");
@@ -91,6 +108,7 @@ export class PlaywrightOwnedTree {
         else unknown.add(row.pid);
       } catch (error) { if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
     }
+    for (const key of this.outside.keys()) if (!seen.has(key)) this.outside.delete(key);
     // Each live witnessed member anchors its current group. Detached children also
     // enter through ancestry before parent exit, or through their browser's session tag.
     expand();
@@ -103,18 +121,18 @@ export class PlaywrightOwnedTree {
   }
   start(onFailure: (error: unknown) => void): void {
     if (this.pulse) return;
-    this.pulse = setInterval(() => { void this.capture().catch(onFailure); }, 100);
+    this.pulse = setInterval(() => { void this.capture().catch(onFailure); }, PLAYWRIGHT_TREE_PULSE_MS);
   }
-  async stop(protectedPid: number = process.pid): Promise<void> {
-    try { await this.stopTargets(protectedPid); }
+  async stop(protectedPid: number = process.pid, budgets: PlaywrightTreeStopBudgets = {}): Promise<void> {
+    try { await this.stopTargets(protectedPid, budgets); }
     catch { throw new Error("Playwright detached process ownership uncertain; preserve leases and data"); }
   }
-  private async stopTargets(protectedPid: number): Promise<void> {
+  private async stopTargets(protectedPid: number, budgets: PlaywrightTreeStopBudgets): Promise<void> {
     clearInterval(this.pulse); this.pulse = undefined;
     if (this.scanning) await this.scanning;
     const self = await readFile(`/proc/${protectedPid}/stat`, "utf8");
     const protectedGroup = Number(self.slice(self.lastIndexOf(")") + 2).trim().split(/\s+/)[2]);
-    for (const [signal, budget] of [["SIGTERM", 1500], ["SIGKILL", 1500]] as const) {
+    for (const [signal, budget] of [["SIGTERM", budgets.termMs ?? 1500], ["SIGKILL", budgets.killMs ?? 1500]] as const) {
       const deadline = Date.now() + budget;
       do {
         const snapshot = await this.capture(), targets = snapshot.processes.filter(row => row.pid !== protectedPid);

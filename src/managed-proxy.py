@@ -10,7 +10,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -36,7 +35,9 @@ def birth(pid):
             f"(Get-Process -Id {int(pid)} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks",
         ], timeout=5, text=True).strip()
         return "win32:" + raw
-    raw = subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], timeout=5, text=True).strip()
+    # Same fixed locale and time zone as managed-lifecycle.ts psEnvironment(): lstart is local time.
+    ps_env = {**os.environ, "LC_ALL": "C", "TZ": "UTC"}
+    raw = subprocess.check_output(["ps", "-p", str(pid), "-o", "lstart="], timeout=5, text=True, env=ps_env).strip()
     return sys.platform + ":" + raw
 
 
@@ -45,8 +46,10 @@ def consumers_present():
         record = json.loads(path.read_text())
         if record.get("resource") != resource:
             continue
-        if record.get("schema") != 1 or record.get("host") != socket.gethostname():
+        if record.get("schemaVersion") != 1:
             return True  # Unknown identity: never terminate a possible peer.
+        # The recorded host is informational: state is local, so PID + birth identity decide, and
+        # a renamed host must not keep the proxy alive forever (see identityLive in managed-lifecycle.ts).
         try:
             if birth(int(record["pid"])) == record["start"]:
                 return True

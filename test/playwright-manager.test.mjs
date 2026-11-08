@@ -13,7 +13,7 @@ const { createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts")
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 async function fixture(t, overrides = {}) {
   const f = await playwrightFixture(t), paths = resolveWorkbenchPaths(f.home), id = randomUUID(), slot = join(paths.playwrightRuntimes, config.PLAYWRIGHT_VERSION, id), calls = [];
-  const ready = { schema: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: "0".repeat(64), slot,
+  const ready = { schemaVersion: 1, policy: 1, id, version: config.PLAYWRIGHT_VERSION, engineVersion: config.PLAYWRIGHT_ENGINE_VERSION, manifestSha256: "0".repeat(64), slot,
     node: { path: process.execPath, version: process.versions.node, sha256: "0".repeat(64) }, npm: { path: join(f.root, "npm-cli.js"), version: "10.9.7", sha256: "0".repeat(64) },
     entrypoint: join(slot, "node_modules", "@playwright", "mcp", "cli.js"), browser: join(slot, "browsers", "synthetic", "chrome"), browserVersion: "synthetic", tools: [...config.PLAYWRIGHT_REQUIRED_TOOLS], validatedAt: new Date().toISOString() };
   let registry, alive = false;
@@ -47,6 +47,21 @@ test("Playwright on is idempotent and uses direct managed stdio with unsafe code
   assert.equal((await readdir(join(f.project.directory, "sessions"))).length, 1);
   assert.equal(await config.playwrightOptedIn(f.project), true); await f.manager.shutdown();
 });
+test("Playwright registration escapes Pi's $ and ! interpolation in every env value instead of rejecting paths", async t => {
+  const f = await fixture(t);
+  const original = join(f.paths.playwrightRoot, "npm$cache", "${HOME}");
+  f.paths.playwrightNpmCache = original;
+  await f.manager.on(); const env = f.registry().env;
+  const entry = Object.entries(env).find(([, value]) => value.includes("npm$$cache"));
+  assert.ok(entry, "the npm cache path is registered with escaped dollar signs");
+  assert.ok(entry[1].includes("$${HOME}"));
+  let resolveConfigValue;
+  try { ({ resolveConfigValue } = await import(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/core/resolve-config-value.js", import.meta.url).href)); }
+  catch { await f.manager.shutdown(); return t.skip("Pi's internal resolver is not importable in this install"); }
+  assert.equal(resolveConfigValue(entry[1], {}), original);
+  for (const value of Object.values(env)) assert.notEqual(resolveConfigValue(value, {}), undefined, "no value references a missing variable");
+  await f.manager.shutdown();
+});
 test("Playwright activation failure retains explicit intent and later restore retries", async t => {
   const f = await fixture(t); let fail = true;
   f.deps.runtime.ensure = async () => { if (fail) throw new Error("Synthetic readiness failure"); return f.ready; };
@@ -64,6 +79,12 @@ test("Playwright off refusal leaves live session, intent, and artifacts untouche
   await writeFile(path, "keep"); const before = [...f.calls];
   assert.equal(await f.manager.off(false), false); assert.deepEqual(f.calls, before); assert.equal(f.registry(), server);
   assert.equal(await readFile(path, "utf8"), "keep"); assert.equal(await config.playwrightOptedIn(f.project), true); await f.manager.shutdown();
+});
+test("Playwright on and confirmed off end with the shared enabled and deleted messages", async t => {
+  const progress = [], f = await fixture(t, { progress: message => progress.push(message) });
+  await f.manager.on(); assert.equal(progress.at(-1), "Playwright enabled for this project");
+  await f.manager.shutdown(); assert.equal(await f.manager.off(true), true);
+  assert.equal(progress.at(-1), "Playwright data deleted for this project");
 });
 test("Playwright shutdown retains artifacts/intent; confirmed off deletes only workspace data", async t => {
   const f = await fixture(t); await f.manager.on(); const spec = JSON.parse(f.registry().args[1]);
@@ -88,7 +109,19 @@ test("Playwright unregister failure prevents deletion and reports incomplete off
   const f = await fixture(t); await f.manager.on(); f.deps.unregister = () => { throw new Error("Synthetic unregister failure"); };
   await assert.rejects(f.manager.off(true), /Synthetic unregister failure/); await access(f.project.directory);
   assert.equal(await config.playwrightOptedIn(f.project), true);
-  assert.match(formatPlaywrightStatus(await f.manager.status()), /Failure\/blocker: Synthetic unregister failure/);
+  assert.match(formatPlaywrightStatus(await f.manager.status()), /Problem:\s+Synthetic unregister failure/);
+});
+test("Playwright status uses the shared layout: state, project, data, version, link and details", async t => {
+  const f = await fixture(t);
+  const off = formatPlaywrightStatus(await f.manager.status()).split("\n");
+  assert.equal(off[0], "Playwright"); assert.match(off[1], /^ {2}State: {4}off$/);
+  assert.match(off[2], new RegExp(`^ {2}Project: {2}${f.project.projectPath}  \\(${f.project.identifier}\\)$`));
+  assert.ok(off.some(line => /^ {2}Link: {5}not registered$/.test(line))); assert.ok(off.includes("  Details:"));
+  await f.manager.on();
+  const on = formatPlaywrightStatus(await f.manager.status());
+  assert.match(on, /State: {4}on\n/); assert.ok(on.includes(`Data:     ${f.project.directory}`)); assert.match(on, /Link: {5}registered/);
+  assert.match(on, /Version: {2}\S+ \(expected /);
+  assert.doesNotMatch(on, /Problem:/); await f.manager.shutdown();
 });
 test("Playwright stop failure prevents workspace deletion", async t => {
   const f = await fixture(t); await f.manager.on(); f.deps.stop = async () => { throw new Error("Synthetic owned cleanup uncertain"); };

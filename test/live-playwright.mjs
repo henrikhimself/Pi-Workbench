@@ -22,9 +22,9 @@ let child, passed = false;
 try {
   for (const path of [home, agent, join(root, "cache"), join(root, "config"), join(root, "data"), join(root, "tmp"), join(root, "a"), join(root, "b")]) await mkdir(path, { mode: 0o700 });
   const jiti = createJiti(import.meta.url, { fsCache: false }), { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts"), paths = resolveWorkbenchPaths(home);
-  const { PlaywrightRuntime } = await jiti.import("../src/playwright-runtime.ts"), { resolvePlaywrightProject, setPlaywrightOptIn } = await jiti.import("../src/playwright-config.ts");
+  const { PlaywrightRuntime } = await jiti.import("../src/playwright-runtime.ts"), { resolvePlaywrightProject, enablePlaywrightOptIn } = await jiti.import("../src/playwright-config.ts");
   await new PlaywrightRuntime({ paths }).ensure(message => console.error(message));
-  for (const name of ["a", "b"]) await setPlaywrightOptIn(resolvePlaywrightProject(join(root, name), paths), true);
+  for (const name of ["a", "b"]) await enablePlaywrightOptIn(resolvePlaywrightProject(join(root, name), paths));
   const definition = { id: modelId, reasoning: true, input: ["text"], contextWindow: loaded.context_length, maxTokens: 1024, compat: { thinkingFormat: "qwen-chat-template", thinkingTokenBudgetField: "thinking_budget_tokens" } };
   await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { "llama.cpp": { baseUrl: base.replace(/\/$/, "") + "/v1", api: "openai-completions", apiKey: "${LLAMA_API_KEY}", models: [definition] } } }), { mode: 0o600 });
   await writeFile(join(agent, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" } }), { mode: 0o600 });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -10,7 +10,7 @@ const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 const { createConsumerLease, publishJson } = await jiti.import("../src/managed-lifecycle.ts");
 async function fixture(fn) {
   const home = await mkdtemp(join(tmpdir(), "wb-headroom-slots-")); const paths = resolveWorkbenchPaths(home);
-  const calls = [], messages = []; const state = { badDependency: false, tamper: false, failInstall: false };
+  const calls = [], messages = []; const state = { badDependency: false, tamper: false, failInstall: false, pip: "24.0" };
   const run = async (command, args, options) => {
     calls.push({ command, args, env: options.env });
     if (args.includes("venv")) {
@@ -19,6 +19,7 @@ async function fixture(fn) {
       for (const name of process.platform === "win32" ? ["python.exe", "headroom.exe"] : ["python", "headroom"]) await writeFile(join(bin, name), "fixture", { mode: 0o700 });
       return "";
     }
+    if (args.includes("--version")) return `pip ${state.pip} from /slot/lib/python3/site-packages/pip (python 3)`;
     const version = command.includes("/runtimes/") ? command.split("/runtimes/")[1].split("/")[0] : "0.41.0";
     if (args.includes("--report")) {
       const install = [{ metadata: { name: "headroom-ai", version }, download_info: { archive_info: { hashes: { sha256: "a".repeat(64) } } } }];
@@ -26,7 +27,7 @@ async function fixture(fn) {
       if (state.badDependency) install.push({ ...install[0], metadata: { name: "torch", version: "9.0" } });
       await writeFile(args[args.indexOf("--report") + 1], JSON.stringify({ install })); return "";
     }
-    if (args.includes("pip")) { if (state.failInstall) throw new Error("injected pip failure"); return ""; }
+    if (args.includes("pip")) { if (state.failInstall) { await state.beforeFail?.(command); throw new Error("injected pip failure"); } return ""; }
     if (args[1]?.includes("distributions")) return JSON.stringify({ version, transport: "50.0.2",
       inventory: [{ name: "headroom-ai", version }, { name: "onnxruntime", version: state.tamper ? "changed" : "1.31.1" }] });
     return "Python 3.13 fixture|Linux AMD64";
@@ -42,7 +43,7 @@ test("shared runtime prepares one immutable permanent slot and reuses without pi
   const two = await runtime.ensure(message => fx.messages.push(message));
   assert.deepEqual(one, two); assert.ok(one.slot.startsWith(join(fx.paths.root, "headroom", "runtimes")));
   assert.equal(fx.calls.filter(c => c.args.includes("venv")).length, 1);
-  assert.equal(fx.calls.filter(c => c.args.includes("pip") && !c.args.includes("--dry-run")).length, 1);
+  assert.equal(fx.calls.filter(c => c.args.includes("pip") && !c.args.includes("--dry-run") && !c.args.includes("--version")).length, 1);
   assert.ok(fx.calls.some(c => c.args.includes("--copies")), "entrypoint paths are never relocated");
   assert.ok(fx.calls.some(c => c.args.includes("--require-hashes")));
   assert.equal(one.embedding.provider, "CPUExecutionProvider");
@@ -109,14 +110,32 @@ test("failed selection publication preserves prior metadata and ready runtime fo
 }));
 
 
-test("manual extension downgrade cannot select an older runtime automatically", () => fixture(async (fx) => {
-  const newer = fx.make({ requiredVersion: "0.42.0" }); const selected = await newer.ensure(() => {});
-  assert.ok(selected);
-  const bytes = await readFile(newer.selectionPath, "utf8"), count = fx.calls.length;
-  assert.equal(await fx.make().ensure(message => fx.messages.push(message)), null);
-  assert.match(fx.messages.join("\n"), /Automatic runtime downgrade refused/);
-  assert.equal(await readFile(newer.selectionPath, "utf8"), bytes);
-  assert.equal(fx.calls.length, count, "no old interpreter installation/execution");
+test("a different pin, older or newer, installs its own runtime in a new slot and leaves the old slot untouched", () => fixture(async (fx) => {
+  const newer = fx.make({ requiredVersion: "0.42.0" }); const first = await newer.ensure(() => {});
+  assert.ok(first); assert.equal(first.version, "0.42.0");
+  const venvs = fx.calls.filter(c => c.args.includes("venv")).length;
+  const older = await fx.make().ensure(message => fx.messages.push(message));
+  assert.ok(older, fx.messages.join("\n")); assert.equal(older.version, "0.41.0");
+  assert.notEqual(older.slot, first.slot);
+  assert.equal(fx.calls.filter(c => c.args.includes("venv")).length, venvs + 1, "exactly one new slot was built");
+  assert.equal(await readFile(first.python, "utf8"), "fixture", "old slot untouched");
+  assert.equal((await newer.inspect()).version, "0.41.0", "selection now names the pinned runtime");
+  const backups = (await readdir(newer.root)).filter(name => name.startsWith("selected.backup-"));
+  assert.equal(backups.length, 1);
+  assert.equal(JSON.parse(await readFile(join(newer.root, backups[0]), "utf8")).slot, first.slot, "previous selection retained");
+}));
+
+test("a runtime selection or descriptor with the old schema key is refused and left unchanged", () => fixture(async (fx) => {
+  const first = await fx.make().ensure(() => {}); assert.ok(first);
+  const oldKey = ({ schemaVersion, ...rest }) => ({ schema: schemaVersion, ...rest });
+  // selected.json is parsed (version message); ready.json is only compared with it, so it fails as a mismatch.
+  for (const [file, expected] of [[join(fx.paths.headroomRoot, "selected.json"), /schemaVersion must be 1/], [join(first.slot, "ready.json"), /readiness identity mismatch/]]) {
+    const original = await readFile(file, "utf8"); assert.equal(JSON.parse(original).schemaVersion, 1, file);
+    const legacy = JSON.stringify(oldKey(JSON.parse(original))); await writeFile(file, legacy);
+    const messages = []; assert.equal(await fx.make().ensure(message => messages.push(message)), null, file);
+    assert.match(messages.join("\n"), expected, file);
+    assert.equal(await readFile(file, "utf8"), legacy); await writeFile(file, original);
+  }
 }));
 
 test("failed hashed install preserves previous selection and immutable slot", () => fixture(async (fx) => {
@@ -163,9 +182,79 @@ test("failed pointer restoration retains recovery intent and blocks apparently v
 test("invalid saved readiness cannot be overwritten by fresh installation", () => fixture(async (fx) => {
   const runtime = fx.make(), selected = await runtime.ensure(() => {});
   const original = await readFile(runtime.selectionPath, "utf8"), count = fx.calls.length;
-  await writeFile(join(selected.slot, "ready.json"), JSON.stringify({ ...selected, schema: 99 }));
+  await writeFile(join(selected.slot, "ready.json"), JSON.stringify({ ...selected, schemaVersion: 99 }));
   assert.equal(await runtime.ensure(message => fx.messages.push(message)), null);
   assert.match(fx.messages.join("\n"), /readiness identity mismatch/);
   assert.equal(await readFile(runtime.selectionPath, "utf8"), original);
   assert.equal(fx.calls.length, count);
+}));
+
+test("runtime environment passes lowercase proxy variables and still no arbitrary HEADROOM_* tuning", () => fixture(async (fx) => {
+  const runtime = fx.make();
+  const env = runtime.environment({
+    PATH: "/bin", http_proxy: "http://proxy:3128", https_proxy: "http://proxy:3128", no_proxy: "localhost",
+    HTTP_PROXY: "http://upper:1", HEADROOM_COMPRESSION_TIMEOUT_SECONDS: "999", HEADROOM_BACKGROUND_COMPRESSION: "1",
+  });
+  assert.equal(env.http_proxy, "http://proxy:3128"); assert.equal(env.https_proxy, "http://proxy:3128");
+  assert.equal(env.no_proxy, "localhost"); assert.equal(env.HTTP_PROXY, "http://upper:1");
+  assert.equal(env.HEADROOM_COMPRESSION_TIMEOUT_SECONDS, undefined, "tuning comes only from validated headroom.json");
+  assert.equal(env.HEADROOM_BACKGROUND_COMPRESSION, undefined);
+}));
+
+test("S2: a slot/digest verified once is not re-verified by later ensure() calls in the same process", () => fixture(async (fx) => {
+  const checks = () => fx.calls.filter(c => c.args[1]?.includes("distributions")).length;
+  const runtime = fx.make();
+  assert.ok(await runtime.ensure(() => {}));
+  const afterInstall = checks();
+  assert.ok(await runtime.ensure(() => {}));
+  const afterFirstReuse = checks();
+  assert.equal(afterFirstReuse, afterInstall + 1, "first reuse verifies the installed slot");
+  for (let i = 0; i < 3; i++) assert.ok(await fx.make().ensure(() => {}));
+  assert.equal(checks(), afterFirstReuse, "later calls, even from another runtime object, skip the Python check");
+}));
+
+const slotNames = async fx => (await readdir(join(fx.paths.headroomRoot, "runtimes", "0.41.0")).catch(() => []));
+
+test("LB-01 M17: a venv whose pip is older than 22.2 is refused with both versions and leaves no slot", () => fixture(async (fx) => {
+  fx.state.pip = "22.0.2";
+  assert.equal(await fx.make().ensure(message => fx.messages.push(message)), null);
+  assert.match(fx.messages.join("\n"), /pip 22\.0\.2, but pip 22\.2 or newer is required/);
+  assert.ok(fx.calls.every(call => !call.args.includes("--dry-run")), "the dry run is never attempted");
+  assert.deepEqual(await slotNames(fx), []);
+  fx.state.pip = "22.2";
+  assert.ok(await fx.make().ensure(() => {}), "pip 22.2 is accepted");
+}));
+
+test("LB-01 L11: a failing install step removes its slot, and a successful install keeps its slot", () => fixture(async (fx) => {
+  fx.state.failInstall = true;
+  assert.equal(await fx.make().ensure(message => fx.messages.push(message)), null);
+  assert.match(fx.messages.join("\n"), /injected pip failure/);
+  assert.deepEqual(await slotNames(fx), []);
+  fx.state.failInstall = false;
+  const ok = await fx.make().ensure(() => {}); assert.ok(ok);
+  assert.equal((await slotNames(fx)).length, 1);
+  assert.equal(await readFile(ok.python, "utf8"), "fixture");
+}));
+
+
+test("LB-01 L11: a slot whose candidate was published is kept even if the publish call then throws", () => fixture(async (fx) => {
+  const runtime = fx.make({ publish: async (root, path, value) => {
+    await publishJson(root, path, value);
+    if (/candidate-/.test(path)) throw new Error("injected failure after the candidate was written");
+  } });
+  assert.equal(await runtime.ensure(message => fx.messages.push(message)), null);
+  assert.match(fx.messages.join("\n"), /injected failure after the candidate/);
+  assert.equal((await slotNames(fx)).length, 1, "the published candidate still has its slot");
+}));
+
+test("LB-01 L11: an error from the slot cleanup does not replace the install error", { skip: process.getuid?.() === 0 }, () => fixture(async (fx) => {
+  const parent = join(fx.paths.headroomRoot, "runtimes", "0.41.0");
+  fx.state.failInstall = true;
+  fx.state.beforeFail = async () => { await chmod(parent, 0o500); };
+  try {
+    assert.equal(await fx.make().ensure(message => fx.messages.push(message)), null);
+    assert.match(fx.messages.join("\n"), /injected pip failure/);
+    assert.doesNotMatch(fx.messages.join("\n"), /EACCES|EPERM/);
+    assert.equal((await readdir(parent)).length, 1, "the cleanup really failed, leaving the slot");
+  } finally { await chmod(parent, 0o700); }
 }));

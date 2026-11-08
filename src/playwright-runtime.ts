@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { requireSchemaVersion } from "./schema-version.js";
 import { access, lstat, mkdir, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { constants } from "node:fs";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -44,6 +45,11 @@ export function validatePlaywrightPlatform(platform: string, arch: string, osRel
   const fields = Object.fromEntries(osRelease.split("\n").map(line => /^([A-Z_]+)=(.*)$/.exec(line)).filter(Boolean).map(match => [match![1], match![2].replace(/^"|"$/g, "")]));
   if (platform !== "linux" || !["x64", "arm64"].includes(arch) || !(fields.ID === "debian" && ["12", "13"].includes(fields.VERSION_ID) || fields.ID === "ubuntu" && ["22.04", "24.04"].includes(fields.VERSION_ID))) throw new Error("Unsupported Playwright host: requires Linux x64/ARM64 on Debian 12/13 or Ubuntu 22.04/24.04");
 }
+/** The recorded host `node` or `npm-cli.js` is missing or has different content (apt upgrade, nvm switch). The runtime is intact; only
+ * its recorded host identity is stale, so `ensure()` may re-provision it. Any other validation failure still stops. */
+export class PlaywrightHostChangedError extends Error {
+  constructor(readonly path: string) { super(`Playwright host executable identity changed (${path}): the host Node or npm was updated or removed after the runtime was provisioned.`); this.name = "PlaywrightHostChangedError"; }
+}
 async function hostFile(path: string): Promise<string> {
   const canonical = await realpath(path);
   await assertNoSymlink(canonical);
@@ -81,7 +87,8 @@ export async function playwrightConsumers(paths: WorkbenchPaths, prefix = ""): P
     if (/^[0-9a-f-]+\.json\.[0-9a-f-]+\.tmp$/.test(name)) continue;
     if (!/^[0-9a-f-]+\.json$/.test(name)) throw new Error("Unknown Playwright consumer entry");
     const path = join(paths.playwrightConsumers, name), record = await readPlaywrightJson(paths.playwrightRoot, path) as any;
-    if (!record || record.schema !== 1 || name !== `${record.token}.json` || typeof record.resource !== "string") throw new Error("Invalid Playwright consumer record");
+    requireSchemaVersion(record, "Playwright consumer record");
+    if (name !== `${record.token}.json` || typeof record.resource !== "string") throw new Error("Invalid Playwright consumer record");
     if (!record.resource.startsWith(prefix)) continue;
     const owner = { pid: record.pid, start: record.start, host: record.host };
     let active = await identityLive(owner);
@@ -116,7 +123,7 @@ export async function probePlaywrightRuntime(options: PlaywrightProbeOptions): P
   let client: Pick<PlaywrightStdioClient, "request" | "call" | "close"> | undefined;
   let tree = new PlaywrightOwnedTree(scope);
   try {
-    client = await (options.connect ?? PlaywrightStdioClient.connect)({ command: options.host.node.path, args: [MCP_BOOTSTRAP, JSON.stringify({ schema: 1, command: options.host.node.path, args: [join(options.slot, "node_modules", "@playwright", "mcp", "cli.js"), "--config", configPath], root, browser: options.browser, home: setup.home, tmp: setup.tmp })], cwd: directory,
+    client = await (options.connect ?? PlaywrightStdioClient.connect)({ command: options.host.node.path, args: [MCP_BOOTSTRAP, JSON.stringify({ schemaVersion: 1, command: options.host.node.path, args: [join(options.slot, "node_modules", "@playwright", "mcp", "cli.js"), "--config", configPath], root, browser: options.browser, home: setup.home, tmp: setup.tmp })], cwd: directory,
       env: { ...playwrightPrivateEnvironment(setup, options.host.node.path, join(options.slot, "browsers"), options.paths.playwrightNpmCache), WB_PLAYWRIGHT_SESSION_ID: sessionId, WB_PLAYWRIGHT_RUNTIME_ID: runtimeId }, signal: options.signal, timeoutMs: 90000 });
     tree = new PlaywrightOwnedTree(scope, client instanceof PlaywrightStdioClient ? [client.group.owner] : []);
     tree.start(() => {});
@@ -188,7 +195,10 @@ export class PlaywrightRuntime {
     }
     await access(record.browser, constants.X_OK);
     for (const host of [record.node, record.npm]) {
-      if (await hostFile(host.path) !== host.path || digest(await readFile(host.path)) !== host.sha256) throw new Error("Playwright host executable identity changed");
+      let same = false;
+      try { same = await hostFile(host.path) === host.path && digest(await readFile(host.path)) === host.sha256; }
+      catch (error) { if (!["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error; }
+      if (!same) throw new PlaywrightHostChangedError(host.path);
     }
   }
   async ensure(onProgress: PlaywrightProgress = () => {}, signal?: AbortSignal): Promise<PlaywrightRuntimeRecord> {
@@ -205,10 +215,20 @@ export class PlaywrightRuntime {
       const recovery = await readPlaywrightJson(this.paths.playwrightRoot, join(this.paths.playwrightRoot, "recovery.json"));
       if (recovery !== null) { parsePlaywrightRecovery(recovery); throw new Error("Playwright publication/cleanup recovery required; preserve existing data"); }
       const previous = await this.selected();
+      let hostChanged: PlaywrightHostChangedError | undefined;
       if (previous?.version === PLAYWRIGHT_VERSION) {
-        await this.validate(previous, assets); onProgress("Playwright installed runtime validated"); return previous;
+        try { await this.validate(previous, assets); onProgress("Playwright installed runtime validated"); return previous; }
+        catch (error) {
+          // Only a changed host Node/npm is repaired here, by provisioning a new runtime below; the old slot is left in place.
+          if (!(error instanceof PlaywrightHostChangedError)) throw error;
+          hostChanged = error; onProgress("Playwright host Node/npm changed; provisioning a new runtime...");
+        }
       }
-      if ((await playwrightConsumers(this.paths, "runtime:")).some(consumer => consumer.active)) throw new Error("Playwright runtime selection deferred: live consumers remain");
+      if ((await playwrightConsumers(this.paths, "runtime:")).some(consumer => consumer.active)) {
+        throw new Error(hostChanged
+          ? `${hostChanged.message} Another Pi session is still using the current Playwright runtime, so it was not replaced. Close the other Pi sessions that use managed Playwright (or run /wb:playwright off there), then run /wb:playwright on again.`
+          : "Playwright runtime selection deferred: live consumers remain");
+      }
       const id = randomUUID(); slot = join(this.paths.playwrightRuntimes, PLAYWRIGHT_VERSION, id);
       await ensurePrivateDirectory(this.paths.playwrightRoot, dirname(slot));
       await mkdir(slot, { mode: 0o700 });
@@ -239,7 +259,7 @@ export class PlaywrightRuntime {
       const ready = await (this.dependencies.probe ?? probePlaywrightRuntime)({ paths: this.paths, slot, host, browser, signal });
       if (!ready || !ready.browserVersion || !Array.isArray(ready.tools) || !PLAYWRIGHT_REQUIRED_TOOLS.every(name => ready.tools.includes(name))) throw new Error("Incomplete Playwright browser readiness evidence");
       signal?.throwIfAborted();
-      const record: PlaywrightRuntimeRecord = { schema: 1, policy: PLAYWRIGHT_POLICY, id, version: PLAYWRIGHT_VERSION, engineVersion: PLAYWRIGHT_ENGINE_VERSION, manifestSha256: assets.sha256, slot, ...host, browser,
+      const record: PlaywrightRuntimeRecord = { schemaVersion: 1, policy: PLAYWRIGHT_POLICY, id, version: PLAYWRIGHT_VERSION, engineVersion: PLAYWRIGHT_ENGINE_VERSION, manifestSha256: assets.sha256, slot, ...host, browser,
         entrypoint: join(slot, "node_modules", "@playwright", "mcp", "cli.js"), browserVersion: ready.browserVersion, tools: ready.tools, validatedAt: new Date().toISOString() };
       parsePlaywrightRuntime(record, this.paths);
       await this.publish(this.paths.playwrightRoot, join(slot, "ready.json"), record);
@@ -247,16 +267,16 @@ export class PlaywrightRuntime {
       signal?.throwIfAborted();
       if ((await playwrightConsumers(this.paths, "runtime:")).some(consumer => consumer.active)) throw new Error("Playwright selection deferred: consumers changed during preparation");
       try {
-        await this.publish(this.paths.playwrightRoot, this.paths.playwrightSelected, { schema: 1, id, version: PLAYWRIGHT_VERSION, slot });
+        await this.publish(this.paths.playwrightRoot, this.paths.playwrightSelected, { schemaVersion: 1, id, version: PLAYWRIGHT_VERSION, slot });
       } catch (error) {
         try {
           const observed = await readPlaywrightJson(this.paths.playwrightRoot, this.paths.playwrightSelected) as any;
           if (observed?.id === id) {
-            if (previous) await this.publish(this.paths.playwrightRoot, this.paths.playwrightSelected, { schema: 1, id: previous.id, version: previous.version, slot: previous.slot });
+            if (previous) await this.publish(this.paths.playwrightRoot, this.paths.playwrightSelected, { schemaVersion: 1, id: previous.id, version: previous.version, slot: previous.slot });
             else { await rm(this.paths.playwrightSelected); await syncDirectory(this.paths.playwrightRoot); }
           } else if (observed && observed.id !== previous?.id) throw new Error("Selection changed unexpectedly");
         } catch {
-          await publishJson(this.paths.playwrightRoot, join(this.paths.playwrightRoot, "recovery.json"), { schema: 1, operation: "publication", runtimeId: id, detail: "Selection publication/restoration uncertain; preserve candidate and prior selection", createdAt: new Date().toISOString() });
+          await publishJson(this.paths.playwrightRoot, join(this.paths.playwrightRoot, "recovery.json"), { schemaVersion: 1, operation: "publication", runtimeId: id, detail: "Selection publication/restoration uncertain; preserve candidate and prior selection", createdAt: new Date().toISOString() });
           throw new Error("Playwright selection publication/restoration failed; recovery required");
         }
         throw error;
@@ -265,9 +285,9 @@ export class PlaywrightRuntime {
       return record;
     } catch (error) {
       if (slot) {
-        await publishJson(this.paths.playwrightRoot, join(slot, "failed.json"), { schema: 1, stage: "preparation", detail: "Runtime preparation failed; candidate retained, never silently selected", createdAt: new Date().toISOString() });
+        await publishJson(this.paths.playwrightRoot, join(slot, "failed.json"), { schemaVersion: 1, stage: "preparation", detail: "Runtime preparation failed; candidate retained, never silently selected", createdAt: new Date().toISOString() });
         if (/ownership uncertain|did not quiesce/.test(error instanceof Error ? error.message : "")) {
-          await publishJson(this.paths.playwrightRoot, join(this.paths.playwrightRoot, "recovery.json"), { schema: 1, operation: "cleanup", runtimeId: slot.split("/").at(-1), detail: "Owned preparation process cleanup uncertain; verify quiescence before recovery", createdAt: new Date().toISOString() });
+          await publishJson(this.paths.playwrightRoot, join(this.paths.playwrightRoot, "recovery.json"), { schemaVersion: 1, operation: "cleanup", runtimeId: slot.split("/").at(-1), detail: "Owned preparation process cleanup uncertain; verify quiescence before recovery", createdAt: new Date().toISOString() });
         }
       }
       throw error;

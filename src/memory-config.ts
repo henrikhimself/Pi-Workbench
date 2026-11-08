@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
-import { HEADROOM_STORE_MARKER } from "./headroom-state.js";
+import { STORE_MARKER } from "./store-identity.js";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { WORKBENCH_PATHS } from "./paths.js";
@@ -38,7 +38,7 @@ export function resolveMemoryStore(options?: {
   const projectPath = canonicalPath(options?.cwd ?? process.cwd());
   const configuredRoot = options?.root;
   const rootConfigured = configuredRoot !== undefined && configuredRoot !== "";
-  // Explicit roots are bases, never aliases for pre-refactor physical stores.
+  // An explicit root is a base directory; the store lives in a marked subdirectory.
   const root = rootConfigured ? join(resolveMemoryRoot(configuredRoot), "workbench-memory-v1")
     : options?.defaultRoot ?? DEFAULT_MEMORY_ROOT;
   const rootInsideProject = isWithin(canonicalPath(root), projectPath);
@@ -66,7 +66,7 @@ export function resolveMemoryStore(options?: {
 }
 
 export function hasMemoryStore(store: Pick<MemoryStore, "databasePath">): boolean {
-  return existsSync(store.databasePath) && existsSync(join(dirname(store.databasePath), HEADROOM_STORE_MARKER));
+  return existsSync(store.databasePath) && existsSync(join(dirname(store.databasePath), STORE_MARKER));
 }
 
 export function resolveMemoryRoot(value: string | undefined): string {

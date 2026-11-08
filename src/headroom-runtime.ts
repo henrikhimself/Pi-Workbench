@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { requireSchemaVersion } from "./schema-version.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -9,6 +10,7 @@ import {
 } from "./managed-lifecycle.js";
 
 export const MANAGED_CRYPTOGRAPHY_VERSION = "50.0.2";
+const MINIMUM_PIP = "pip 22.2";
 export type RuntimeRunner = (command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal }) => Promise<string>;
 const runDefault: RuntimeRunner = (command, args, options) => new Promise((resolve, reject) => {
   execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
@@ -32,7 +34,7 @@ export async function findPython(): Promise<string | null> {
   return null;
 }
 export interface ManagedHeadroomDescriptor {
-  schema: 1;
+  schemaVersion: 1;
   version: string;
   slot: string;
   python: string;
@@ -60,6 +62,8 @@ const CHECK = [
 const forbidden = (name: string) => /torch|sentence[-_]transformers|tensorflow|nvidia|cupy|ollama/i.test(name);
 
 /** One installation, separate service/model readiness. All slots stay at creation paths. */
+/** Slot + dependency digest pairs whose inventory this process has already verified. */
+const VERIFIED_SLOTS = new Set<string>();
 export class ManagedHeadroomRuntime {
   readonly root: string;
   readonly selectionPath: string;
@@ -87,7 +91,7 @@ export class ManagedHeadroomRuntime {
   }
   environment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
     const env: NodeJS.ProcessEnv = {};
-    for (const key of ["PATH", "LANG", "LC_ALL", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "HF_TOKEN", "HEADROOM_OFFLINE"]) {
+    for (const key of ["PATH", "LANG", "LC_ALL", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "HF_TOKEN", "HEADROOM_OFFLINE"]) {
       if (source[key] !== undefined) env[key] = source[key];
     }
     return { ...env, PYTHONNOUSERSITE: "1", HOME: join(this.root, "home"),
@@ -108,7 +112,7 @@ export class ManagedHeadroomRuntime {
       assertWithin(this.root, path); await assertNoSymlink(path);
       const descriptor = JSON.parse(await readFile(path, "utf8")) as ManagedHeadroomDescriptor;
       opened = true;
-      if (descriptor.schema !== 1) throw new Error("Unknown managed Headroom layout schema");
+      requireSchemaVersion(descriptor, "Managed Headroom runtime descriptor");
       if (typeof descriptor.version !== "string" || descriptor.version.split(".").length !== 3 || descriptor.version.split(".").some(part => !/^[0-9]+$/.test(part)) || !Array.isArray(descriptor.inventory) ||
           descriptor.inventory.some(d => typeof d.name !== "string" || typeof d.version !== "string" || forbidden(d.name)) ||
           descriptor.embedding?.model !== "Qdrant/all-MiniLM-L6-v2-onnx" ||
@@ -126,7 +130,7 @@ export class ManagedHeadroomRuntime {
       return descriptor;
     } catch (error) {
       if (!opened && (error as NodeJS.ErrnoException).code === "ENOENT") return null;
-      // A broken/unknown new-layout selection is not a legacy adoption candidate.
+      // A broken or unknown selection is an error, never silently replaced.
       throw error;
     }
   }
@@ -168,28 +172,66 @@ export class ManagedHeadroomRuntime {
     } finally { await rm(temporary, { recursive: true, force: true }); }
   }
   private async verify(descriptor: ManagedHeadroomDescriptor): Promise<void> {
+    // Slots are immutable and each check starts Python, so verify a slot/digest pair once per process.
+    const key = `${descriptor.slot}\0${descriptor.dependencyDigest}`;
+    if (VERIFIED_SLOTS.has(key)) return;
     const result = await this.check(descriptor.python);
     if (result.transport !== MANAGED_CRYPTOGRAPHY_VERSION || result.version !== descriptor.version || result.inventory.some((d: { name: string }) => forbidden(d.name))) throw new Error("Headroom runtime identity/CPU dependency check failed");
     const digest = createHash("sha256").update(JSON.stringify(result.inventory)).digest("hex");
     if (digest !== descriptor.dependencyDigest) throw new Error("Managed immutable dependency inventory changed");
+    VERIFIED_SLOTS.add(key);
   }
   async ensure(onStatus: (message: string) => void): Promise<ManagedHeadroomDescriptor | null> {
     try { return await this.prepare(onStatus); }
     catch (error) { onStatus(`Headroom runtime unavailable: ${String(error)}`); return null; }
+  }
+  /** `pip install --dry-run --report` needs pip 22.2; never upgrade pip silently (an upgrade would need a pinned, hash-checked step). */
+  private async requireDryRunPip(python: string): Promise<void> {
+    const output = await this.execute(python, ["-m", "pip", "--version"], { env: this.environment(), timeoutMs: 30_000 });
+    const match = /^pip ((\d+)\.(\d+)[\d.]*)/.exec(output.trim());
+    if (!match) throw new Error(`Cannot read the pip version of the new Headroom runtime (need ${MINIMUM_PIP})`);
+    const [major, minor] = [Number(match[2]), Number(match[3])];
+    if (major < 22 || (major === 22 && minor < 2)) {
+      throw new Error(`The new Headroom runtime has pip ${match[1]}, but ${MINIMUM_PIP} or newer is required. Use a Python whose venv ships pip 22.2 or newer.`);
+    }
+  }
+  /** Build the venv and install the hashed requirements into an empty slot; the caller removes the slot on failure. */
+  private async installIntoSlot(system: string, version: string, slot: string, pythonIdentity: string, onStatus: (message: string) => void): Promise<ManagedHeadroomDescriptor> {
+    await ensurePrivateDirectory(this.root, slot);
+    // Conservative current-package estimate; failure never mutates a live slot/store.
+    await requireDiskSpace(this.root, 2 * 1024 * 1024 * 1024);
+    const python = join(slot, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+    const cli = join(slot, process.platform === "win32" ? "Scripts/headroom.exe" : "bin/headroom");
+    onStatus(`Preparing Headroom ${version} runtime...`);
+    await this.execute(system, ["-m", "venv", "--copies", slot], { env: this.environment(), timeoutMs: 60_000 });
+    await this.requireDryRunPip(python);
+    const report = join(slot, "resolved.json");
+    await this.execute(python, ["-m", "pip", "--isolated", "install", "--dry-run", "--report", report, `headroom-ai[proxy]==${version}`, `cryptography==${MANAGED_CRYPTOGRAPHY_VERSION}`, "--disable-pip-version-check"], { env: this.environment(), timeoutMs: 240_000 });
+    const resolved = JSON.parse(await readFile(report, "utf8"));
+    const requirements: string[] = [];
+    for (const distribution of resolved.install) {
+      const name = distribution.metadata.name as string;
+      const hash = distribution.download_info?.archive_info?.hashes?.sha256;
+      if (forbidden(name) || !/^[0-9a-f]{64}$/.test(hash ?? "")) throw new Error(`Unapproved/unhashed runtime dependency: ${name}`);
+      requirements.push(`${name.toLowerCase().replaceAll("_", "-") === "headroom-ai" ? "headroom-ai[proxy]" : name}==${distribution.metadata.version} --hash=sha256:${hash}`);
+    }
+    if (!requirements.some(line => line.startsWith(`cryptography==${MANAGED_CRYPTOGRAPHY_VERSION} `))) throw new Error("Resolver did not return pinned managed cryptography");
+    if (!requirements.some(line => line.startsWith(`headroom-ai[proxy]==${version} `))) throw new Error("Resolver did not return exact pinned Headroom");
+    const frozen = join(slot, "requirements.txt"); await writeFile(frozen, requirements.sort().join("\n") + "\n", { mode: 0o600 });
+    await this.execute(python, ["-m", "pip", "--isolated", "install", "--require-hashes", "-r", frozen, "--disable-pip-version-check"], { env: this.environment(), timeoutMs: 600_000 });
+    const checked = await this.check(python);
+    if (checked.transport !== MANAGED_CRYPTOGRAPHY_VERSION || checked.version !== version || checked.inventory.some((d: { name: string }) => forbidden(d.name))) throw new Error("Candidate failed pinned CPU runtime validation");
+    const descriptor: ManagedHeadroomDescriptor = { schemaVersion: 1, version, slot, python, cli, pythonIdentity,
+      inventory: checked.inventory, dependencyDigest: createHash("sha256").update(JSON.stringify(checked.inventory)).digest("hex"),
+      embedding: { model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384, provider: "CPUExecutionProvider" } };
+    await this.publish(this.root, join(slot, "ready.json"), descriptor);
+    return descriptor;
   }
   private async prepare(onStatus: (message: string) => void): Promise<ManagedHeadroomDescriptor> {
     const version = this.versionOverride ?? await getHeadroomAiVersion();
     if (!version || !/^\d+\.\d+\.\d+$/.test(version)) throw new Error("Missing exact Headroom package pin");
     await this.prepareRoot();
     await this.assertNoPending();
-    const selected = await this.inspect();
-    if (selected && selected.version !== version) {
-      const target = version.split(".").map(Number), source = selected.version.split(".").map(Number);
-      if (source.length !== 3 || source.some(value => !Number.isSafeInteger(value)) ||
-          !(target[0] > source[0] || (target[0] === source[0] && (target[1] > source[1] || (target[1] === source[1] && target[2] > source[2]))))) {
-        throw new Error("Automatic runtime downgrade refused; manual extension downgrade requires paired backend and data");
-      }
-    }
     const current = await this.readDescriptor(this.selectionPath, version);
     if (current) { await this.verify(current); return current; }
     const release = await acquireManagedLock(join(this.root, "coordination"), "install", { timeoutMs: 240_000, signal: this.cancellation });
@@ -200,47 +242,29 @@ export class ManagedHeadroomRuntime {
       const candidatePath = join(this.root, `candidate-${version}.json`);
       let descriptor = await this.readDescriptor(candidatePath, version);
       if (!descriptor) {
-        if (/^(1|true|yes)$/i.test(this.environment().HEADROOM_OFFLINE ?? "")) throw new Error("Offline mode: fresh runtime installation requires cached/prepared candidate");
+        if (/^(1|true|yes)$/i.test(this.environment().HEADROOM_OFFLINE ?? "")) throw new Error("Offline mode: new runtime installation requires cached/prepared candidate");
         const system = await this.systemPython();
         if (!system) throw new Error("Python >=3.10 unavailable");
         const pythonIdentity = (await this.execute(system, ["-c", "import sys,platform;print(sys.version+'|'+platform.platform())"], { env: this.environment(), timeoutMs: 10_000 })).trim();
         const build = createHash("sha256").update(pythonIdentity).digest("hex").slice(0, 16);
         const slot = join(this.root, "runtimes", version, `${build}-${randomUUID()}`);
-        await ensurePrivateDirectory(this.root, slot);
-        // Conservative current-package estimate; failure never mutates a live slot/store.
-        await requireDiskSpace(this.root, 2 * 1024 * 1024 * 1024);
-        const python = join(slot, process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
-        const cli = join(slot, process.platform === "win32" ? "Scripts/headroom.exe" : "bin/headroom");
-        onStatus(`Preparing Headroom ${version} runtime...`);
-        await this.execute(system, ["-m", "venv", "--copies", slot], { env: this.environment(), timeoutMs: 60_000 });
-        const report = join(slot, "resolved.json");
-        await this.execute(python, ["-m", "pip", "--isolated", "install", "--dry-run", "--report", report, `headroom-ai[proxy]==${version}`, `cryptography==${MANAGED_CRYPTOGRAPHY_VERSION}`, "--disable-pip-version-check"], { env: this.environment(), timeoutMs: 240_000 });
-        const resolved = JSON.parse(await readFile(report, "utf8"));
-        const requirements: string[] = [];
-        for (const distribution of resolved.install) {
-          const name = distribution.metadata.name as string;
-          const hash = distribution.download_info?.archive_info?.hashes?.sha256;
-          if (forbidden(name) || !/^[0-9a-f]{64}$/.test(hash ?? "")) throw new Error(`Unapproved/unhashed runtime dependency: ${name}`);
-          requirements.push(`${name.toLowerCase().replaceAll("_", "-") === "headroom-ai" ? "headroom-ai[proxy]" : name}==${distribution.metadata.version} --hash=sha256:${hash}`);
+        try {
+          descriptor = await this.installIntoSlot(system, version, slot, pythonIdentity, onStatus);
+          await this.publish(this.root, candidatePath, descriptor);
+        } catch (error) {
+          // A slot nobody published is removed so retries don't pile up venvs; a published candidate is kept.
+          // A failing cleanup never replaces the original error.
+          const published = await this.readDescriptor(candidatePath, version).then(found => !!found, () => true);
+          if (!published) await rm(slot, { recursive: true, force: true }).catch(() => {});
+          throw error;
         }
-        if (!requirements.some(line => line.startsWith(`cryptography==${MANAGED_CRYPTOGRAPHY_VERSION} `))) throw new Error("Resolver did not return pinned managed cryptography");
-        if (!requirements.some(line => line.startsWith(`headroom-ai[proxy]==${version} `))) throw new Error("Resolver did not return exact pinned Headroom");
-        const frozen = join(slot, "requirements.txt"); await writeFile(frozen, requirements.sort().join("\n") + "\n", { mode: 0o600 });
-        await this.execute(python, ["-m", "pip", "--isolated", "install", "--require-hashes", "-r", frozen, "--disable-pip-version-check"], { env: this.environment(), timeoutMs: 600_000 });
-        const checked = await this.check(python);
-        if (checked.transport !== MANAGED_CRYPTOGRAPHY_VERSION || checked.version !== version || checked.inventory.some((d: { name: string }) => forbidden(d.name))) throw new Error("Candidate failed pinned CPU runtime validation");
-        descriptor = { schema: 1, version, slot, python, cli, pythonIdentity,
-          inventory: checked.inventory, dependencyDigest: createHash("sha256").update(JSON.stringify(checked.inventory)).digest("hex"),
-          embedding: { model: "Qdrant/all-MiniLM-L6-v2-onnx", dimensions: 384, provider: "CPUExecutionProvider" } };
-        await this.publish(this.root, join(slot, "ready.json"), descriptor);
-        await this.publish(this.root, candidatePath, descriptor);
       } else await this.verify(descriptor);
       this.cancellation?.throwIfAborted();
       if ((await activeConsumers(this.leaseRoot)).length) throw new Error("Runtime activation deferred: managed consumers still use prior selection");
       const previous = await this.inspect();
       if (previous) await this.publish(this.root, join(this.root, `selected.backup-${randomUUID()}.json`), previous);
       const pending = join(this.root, "selection.pending.json");
-      await publishJson(this.root, pending, { schema: 1, previous, candidate: descriptor });
+      await publishJson(this.root, pending, { schemaVersion: 1, previous, candidate: descriptor });
       try {
         await this.publish(this.root, this.selectionPath, descriptor);
         await rm(pending);

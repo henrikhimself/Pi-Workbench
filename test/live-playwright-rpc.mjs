@@ -51,9 +51,9 @@ try {
   server = createServer((_request, reply) => { reply.setHeader("content-type", "text/html"); reply.end("<!doctype html><title>Synthetic live</title><h1>WB_LIVE_PAGE</h1><p>Only synthetic acceptance content.</p><button onclick=\"document.querySelector('#r').textContent='WB_CLICKED_OK'\">Go</button><p id=\"r\"></p>"); });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve)); const url = `http://127.0.0.1:${server.address().port}/`;
   const jiti = createJiti(import.meta.url, { fsCache: false }), { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts"), paths = resolveWorkbenchPaths(home);
-  const { PlaywrightRuntime } = await jiti.import("../src/playwright-runtime.ts"), { resolvePlaywrightProject, setPlaywrightOptIn } = await jiti.import("../src/playwright-config.ts");
+  const { PlaywrightRuntime } = await jiti.import("../src/playwright-runtime.ts"), { resolvePlaywrightProject, enablePlaywrightOptIn } = await jiti.import("../src/playwright-config.ts");
   await new PlaywrightRuntime({ paths }).ensure(message => console.error(message));
-  const project = resolvePlaywrightProject(workspace, paths); await setPlaywrightOptIn(project, true);
+  const project = resolvePlaywrightProject(workspace, paths); await enablePlaywrightOptIn(project);
   const definition = { id: modelId, reasoning: true, input: ["text"], contextWindow: loaded.context_length, maxTokens: 1024, compat: { thinkingFormat: "qwen-chat-template", thinkingTokenBudgetField: "thinking_budget_tokens" } };
   await writeFile(join(agent, "models.json"), JSON.stringify({ providers: { "llama.cpp": { baseUrl: base.replace(/\/$/, "") + "/v1", api: "openai-completions", apiKey: "${LLAMA_API_KEY}", models: [definition] } } }), { mode: 0o600 });
   await writeFile(join(agent, "settings.json"), JSON.stringify({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: { mode: "off" } }), { mode: 0o600 });
@@ -123,7 +123,7 @@ try {
   from = events.length; send({ type: "prompt", message: "/wb:playwright off", id: randomUUID() });
   const approved = await waitFor(event => event.type === "extension_ui_request" && event.method === "confirm", "second off confirmation", 30000, from);
   send({ type: "extension_ui_response", id: approved.id, confirmed: true });
-  await waitFor(event => event.type === "extension_ui_request" && ["notify", "setStatus"].includes(event.method) && /Playwright off|workspace data deleted/i.test(strip(event.message ?? event.statusText)), "off completion", 120000, from);
+  await waitFor(event => event.type === "extension_ui_request" && ["notify", "setStatus"].includes(event.method) && /Playwright off|Playwright data deleted for this project/i.test(strip(event.message ?? event.statusText)), "off completion", 120000, from);
   await assert.rejects(lstat(project.directory), { code: "ENOENT" });
   report.checks.push("approved off deletes this workspace's data and reports completion over the wire");
 
