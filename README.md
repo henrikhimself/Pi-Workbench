@@ -199,4 +199,4 @@ Displays the system prompt which models usually will refuse to do when asked. Ev
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Third-party component attribution: [NOTICE](NOTICE).
