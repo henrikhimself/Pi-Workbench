@@ -50,7 +50,7 @@ try {
   const first = await connect(a), tools = await first.call("tools/list");
   assert.equal(tools.tools.length, 17);
   await writeFile(join(home, "tool-schemas.json"), JSON.stringify(tools.tools, null, 2));
-  assert.match(text(await first.tool("search_graph", { project: (await a.fetchIndexSummary(one.project, activated.binaryPath)), name_pattern: "fixtureSentinel" })), /fixtureSentinel/);
+  assert.match(text(await first.tool("search_graph", { project: (await a.indexedProjectName(one.project, activated.binaryPath)), name_pattern: "fixtureSentinel" })), /fixtureSentinel/);
   assert.equal((await b.activate(two.project)).ok, true); const second = await connect(b);
   assert.notEqual(launcherEnv(a).CBM_RUNTIME_DIR, launcherEnv(b).CBM_RUNTIME_DIR);
   assert.equal(launcherEnv(a).CBM_CACHE_DIR, one.project.directory);
@@ -63,7 +63,7 @@ try {
   report.checks.push("same-workspace peers survive creator release; deletion remains guarded");
   await writeFile(join(one.cwd, "fixture.ts"), ["export function watcherSentinel(): number { return watcherCallee(); }", "export function watcherCallee(): number { return 712398; }", ""].join("\n"));
   let watched = false; const watchDeadline = Date.now() + 20000;
-  const projectName = await peer.fetchIndexSummary(one.project, activated.binaryPath);
+  const projectName = await peer.indexedProjectName(one.project, activated.binaryPath);
   while (Date.now() < watchDeadline) {
     const result = await peerClient.tool("search_graph", { project: projectName, name_pattern: "watcherSentinel" });
     if (text(result).includes("watcherSentinel")) { watched = true; break; }

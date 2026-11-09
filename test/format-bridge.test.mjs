@@ -431,20 +431,26 @@ test("restoreAgentMessages: a changed message count returns the compressed messa
 
 // ─── Edge cases ───────────────────────────────────────────────────────
 
-test("openAIToPi: invalid JSON tool arguments → {_raw} fallback", () => {
-  const original = [assistantMixed];
-  const compressed = [
-    {
-      role: "assistant",
-      content: "x",
-      tool_calls: [
-        { id: "c1", type: "function", function: { name: "bash", arguments: "not-json{" } },
-      ],
-    },
-  ];
-  const [m] = openAIToPi(compressed, original);
+const argumentsOutcome = (rawArguments) => {
+  const [m] = openAIToPi([{ role: "assistant", content: "x", tool_calls: [
+    { id: "call_1", type: "function", function: { name: "bash", arguments: rawArguments } },
+  ] }], [assistantMixed]);
+  return m;
+};
+
+test("openAIToPi: invalid JSON tool arguments keep the original arguments", () => {
+  const m = argumentsOutcome("not-json{");
   const tc = m.content.find((p) => p.type === "toolCall");
-  assert.deepEqual(tc.arguments, { _raw: "not-json{" });
+  assert.deepEqual(tc.arguments, { command: "ls -la" });
+  assert.equal(m.content.find((p) => p.type === "text").text, "x");
+});
+
+test("H-11: non-object JSON arguments keep the original arguments", () => {
+  for (const raw of ["null", "[1]"]) {
+    const m = argumentsOutcome(raw);
+    assert.deepEqual(m.content.find((p) => p.type === "toolCall").arguments, { command: "ls -la" }, raw);
+    assert.equal(m.content.find((p) => p.type === "text").text, "x", raw);
+  }
 });
 
 test("openAIToPi: null assistant content → no text part", () => {
@@ -469,4 +475,40 @@ test("round-trip: piToOpenAI is stable across compress round-trips", () => {
   const back = openAIToPi(once, original);
   const twice = piToOpenAI(back);
   assert.deepEqual(twice, once);
+});
+
+const interleavedUser = {
+  role: "user",
+  content: [
+    { type: "text", text: "Before:" },
+    { type: "image", data: "QUJD", mimeType: "image/png" },
+    { type: "text", text: "After:" },
+    { type: "image", data: "REVG", mimeType: "image/png" },
+  ],
+  timestamp: 901,
+};
+const interleavedToolResult = {
+  role: "toolResult", toolCallId: "call_interleaved", toolName: "screenshot", isError: false, timestamp: 902,
+  content: interleavedUser.content,
+};
+
+test("H-10: interleaved captions stay with their images when the layout is unchanged", () => {
+  const compressed = piToOpenAI([interleavedUser]);
+  const texts = compressed[0].content.filter((part) => part.type === "text");
+  texts[0].text = "B:"; texts[1].text = "A:";
+  const [m] = openAIToPi(compressed, [interleavedUser]);
+  assert.deepEqual(m.content, [
+    { type: "text", text: "B:" },
+    interleavedUser.content[1],
+    { type: "text", text: "A:" },
+    interleavedUser.content[3],
+  ]);
+  assert.equal(m.content[1], interleavedUser.content[1], "images stay the original objects");
+});
+
+test("H-10: interleaved captions whose layout was lost keep the original message", () => {
+  const [user] = openAIToPi([{ role: "user", content: "Before:\nAfter:" }], [interleavedUser]);
+  assert.equal(user, interleavedUser);
+  const [tool] = openAIToPi([{ role: "tool", tool_call_id: "call_interleaved", content: "Before: After:" }], [interleavedToolResult]);
+  assert.equal(tool, interleavedToolResult);
 });

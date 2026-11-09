@@ -110,10 +110,15 @@ def validate_bundle_root(bundle: Path) -> Path:
     return bundle.resolve(strict=True)
 
 
-def require_bundle_directory(bundle: Path, root: Path, kind: str) -> Path:
+def require_bundle_directory(bundle: Path, root: Path, kind: str) -> Path | None:
     directory = bundle / kind
-    if directory.is_symlink() or not directory.is_dir():
+    if directory.is_symlink():
         raise ValueError(f"bundle directory must not be a symbolic link: {kind}")
+    if not directory.exists():
+        # Git does not store empty directories, so a kind without records may be absent.
+        return None
+    if not directory.is_dir():
+        raise ValueError(f"bundle entry must be a directory: {kind}")
     if not directory.resolve(strict=True).is_relative_to(root):
         raise ValueError(f"bundle directory resolves outside bundle: {kind}")
     return directory
@@ -144,6 +149,8 @@ def derived_entries(bundle: Path, root: Path) -> list[dict[str, str]]:
     entries = []
     for kind in ("memories", "entities", "relationships"):
         directory = require_bundle_directory(bundle, root, kind)
+        if directory is None:
+            continue
         for child in sorted(directory.iterdir()):
             relative_path = f"{kind}/{child.name}"
             if child.is_dir() and not child.is_symlink():
@@ -167,15 +174,12 @@ def read_bundle(bundle: Path, namespace: str, derive_manifest: bool = False) -> 
     files = manifest.get("files")
     if not isinstance(files, list):
         raise ValueError("bundle manifest files must be a list")
-    result_kinds = ("memories", "entities", "relationships")
-    for kind in result_kinds:
+    result: dict[str, list[dict[str, Any]]] = {"memories": [], "entities": [], "relationships": []}
+    for kind in result:
         require_bundle_directory(bundle, root, kind)
     if derive_manifest:
         files = derived_entries(bundle, root)
     expected = {"manifest.json"}
-    result: dict[str, list[dict[str, Any]]] = {"memories": [], "entities": [], "relationships": []}
-    for kind in result:
-        require_bundle_directory(bundle, root, kind)
     for entry in files:
         if not isinstance(entry, dict) or set(entry) != {"path", "sha256"}:
             raise ValueError("bundle manifest has invalid file entry")

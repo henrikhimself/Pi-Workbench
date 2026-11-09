@@ -53,6 +53,7 @@ test("MemoryManager: preflights ONNX and produces direct local MCP configuration
       ensurePython: async () => "/managed/python",
       runProcess: async (command, args, options) => {
         processCalls.push({ command, args, options });
+        return JSON.stringify({ modelSha256: "a".repeat(64), tokenizerSha256: "b".repeat(64), modelRevision: "c".repeat(40) });
       },
     });
 
@@ -78,7 +79,7 @@ test("MemoryManager: preflights ONNX and produces direct local MCP configuration
     assert.deepEqual(spec.args.slice(0, 3), ["-m", "headroom.memory.mcp_server", "--db"]);
     assert.equal(spec.args.at(-1), "tester");
     assert.equal(config.exposure, "direct");
-    assert.equal(config.timeout, 60);
+    assert.equal(config.timeout, undefined);
     assert.equal(config.env, undefined, "nothing is registered through Pi's merged, interpolated env");
     assert.equal(spec.env.HEADROOM_EMBEDDER_RUNTIME, undefined);
     assert.equal(spec.env.HF_HUB_OFFLINE, "1");
@@ -285,6 +286,26 @@ test("M13: show returns output larger than Node's default 1 MiB execFile buffer"
   } finally { await rm(tempDir, { recursive: true, force: true }); }
 });
 
+test("X-3c: an aborted bundle child that ignores SIGTERM is killed before the call returns", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-kill-"));
+  const project = join(tempDir, "project"), pidFile = join(tempDir, "pid");
+  let pid = 0;
+  try {
+    await mkdir(project);
+    const controller = new AbortController();
+    const manager = new MemoryManager({ cwd: project, root: join(tempDir, "memory-root"), userId: "tester", signal: controller.signal });
+    await manager.createStore();
+    const fake = join(tempDir, "fake-python");
+    await writeFile(fake, `#!${process.execPath}\nprocess.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);\n`, { mode: 0o755 });
+    const run = manager.showBundle(fake); const settled = run.then(() => null, error => error);
+    for (let i = 0; i < 200 && !existsSync(pidFile); i++) await new Promise(done => setTimeout(done, 25));
+    pid = Number(await readFile(pidFile, "utf8"));
+    controller.abort();
+    assert.ok(await settled);
+    assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
+  } finally { if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ } await rm(tempDir, { recursive: true, force: true }); }
+});
+
 test("M8: merge and import ask the bundle script to derive the manifest; strict validation elsewhere is unchanged", async () => {
   const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-derive-"));
   try {
@@ -364,9 +385,60 @@ test("L10: two merges in the same second both succeed and each keeps its own bac
   } finally { await rm(tempDir, { recursive: true, force: true }); }
 });
 
+test("M-6: deleteStore also removes this project's merge backups and nothing else", async () => {
+  const { tempDir, manager } = await stubbedManager();
+  try {
+    await manager.mergeBundle("python3");
+    await manager.mergeBundle("python3");
+    const parent = dirname(manager.store.directory);
+    const other = join(parent, "other-0123456789abcdef.merge-backup-x");
+    await mkdir(other);
+    const mine = () => readdir(parent).then(names => names.filter(name => name.startsWith(`${manager.store.identifier}.merge-backup-`)));
+    assert.equal((await mine()).length, 2);
+    await manager.deleteStore();
+    assert.deepEqual(await mine(), []);
+    assert.equal(existsSync(other), true);
+    assert.equal(existsSync(manager.store.directory), false);
+  } finally { await rm(tempDir, { recursive: true, force: true }); }
+});
+
 test("L14: every SQLite connection in the bundle script is closed, and before derived files are unlinked", async () => {
   const { stdout } = await execFileAsync("python3", ["-I", join(process.cwd(), "test", "helpers", "bundle-closes-connections.py"), join(process.cwd(), "src", "memory-bundle.py")]);
   const report = JSON.parse(stdout);
   assert.ok(report.opened >= 5, `expected the replace, merge and read connections, saw ${report.opened}`);
   assert.deepEqual({ allClosed: report.allClosed, closedBeforeUnlink: report.closedBeforeUnlink }, { allClosed: true, closedBeforeUnlink: true });
+});
+
+test("M-2: Memory MCP env carries no Hugging Face token or proxy settings", async () => {
+  const keys = ["HF_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"];
+  const source = {
+    PATH: "/usr/bin", SAFE_VALUE: "kept", HF_TOKEN: "hf_fixture_secret",
+    HTTP_PROXY: "http://user:pw@proxy.invalid:3128", HTTPS_PROXY: "http://user:pw@proxy.invalid:3128", NO_PROXY: "localhost",
+    http_proxy: "http://user:pw@proxy.invalid:3128", https_proxy: "http://user:pw@proxy.invalid:3128", no_proxy: "localhost",
+  };
+  const env = createMcpEnvironment(source);
+  for (const key of keys) assert.equal(key in env, false, key);
+  assert.equal(env.PATH, "/usr/bin");
+  assert.equal(env.SAFE_VALUE, "kept");
+  assert.equal(env.HF_HUB_OFFLINE, "1");
+  assert.equal(createPreflightEnvironment(source).HF_TOKEN, "hf_fixture_secret");
+
+  const saved = { HF_TOKEN: process.env.HF_TOKEN, HTTPS_PROXY: process.env.HTTPS_PROXY };
+  process.env.HF_TOKEN = "hf_fixture_secret";
+  process.env.HTTPS_PROXY = "http://user:pw@proxy.invalid:3128";
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-memory-env-"));
+  try {
+    const manager = new MemoryManager({
+      cwd: join(tempDir, "project"), root: join(tempDir, "memory-root"), userId: "tester",
+      ensurePython: async () => "/managed/python", runProcess: async () => {},
+    });
+    await manager.prepare(() => {});
+    await manager.createStore();
+    const argv = manager.getMcpConfig("/managed/python").args.join(" ");
+    assert.doesNotMatch(argv, /hf_fixture_secret/);
+    assert.doesNotMatch(argv, /user:pw/);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });

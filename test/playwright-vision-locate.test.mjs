@@ -85,6 +85,10 @@ function toolFixture({ outcome = shot, reply, state = READY, available = true, l
 }
 const run = (f, params = { target: "the green button" }, signal = new AbortController().signal) => f.def.execute("id", params, signal, undefined, f.ctx);
 
+test("locate refuses before any screenshot when browser_evaluate is not callable", async () => {
+  const f = toolFixture(); f.ctx.tools = [{ name: "mcp__playwright__browser_take_screenshot" }];
+  await assert.rejects(run(f), /browser_evaluate/); assert.equal(f.calls.length, 0);
+});
 test("locate tool schema is strict, inactive by default, and takes only a bounded target", () => {
   const f = toolFixture(); assert.equal(f.def.name, "wb_screenshot_locate"); assert.equal(f.def.defaultActive, false);
   assert.equal(Value.Check(f.def.parameters, { target: "x" }), true);

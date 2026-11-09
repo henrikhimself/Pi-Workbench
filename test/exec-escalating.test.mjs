@@ -6,9 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
-const { execWithKillEscalation, KILL_GRACE_MS } = await jiti.import("../src/exec-escalating.ts");
-const { extractCodeGraphArchive, defaultProcessRunner } = await jiti.import("../src/code-graph-installer.ts");
-const manager = await jiti.import("../src/code-graph-manager.ts");
+const { execWithKillEscalation, defaultProcessRunner, KILL_GRACE_MS } = await jiti.import("../src/exec-escalating.ts");
+const { extractCodeGraphArchive } = await jiti.import("../src/code-graph-installer.ts");
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -58,14 +57,11 @@ test("well-behaved children keep their output and exit code", async () => {
   assert.notEqual(missing.code, 0);
 });
 
-test("both default process runners use the escalation", async () => {
+test("the shared default process runner uses the escalation", async () => {
   const dir = await mkdtemp(join(tmpdir(), "wb-escalate-")); const pidFile = join(dir, "pid");
   try {
-    const installerResult = await defaultProcessRunner()(process.execPath, ["-e", stubborn, pidFile], { env: process.env, cwd: dir, timeoutMs: 300, killGraceMs: 300 });
-    assert.notEqual(installerResult.code, 0);
-    assert.equal(await waitFor(() => !alive(Number(require_(pidFile)))), true);
-    const managerResult = await manager.defaultProcessRunner()(process.execPath, ["-e", stubborn, pidFile], { env: process.env, cwd: dir, timeoutMs: 300, killGraceMs: 300 });
-    assert.notEqual(managerResult.exitCode, 0);
+    const result = await defaultProcessRunner()(process.execPath, ["-e", stubborn, pidFile], { env: process.env, cwd: dir, timeoutMs: 300, killGraceMs: 300 });
+    assert.notEqual(result.code, 0);
     assert.equal(await waitFor(() => !alive(Number(require_(pidFile)))), true);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });

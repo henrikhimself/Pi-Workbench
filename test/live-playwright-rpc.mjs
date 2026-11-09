@@ -21,7 +21,7 @@ assert.equal(loaded?.status?.value, "loaded", "MODEL_NOT_READY: user must load e
 
 const root = await mkdtemp(join(tmpdir(), "wb-playwright-rpc-")), home = join(root, "home"), agent = join(root, "agent"), workspace = join(root, "a");
 const repo = fileURLToPath(new URL("..", import.meta.url));
-const report = { model: `llama.cpp/${modelId}`, transport: "real `pi --mode rpc` subprocess, JSONL stdin/stdout", checks: [], unverified: ["Provider/model image input and visual interpretation: authorized fixture model is text-only", "TUI is a manual procedure (owner-tested)"], passed: false };
+const report = { model: `llama.cpp/${modelId}`, transport: "real `pi --mode rpc` subprocess, JSONL stdin/stdout", checks: [], unverified: ["Image input to the agent and its visual interpretation: not tested; needs an image-capable agent model (the live gates use a text-only one)", "TUI is a manual procedure (owner-tested)"], passed: false };
 let child, server, passed = false, stderr = "";
 const events = [], waiters = [], pending = new Map(); let buffer = "";
 const strip = text => String(text ?? "").replace(/\u001b\[[0-9;]*m/g, "");

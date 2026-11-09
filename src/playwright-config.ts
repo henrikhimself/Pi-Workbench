@@ -21,7 +21,7 @@ const hash = /^[0-9a-f]{64}$/;
 export interface PlaywrightProject { root: string; projectPath: string; identifier: string; directory: string; optInPath: string }
 export interface PlaywrightSession {
   project: PlaywrightProject; id: string; directory: string; configPath: string; markerPath: string;
-  artifacts: string; home: string; cache: string; tmp: string; diagnostics: string;
+  artifacts: string; home: string; cache: string; tmp: string;
 }
 export interface PlaywrightHostExecutable { path: string; version: string; sha256: string }
 export interface PlaywrightRuntimeRecord {
@@ -154,11 +154,11 @@ export function resolvePlaywrightSession(project: PlaywrightProject, id: string 
   assertPlaywrightProject(project); assertPlaywrightId(id);
   const directory = join(project.directory, "sessions", id);
   return { project, id, directory, configPath: join(directory, "config.json"), markerPath: join(directory, "session.json"),
-    artifacts: join(directory, "artifacts"), home: join(directory, "home"), cache: join(directory, "cache"), tmp: join(directory, "tmp"), diagnostics: join(directory, "diagnostics") };
+    artifacts: join(directory, "artifacts"), home: join(directory, "home"), cache: join(directory, "cache"), tmp: join(directory, "tmp") };
 }
 export function assertPlaywrightSession(session: PlaywrightSession): void {
   const expected = resolvePlaywrightSession(session.project, session.id);
-  for (const key of ["directory", "configPath", "markerPath", "artifacts", "home", "cache", "tmp", "diagnostics"] as const) {
+  for (const key of ["directory", "configPath", "markerPath", "artifacts", "home", "cache", "tmp"] as const) {
     if (session[key] !== expected[key]) throw new Error("Playwright session identity/path mismatch");
   }
 }
@@ -191,7 +191,7 @@ export async function preparePlaywrightSession(session: PlaywrightSession, runti
   assertWithin(join(runtime.slot, "browsers"), runtime.browser);
   await ensurePrivateDirectory(session.project.root, dirname(session.directory));
   await mkdir(session.directory, { mode: 0o700 }); // EEXIST is not permission to reuse prior login state.
-  for (const path of [session.artifacts, session.diagnostics]) await ensurePrivateDirectory(session.project.root, path);
+  await ensurePrivateDirectory(session.project.root, session.artifacts);
   await preparePlaywrightTransient(session);
   await publishJson(session.project.root, session.markerPath, { schemaVersion: 1, sessionId: session.id, runtimeId: runtime.id,
     workspace: session.project.projectPath, identifier: session.project.identifier, owner: await ownIdentity(), createdAt: new Date().toISOString() });

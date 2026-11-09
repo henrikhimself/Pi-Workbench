@@ -108,9 +108,10 @@ try {
   assert.ok(a.session.sessionManager.getBranch().some(entry => entry.type === "custom" && entry.customType === STUDY_ENTRY_TYPE && entry.data.enabled === true));
   await a.session.prompt("/wb:study-mode off");
   await a.session.prompt("/wb:code-graph off --confirm-delete");
-  await wait(() => !named(a.session, "search_graph"), "owned tool removal"); assert.ok(named(b.session, "search_graph"));
+  await wait(() => notices.some(message => /Code Graph is in use by another Pi session/.test(message)), "off refused while a peer session is active");
+  assert.ok(named(a.session, "search_graph") && named(b.session, "search_graph"), "refused off must leave both sessions' tools unchanged");
   assert.ok((await tool(b.session, "list_projects", {})).content);
-  checks.push("owned direct tool removal preserves active peer and busy data");
+  checks.push("off refuses while another session uses the workspace and leaves tools and data unchanged");
   await a.dispose(); assert.equal(await proxy.healthCheck(), true);
   const { cliAcceptance } = await import("./live-cli.mjs");
   checks.push(...await cliAcceptance({ cwd: join(home, "a"), extension, modelId, loaded, wait, search }));

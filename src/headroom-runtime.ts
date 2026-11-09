@@ -1,4 +1,4 @@
-import { execFile } from "node:child_process";
+import { execWithKillEscalation } from "./exec-escalating.js";
 import { requireSchemaVersion } from "./schema-version.js";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -12,12 +12,16 @@ import {
 export const MANAGED_CRYPTOGRAPHY_VERSION = "50.0.2";
 const MINIMUM_PIP = "pip 22.2";
 export type RuntimeRunner = (command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal }) => Promise<string>;
-const runDefault: RuntimeRunner = (command, args, options) => new Promise((resolve, reject) => {
-  execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-    if (error) reject(new Error(String(stderr || error.message).slice(-2000)));
-    else resolve(String(stdout));
-  });
-});
+export const defaultRuntimeRunner: RuntimeRunner = async (command, args, options) => {
+  const started = Date.now();
+  const result = await execWithKillEscalation(command, args, { env: options.env, timeoutMs: options.timeoutMs, signal: options.signal, maxBuffer: 8 * 1024 * 1024 });
+  options.signal?.throwIfAborted();
+  if (result.code !== 0) {
+    const timedOut = Date.now() - started >= options.timeoutMs;
+    throw new Error((result.stderr || (timedOut ? `${command} timed out after ${options.timeoutMs} ms` : `${command} exited with code ${result.code}`)).slice(-2000));
+  }
+  return result.stdout;
+};
 export async function getHeadroomAiVersion(): Promise<string | null> {
   const manifest = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   const version = manifest.dependencies?.["headroom-ai"];
@@ -26,7 +30,7 @@ export async function getHeadroomAiVersion(): Promise<string | null> {
 export async function findPython(): Promise<string | null> {
   for (const command of ["python3", "python"]) {
     try {
-      const output = await runDefault(command, ["--version"], { env: process.env, timeoutMs: 5000 });
+      const output = await defaultRuntimeRunner(command, ["--version"], { env: process.env, timeoutMs: 5000 });
       const match = output.match(/Python (\d+)\.(\d+)/);
       if (match && (+match[1] > 3 || (+match[1] === 3 && +match[2] >= 10))) return command;
     } catch { /* Try next supported system interpreter, never an old managed venv. */ }
@@ -62,8 +66,14 @@ const CHECK = [
 const forbidden = (name: string) => /torch|sentence[-_]transformers|tensorflow|nvidia|cupy|ollama/i.test(name);
 
 /** One installation, separate service/model readiness. All slots stay at creation paths. */
-/** Slot + dependency digest pairs whose inventory this process has already verified. */
-const VERIFIED_SLOTS = new Set<string>();
+/**
+ * Slot + dependency digest pairs whose inventory this process has already verified. Pi re-imports
+ * extension modules on /reload, so the set lives on globalThis: a module-level Set would start empty
+ * and repeat the slow Python check while the old lease is already released.
+ */
+const VERIFIED_SLOTS: Set<string> = ((globalThis as Record<symbol, unknown>)[Symbol.for("pi-workbench.headroom.verified-slots.v1")] ??= new Set<string>()) as Set<string>;
+/** Identifies the check itself, so a release with a different check never reuses another release's entry. */
+const CHECK_IDENTITY = createHash("sha256").update(`${CHECK}\0${MANAGED_CRYPTOGRAPHY_VERSION}`).digest("hex");
 export class ManagedHeadroomRuntime {
   readonly root: string;
   readonly selectionPath: string;
@@ -77,7 +87,7 @@ export class ManagedHeadroomRuntime {
     this.root = (options.paths ?? WORKBENCH_PATHS).headroomRoot;
     this.selectionPath = join(this.root, "selected.json");
     this.leaseRoot = join(this.root, "consumers");
-    this.run = options.run ?? runDefault;
+    this.run = options.run ?? defaultRuntimeRunner;
     this.systemPython = options.systemPython ?? findPython;
     this.versionOverride = options.requiredVersion;
     this.publish = options.publish ?? publishJson;
@@ -172,8 +182,9 @@ export class ManagedHeadroomRuntime {
     } finally { await rm(temporary, { recursive: true, force: true }); }
   }
   private async verify(descriptor: ManagedHeadroomDescriptor): Promise<void> {
-    // Slots are immutable and each check starts Python, so verify a slot/digest pair once per process.
-    const key = `${descriptor.slot}\0${descriptor.dependencyDigest}`;
+    // Slots are immutable and each check starts Python, so verify a slot/digest pair once per process
+    // (the set is shared across module re-imports, see VERIFIED_SLOTS).
+    const key = `${CHECK_IDENTITY}\0${descriptor.slot}\0${descriptor.dependencyDigest}`;
     if (VERIFIED_SLOTS.has(key)) return;
     const result = await this.check(descriptor.python);
     if (result.transport !== MANAGED_CRYPTOGRAPHY_VERSION || result.version !== descriptor.version || result.inventory.some((d: { name: string }) => forbidden(d.name))) throw new Error("Headroom runtime identity/CPU dependency check failed");

@@ -1,7 +1,7 @@
 """Internal owned Headroom entry point: health attestation and orphan drain.
 
 Uses the pinned upstream CLI unchanged. No model/provider fallbacks or shared
-router control. Health uses challenge-response; all other HTTP routes require authenticated encryption.
+router control. Health uses challenge-response; all other HTTP routes require authenticated encryption; WebSocket upgrades are refused.
 """
 import base64
 import hmac
@@ -85,8 +85,15 @@ class OwnedHealth:
         self.key = bytes.fromhex(nonce)
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
+        kind = scope.get("type")
+        if kind == "lifespan":
             return await self.app(scope, receive, send)
+        if kind == "websocket":
+            await receive()  # the websocket.connect event
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        if kind != "http":
+            return
         headers = dict(scope.get("headers", []))
         if scope.get("path") == "/health" and headers.get(b"x-pi-workbench-encrypted") != b"1":
             challenge = headers.get(b"x-pi-workbench-challenge", b"")

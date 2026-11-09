@@ -82,7 +82,7 @@ test("Playwright missing tools exhaust bounded observation without backend retry
 });
 test("Playwright headless refusal and RPC confirmation cancellation preserve active session", async t => {
   const f = await fixture(t); await f.command("on"); await f.command("off"); assert.equal(f.managers[0].offCalls, 0); assert.equal(f.questions(), 0);
-  f.ctx.hasUI = true; f.ctx.mode = "rpc"; await f.command("off --confirm-delete"); assert.equal(f.questions(), 1); assert.equal(f.managers[0].offCalls, 0); assert.match(f.statuses.at(-1).text, /✓ Playwright/);
+  f.ctx.hasUI = true; f.ctx.mode = "rpc"; await f.command("off"); assert.equal(f.questions(), 1); assert.equal(f.managers[0].offCalls, 0); assert.match(f.statuses.at(-1).text, /✓ Playwright/);
 });
 test("Playwright confirmed RPC off removes guidance and reports off", async t => {
   const f = await fixture(t, { confirm: true }); await f.command("on"); f.ctx.hasUI = true; f.ctx.mode = "rpc";

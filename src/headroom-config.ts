@@ -1,11 +1,12 @@
 import type { CompressRequestConfig } from "headroom-ai";
 import { readFileSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { dirname, isAbsolute } from "node:path";
 import { DEFAULT_HEADROOM_PORT, parseHeadroomPort } from "./config.js";
+import { assertNoSymlink, ensurePrivateDirectory } from "./managed-lifecycle.js";
 import { WORKBENCH_PATHS } from "./paths.js";
 
-export type HeadroomCompressionConfig = Omit<CompressRequestConfig, "sessionId">;
+export type HeadroomCompressionConfig = Omit<CompressRequestConfig, "sessionId" | "mode"> & { mode?: "lossy_inline" | "lossless_then_lossy" };
 
 /** Tuning for the extension-managed proxy process, mapped to Headroom's own environment variables. */
 export interface HeadroomProxyConfig {
@@ -154,8 +155,8 @@ function parseCompressionConfig(value: unknown): HeadroomCompressionConfig {
 
   const compression: HeadroomCompressionConfig = {};
   if (source.mode !== undefined) {
-    if (source.mode !== "ccr" && source.mode !== "lossy_inline" && source.mode !== "lossless_then_lossy") {
-      throw configError("compression.mode must be ccr, lossy_inline, or lossless_then_lossy.");
+    if (source.mode !== "lossy_inline" && source.mode !== "lossless_then_lossy") {
+      throw configError("compression.mode must be lossy_inline or lossless_then_lossy (ccr is not supported: Workbench cannot retrieve CCR content).");
     }
     compression.mode = source.mode;
   }
@@ -220,9 +221,10 @@ export function parseHeadroomConfig(value: unknown): HeadroomConfig {
 
 /** Create extension-owned config once. Existing user settings are never overwritten. */
 export async function ensureHeadroomConfigFile(configPath = WORKBENCH_PATHS.headroomConfig): Promise<boolean> {
-  await mkdir(dirname(configPath), { recursive: true });
+  await ensurePrivateDirectory(dirname(configPath));
+  await assertNoSymlink(configPath);
   try {
-    await writeFile(configPath, `${JSON.stringify(DEFAULT_HEADROOM_CONFIG, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    await writeFile(configPath, `${JSON.stringify(DEFAULT_HEADROOM_CONFIG, null, 2)}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
     return true;
   } catch (error: unknown) {
     if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") return false;

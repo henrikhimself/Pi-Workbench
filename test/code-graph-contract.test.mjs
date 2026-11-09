@@ -47,7 +47,7 @@ for (const [label, config, error] of [
 
 test("CBM child environment binds owned namespace and workspace, ignores inherited overrides", () => {
   const source = { PATH: "/bin", HOME: "/home/example", CBM_RUNTIME_DIR: "/external", CBM_CACHE_DIR: "/wrong", CBM_ALLOWED_ROOT: "/", CBM_DOWNLOAD_URL: "https://bad" };
-  const env = createCbmEnvironment({ projectDirectory: "/owned/cache", runtimeDirectory: "/owned/runtime", workspacePath: "/workspace/project", shimPath: "/owned/shim/curl", source });
+  const env = createCbmEnvironment({ projectDirectory: "/owned/cache", runtimeDirectory: "/owned/runtime", homeDirectory: "/owned/home", workspacePath: "/workspace/project", shimPath: "/owned/shim/curl", source });
   assert.equal(env.CBM_RUNTIME_DIR, "/owned/runtime"); assert.equal(env.CBM_CACHE_DIR, "/owned/cache");
   assert.equal(env.CBM_ALLOWED_ROOT, "/workspace/project"); assert.equal(env.CBM_DOWNLOAD_URL, undefined);
   assert.equal(source.CBM_RUNTIME_DIR, "/external");
@@ -64,9 +64,13 @@ test("project discovery follows pagination and ignores misleading first project"
   const rows = Array.from({ length: 60 }, (_, i) => ({ name: `other-${i}`, root_path: `/other/${i}` }));
   rows.push({ name: "exact-project", root_path: fx.project.projectPath });
   const manager = await seeded(fx, { projectRows: rows });
-  assert.equal(await manager.fetchIndexSummary(fx.project, join(fx.root, "cbm.cjs")), "exact-project");
+  assert.equal(await manager.indexedProjectName(fx.project, join(fx.root, "cbm.cjs")), "exact-project");
   const env = JSON.parse(manager.getMcpConfig(fx.project, { path: join(fx.root, "cbm.cjs"), version: "v0.12.1", resolvedUrl: "https://fixture.invalid/reviewed", sha256: "b".repeat(64) }).args[1]).env;
   assert.equal(env.CBM_RUNTIME_DIR, join(fx.paths.codeGraphIpc, createHash("sha256").update(fx.project.directory).digest("hex").slice(0, 16)));
+}));
+test("status index summary reports the ready project", () => fixture(async (fx) => {
+  const manager = await seeded(fx, { projectRows: [{ name: "exact-project", root_path: fx.project.projectPath }] });
+  assert.equal(await manager.fetchIndexSummary(fx.project, join(fx.root, "cbm.cjs")), "ready (exact-project)");
 }));
 for (const [label, rows] of [
   ["ambiguous workspace", (path) => [{ name: "a", root_path: path }, { name: "b", root_path: path }]],
@@ -75,7 +79,7 @@ for (const [label, rows] of [
   ["wrong workspace", () => [{ name: "other", root_path: "/other" }]],
 ]) test(`project discovery rejects ${label}`, () => fixture(async (fx) => {
   const manager = await seeded(fx, { projectRows: rows(fx.project.projectPath) });
-  assert.equal(await manager.fetchIndexSummary(fx.project, join(fx.root, "cbm.cjs")), null);
+  assert.equal(await manager.indexedProjectName(fx.project, join(fx.root, "cbm.cjs")), null);
 }));
 
 // ── M14: failures after installation report their real kind, not "upgrade pending" ──

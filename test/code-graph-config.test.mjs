@@ -267,7 +267,7 @@ test("status formatting covers every state kind without leaking internals", () =
     platform: "linux-arm64",
     manifestVersion: "v0.8.1",
   };
-  const kinds = ["off", "enabled", "corrupt", "binary_missing", "mcp_failed", "upgrade_pending", "locked"];
+  const kinds = ["off", "enabled", "corrupt", "upgrade_pending"];
   for (const kind of kinds) {
     const lines = formatCodeGraphStatus({ ...base, kind });
     assert.ok(lines[0].includes("Code Graph"));
@@ -278,7 +278,7 @@ test("status formatting covers every state kind without leaking internals", () =
     kind: "enabled",
     installedVersion: "v0.8.1",
     mcpRegistered: true,
-    indexSummary: "12 nodes, 40 edges",
+    indexSummary: "ready (p)",
     watcher: "git",
   });
   assert.ok(enabled.join("\n").includes("Git watcher enabled"));
@@ -305,4 +305,13 @@ test("status uses the shared layout, and a refused identity shows the shared ref
   const gone = formatCodeGraphStatus({ ...base, projectDirectory: join(tmpdir(), "no-such-code-graph-dir"), kind: "off" }).join("\n");
   assert.match(gone, /Data: {5}none/);
   assert.match(gone, /Version: {2}not installed/);
+});
+
+test("sameBackend compares version, URL and SHA-256", () => {
+  const identity = { codeGraphVersion: "v1", resolvedUrl: "https://example.invalid/a.tar.gz", sha256: "a".repeat(64) };
+  const binary = { version: "v1", resolvedUrl: identity.resolvedUrl, sha256: identity.sha256 };
+  assert.equal(config.sameBackend(identity, binary), true);
+  for (const changed of [{ version: "v2" }, { resolvedUrl: "https://example.invalid/b.tar.gz" }, { sha256: "b".repeat(64) }]) {
+    assert.equal(config.sameBackend(identity, { ...binary, ...changed }), false, JSON.stringify(changed));
+  }
 });

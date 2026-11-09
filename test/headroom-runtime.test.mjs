@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
-const { ManagedHeadroomRuntime } = await jiti.import("../src/headroom-runtime.ts");
+const { ManagedHeadroomRuntime, defaultRuntimeRunner } = await jiti.import("../src/headroom-runtime.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 const { createConsumerLease, publishJson } = await jiti.import("../src/managed-lifecycle.ts");
 async function fixture(fn) {
@@ -33,7 +33,7 @@ async function fixture(fn) {
     return "Python 3.13 fixture|Linux AMD64";
   };
   const make = options => new ManagedHeadroomRuntime({ paths, run, systemPython: async () => "system-python", ...options });
-  try { await fn({ home, paths, calls, state, messages, make }); }
+  try { await fn({ home, paths, calls, state, messages, make, run }); }
   finally { await rm(home, { recursive: true, force: true }); }
 }
 
@@ -258,3 +258,37 @@ test("LB-01 L11: an error from the slot cleanup does not replace the install err
     assert.equal((await readdir(parent)).length, 1, "the cleanup really failed, leaving the slot");
   } finally { await chmod(parent, 0o700); }
 }));
+
+test("H-7: a module re-import (Pi /reload) does not repeat the Python check", () => fixture(async (fx) => {
+  await fx.make().ensure(() => {});
+  await fx.make().ensure(() => {});
+  const checks = () => fx.calls.filter(c => c.args[1]?.includes("distributions")).length;
+  const before = checks();
+  assert.ok(before >= 1);
+  const R = await createJiti(import.meta.url, { moduleCache: false }).import("../src/headroom-runtime.ts");
+  assert.notEqual(R.ManagedHeadroomRuntime, ManagedHeadroomRuntime);
+  assert.ok(await new R.ManagedHeadroomRuntime({ paths: fx.paths, run: fx.run, systemPython: async () => "system-python" }).ensure(() => {}));
+  assert.equal(checks(), before);
+}));
+
+const stubborn = `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);`;
+const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+test("X-3a: the default runner SIGKILLs a child that ignores SIGTERM", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wb-runner-")); const pidFile = join(dir, "pid");
+  let pid = 0;
+  try {
+    const outcome = await Promise.race([
+      defaultRuntimeRunner(process.execPath, ["-e", stubborn, pidFile], { env: process.env, timeoutMs: 300 }).then(() => "resolved", () => "rejected"),
+      new Promise(resolve => setTimeout(() => resolve("hung"), 8000)),
+    ]);
+    pid = Number(await readFile(pidFile, "utf8"));
+    assert.equal(outcome, "rejected"); assert.equal(alive(pid), false);
+  } finally { if (pid && alive(pid)) process.kill(pid, "SIGKILL"); await rm(dir, { recursive: true, force: true }); }
+});
+test("X-3a: failures keep the stderr tail", async () => {
+  await assert.rejects(
+    defaultRuntimeRunner(process.execPath, ["-e", "process.stderr.write('x'.repeat(3000) + 'pip said no'); process.exit(2)"], { env: process.env, timeoutMs: 5000 }),
+    error => error.message.endsWith("pip said no") && error.message.length <= 2000);
+  await assert.rejects(defaultRuntimeRunner(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { env: process.env, timeoutMs: 5000, signal: AbortSignal.abort() }));
+  assert.equal(await defaultRuntimeRunner(process.execPath, ["-e", "process.stdout.write('ok')"], { env: process.env, timeoutMs: 5000 }), "ok");
+});

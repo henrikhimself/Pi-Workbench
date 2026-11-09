@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const v = await jiti.import("../src/playwright-vision.ts");
+const { visionToken } = await import("./helpers/vision-token.mjs");
 const target = { provider: "llama.cpp", model: "Qwen3-VL-4B-q4" };
 const KEY = "sk-secret-test-key-123";
 const png = Buffer.from("fake-png-bytes").toString("base64");
@@ -20,6 +21,13 @@ function fixture(overrides = {}) {
 }
 const reasonOf = result => result.ok ? "ok" : result.reason;
 
+test("require-loaded accepts string and object statuses", async () => {
+  for (const [status, expected] of [["unloaded", "not loaded"], [{}, "not loaded"], [null, "not loaded"], ["loaded", "ok"], [{ value: "loaded" }, "ok"]]) {
+    const f = fixture({ fetch: async () => new Response(JSON.stringify({ data: [{ id: target.model, status }] }), { status: 200 }) });
+    assert.equal(reasonOf(await v.describeImage(f.request, f.deps)), expected, JSON.stringify(status));
+    assert.equal(f.calls.complete.length, expected === "ok" ? 1 : 0, JSON.stringify(status));
+  }
+});
 test("success wraps the description and sends one bounded image request with fixed prompts", async () => {
   const f = fixture(), result = await v.describeImage(f.request, f.deps);
   assert.equal(result.ok, true); assert.match(result.text, /Approve button/); assert.equal(result.model, "llama.cpp/Qwen3-VL-4B-q4");
@@ -149,4 +157,13 @@ test("static: Workbench source never reads another tool's credential or model st
     const text = await readFile(new URL(`../src/${name}`, import.meta.url), "utf8");
     assert.doesNotMatch(text, /auth\.json|models-store\.json/, name);
   }
+});
+
+test("live vision token avoids look-alike and doubled characters", () => {
+  for (let i = 0; i < 2000; i++) {
+    const token = visionToken();
+    assert.match(token, /^WBV-[ACEFHKMNPRTWXY3479]{6}$/); assert.doesNotMatch(token, /(.)\1/);
+  }
+  const picks = [0, 0, 1, 1, 2, 3, 3, 4, 5]; let index = 0;
+  assert.equal(visionToken(6, () => picks[index++]), "WBV-ACEFHK");
 });

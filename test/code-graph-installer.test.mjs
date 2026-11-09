@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { gzipSync } from "node:zlib";
 import { Readable } from "node:stream";
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { createJiti } from "jiti";
 
 const jiti = createJiti(import.meta.url);
@@ -401,26 +401,42 @@ test("install lock: times out while a live process holds it", async () => {
   await cleanup();
 });
 
+test("findGnuTar ignores relative PATH entries", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "cg-tar-path-"));
+  try {
+    await writeFile(join(dir, "tar"), "#!/bin/sh\n"); await chmod(join(dir, "tar"), 0o755);
+    const seen = [];
+    const runner = async (command) => { seen.push(command); return { code: 0, stdout: "tar (GNU tar) 1.35\n", stderr: "" }; };
+    await assert.rejects(findGnuTar(runner, relative(process.cwd(), dir)), /GNU tar is required/);
+    assert.deepEqual(seen, []);
+    assert.equal(await findGnuTar(runner, dir), join(dir, "tar"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 // ─── Installed records ────────────────────────────────────────────────
 
 test("readInstalledRecord validates shape and version match", async () => {
-  const { root, paths, cleanup } = await makeTempRoot();
-  const recordPath = join(paths.codeGraphBin, "v0.8.1", "linux-arm64", "asset.json");
-  await mkdir(join(paths.codeGraphBin, "v0.8.1", "linux-arm64"), { recursive: true });
+  const { paths, cleanup } = await makeTempRoot();
+  const directory = join(paths.codeGraphBin, "v0.8.1", "linux-arm64");
+  const recordPath = join(directory, "asset.json");
+  await mkdir(directory, { recursive: true });
+  const read = () => readInstalledRecord(paths.codeGraphBin, "v0.8.1", "linux-arm64");
+  const valid = { schemaVersion: 1, version: "v0.8.1", resolvedUrl: "u", sha256: "s", binarySha256: "a".repeat(64), installedAt: "2026-01-01T00:00:00.000Z" };
+  await writeFile(recordPath, JSON.stringify(valid));
+  assert.deepEqual(await read(), valid);
+  // A legacy record (no schemaVersion), malformed JSON and a missing file all mean "not installed".
   await writeFile(recordPath, JSON.stringify({ version: "v0.8.1", resolvedUrl: "u", sha256: "s" }));
-  assert.deepEqual(await readInstalledRecord(paths.codeGraphBin, "v0.8.1", "linux-arm64"), {
-    version: "v0.8.1",
-    resolvedUrl: "u",
-    sha256: "s",
-  });
-  // Version mismatch between record and directory is rejected.
-  await writeFile(recordPath, JSON.stringify({ version: "v0.9.9", resolvedUrl: "u", sha256: "s" }));
-  assert.equal(await readInstalledRecord(paths.codeGraphBin, "v0.8.1", "linux-arm64"), null);
-  // Malformed record is rejected.
-  await writeFile(recordPath, JSON.stringify({ version: "v0.8.1" }));
-  assert.equal(await readInstalledRecord(paths.codeGraphBin, "v0.8.1", "linux-arm64"), null);
-  // Missing record.
+  assert.equal(await read(), null);
+  await writeFile(recordPath, "{not json");
+  assert.equal(await read(), null);
   assert.equal(await readInstalledRecord(paths.codeGraphBin, "v9.9.9", "linux-arm64"), null);
+  // Another schemaVersion, or a version-1 record of the wrong shape, is refused.
+  await writeFile(recordPath, JSON.stringify({ ...valid, schemaVersion: 2 }));
+  await assert.rejects(read(), /does not read|not readable/);
+  await writeFile(recordPath, JSON.stringify({ ...valid, extra: true }));
+  await assert.rejects(read(), /does not read|not readable/);
+  await writeFile(recordPath, JSON.stringify({ ...valid, version: "v0.9.9" }));
+  await assert.rejects(read(), /does not read|not readable/);
   await cleanup();
 });
 
@@ -440,6 +456,8 @@ test("ensureInstalled installs a fresh, verified binary and cleans staging", asy
   assert.equal(record.version, "v0.8.1");
   assert.equal(record.sha256, sha);
   assert.equal(record.resolvedUrl, LINUX_ARM64_URL.replace("v0.x.y", "v0.8.1"));
+  assert.equal(record.schemaVersion, 1);
+  assert.equal((await stat(join(fixture.paths.codeGraphBin, "v0.8.1", "linux-arm64", "asset.json"))).mode & 0o077, 0, "the record is owner-only");
   // Staging and archives are cleaned.
   const downloads = await readdir(fixture.paths.codeGraphDownloads);
   assert.deepEqual(downloads, []);
@@ -572,6 +590,36 @@ test("ensureInstalled reinstalls when the installed binary fails verification", 
   assert.equal(result.reused, false);
   assert.equal(await readFile(result.path, "utf8"), "ELF-A");
   assert.equal(fixture.downloads.length, 2);
+  await fixture.cleanup();
+});
+
+async function installThenRewriteRecord(rewrite) {
+  const archiveBytes = tarGzip([{ name: "codebase-memory-mcp", data: "ELF-A" }]);
+  const sha = (await import("node:crypto")).createHash("sha256").update(archiveBytes).digest("hex");
+  const fixture = await makeFixtureInstall({ archiveBytes, reportsVersion: "0.8.1" });
+  await fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(sha) });
+  const recordPath = join(fixture.paths.codeGraphBin, "v0.8.1", "linux-arm64", "asset.json");
+  const record = JSON.parse(await readFile(recordPath, "utf8"));
+  await writeFile(recordPath, JSON.stringify(rewrite(record)));
+  const quarantines = async () => (await readdir(join(fixture.paths.codeGraphBin, "v0.8.1"))).filter((name) => name.includes(".quarantine-"));
+  return { fixture, sha, recordPath, quarantines };
+}
+
+test("ensureInstalled reinstalls over a legacy record without schemaVersion", async () => {
+  const { fixture, sha, recordPath, quarantines } = await installThenRewriteRecord(({ version, resolvedUrl, sha256, binarySha256 }) => ({ version, resolvedUrl, sha256, binarySha256 }));
+  const result = await fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(sha) });
+  assert.equal(result.reused, false);
+  assert.equal(fixture.downloads.length, 2);
+  assert.equal((await quarantines()).length, 1);
+  assert.equal(JSON.parse(await readFile(recordPath, "utf8")).schemaVersion, 1);
+  await fixture.cleanup();
+});
+
+test("ensureInstalled refuses a record with another schemaVersion and touches nothing", async () => {
+  const { fixture, sha, quarantines } = await installThenRewriteRecord((record) => ({ ...record, schemaVersion: 2 }));
+  await assert.rejects(fixture.installer.ensureInstalled(() => {}, { asset: fixtureAsset(sha) }), /does not read/);
+  assert.equal(fixture.downloads.length, 1);
+  assert.deepEqual(await quarantines(), []);
   await fixture.cleanup();
 });
 

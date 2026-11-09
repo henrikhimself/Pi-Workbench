@@ -161,6 +161,11 @@ function listIndexDbs(directory: string): string[] {
 const IDENTITY_KEYS = ["schemaVersion", "layout", "kind", "codeGraphVersion", "resolvedUrl", "sha256"];
 
 /** The identity this release would write for an installed backend. */
+/** True when a state identity names exactly this backend (version, resolved URL and SHA-256). */
+export function sameBackend(identity: CodeGraphStoreIdentity, binary: { version: string; resolvedUrl: string; sha256: string }): boolean {
+  return binary.version === identity.codeGraphVersion && binary.resolvedUrl === identity.resolvedUrl && binary.sha256 === identity.sha256;
+}
+
 export function codeGraphIdentity(asset: { version: string; resolvedUrl: string; sha256: string }): CodeGraphStoreIdentity {
   return { schemaVersion: 1, layout: 1, kind: "code-graph", codeGraphVersion: asset.version, resolvedUrl: asset.resolvedUrl, sha256: asset.sha256 };
 }
@@ -243,10 +248,7 @@ export type CodeGraphStateKind =
   | "off"
   | "enabled"
   | "corrupt"
-  | "binary_missing"
-  | "mcp_failed"
-  | "upgrade_pending"
-  | "locked";
+  | "upgrade_pending";
 
 export interface CodeGraphStatusReport {
   kind: CodeGraphStateKind;
@@ -272,10 +274,7 @@ export function formatCodeGraphStatus(report: CodeGraphStatusReport): string[] {
     off: "off",
     enabled: "on",
     corrupt: "off (corrupt data)",
-    binary_missing: "off (binary missing)",
-    mcp_failed: "off (MCP failed)",
     upgrade_pending: "refused (data written by another version)",
-    locked: "off (project locked)",
   };
   // A refused project shows the shared refusal text as its problem; every other kind shows the last error.
   const refused = report.kind === "upgrade_pending";

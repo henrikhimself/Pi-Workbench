@@ -5,4 +5,3 @@ export const TOOL_NAMES = {
   codeGraph: "Code Graph",
   playwright: "Playwright",
 } as const;
-export type ToolName = (typeof TOOL_NAMES)[keyof typeof TOOL_NAMES];

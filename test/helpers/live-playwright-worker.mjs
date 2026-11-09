@@ -12,7 +12,7 @@ const { createAgentSessionRuntime, createAgentSessionServices, createAgentSessio
 const root = process.env.WB_PLAYWRIGHT_LIVE_ROOT, agentDir = process.env.PI_CODING_AGENT_DIR, modelId = process.env.WB_PLAYWRIGHT_MODEL;
 assert.ok(modelId);
 const extension = fileURLToPath(new URL("../../src/index.ts", import.meta.url)), runtimes = [], checks = [], notices = [], nested = [];
-const report = { model: `llama.cpp/${modelId}`, checks, imagesCapturedInPi: 0, unverified: ["Provider/model image input and visual interpretation: authorized fixture model is text-only", "Real CLI TUI and RPC wire transport (SDK RPC-context dialogs only)"] };
+const report = { model: `llama.cpp/${modelId}`, checks, imagesCapturedInPi: 0, unverified: ["Image input to the agent and its visual interpretation: not tested; needs an image-capable agent model (the live gates use a text-only one)", "Real CLI TUI and RPC wire transport (SDK RPC-context dialogs only)"] };
 let confirm = false, questions = 0;
 const jiti = createJiti(import.meta.url, { fsCache: false });
 const { WORKBENCH_PATHS } = await jiti.import("../../src/paths.ts");

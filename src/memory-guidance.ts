@@ -4,32 +4,31 @@ export const MEMORY_GUIDANCE = `Headroom Memory provides project-scoped durable 
 
 Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present.
 
-Save only when user explicitly asks to remember a fact or directly confirms it in this turn. Save atomic, accurate, project-relevant facts. Never save secrets, credentials, tokens, private keys, personal data, learner data, sensitive business data, raw transcripts, speculation, or transient task state.`;
+Save only when user explicitly asks to remember a fact or directly confirms it in this turn. Save atomic, accurate, project-relevant facts. Never save secrets, credentials, tokens, private keys, personal data, sensitive business data, raw transcripts, speculation, or transient task state.`;
 
-export const STUDY_MEMORY_GUIDANCE = `Headroom Memory search is available for project-scoped durable context. Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present. Tool availability, not Study Mode, determines whether Memory can be saved.`;
+export const SEARCH_ONLY_MEMORY_GUIDANCE = `Headroom Memory search is available for project-scoped durable context. Search only when prior project decisions, conventions, preferences, incidents, or unresolved history may materially help and are absent from current context. Do not search for routine work whose needed context is already present. Saving Memory is not available in this session.`;
 
-export type MemoryGuidanceMode = "normal" | "study" | "off";
+export type MemoryGuidanceMode = "normal" | "search-only" | "off";
 
 export function applyMemoryGuidance(
   sections: Record<string, string>,
   mode: MemoryGuidanceMode,
 ): void {
-  const guidance = mode === "normal" ? MEMORY_GUIDANCE : mode === "study" ? STUDY_MEMORY_GUIDANCE : undefined;
+  const guidance = mode === "normal" ? MEMORY_GUIDANCE : mode === "search-only" ? SEARCH_ONLY_MEMORY_GUIDANCE : undefined;
   if (guidance) sections[MEMORY_PROMPT_SECTION] = guidance;
   else delete sections[MEMORY_PROMPT_SECTION];
 }
 
 export function resolveMemoryGuidanceMode(options: {
   memoryRegistered: boolean;
-  studyEnabled: boolean;
   activeToolNames: readonly string[];
 }): MemoryGuidanceMode {
   if (!options.memoryRegistered) return "off";
 
-  const activeTools = new Set(options.activeToolNames.map(name => name.replace("mcp__headroom-memory__", "mcp__headroom_memory__")));
+  const activeTools = new Set(options.activeToolNames);
   const searchAvailable = activeTools.has("mcp__headroom_memory__memory_search");
   if (!searchAvailable) return "off";
 
   if (activeTools.has("mcp__headroom_memory__memory_save")) return "normal";
-  return options.studyEnabled ? "study" : "off";
+  return "search-only";
 }

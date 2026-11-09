@@ -5,10 +5,11 @@ import { join } from "node:path";
 import { readFile } from "node:fs/promises";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
-const { requireSchemaVersion } = await jiti.import("./schema-version.ts");
-const { acquireManagedLock, createConsumerLease, assertWithin, assertNoSymlink, processBirth, publishJson } = await jiti.import("./managed-lifecycle.ts");
+const { requireSchemaVersion } = /** @type {typeof import("./schema-version.js")} */ (await jiti.import("./schema-version.ts"));
+const { acquireManagedLock, createConsumerLease, assertWithin, assertNoSymlink, processBirth, publishJson } = /** @type {typeof import("./managed-lifecycle.js")} */ (await jiti.import("./managed-lifecycle.ts"));
 /** The exact environment of the real server. Pi merges its whole environment into the launcher's
  * own, so the child must never inherit process.env: only what the extension decided gets through. */
+/** @param {unknown} env */
 function validEnvironment(env) {
   return !!env && typeof env === "object" && !Array.isArray(env) &&
     Object.entries(env).every(([key, value]) => key.length > 0 && !/[=\0]/.test(key) && typeof value === "string" && !value.includes("\0"));
@@ -16,11 +17,18 @@ function validEnvironment(env) {
 const spec = JSON.parse(process.argv[2] ?? "null");
 requireSchemaVersion(spec, "Owned MCP specification");
 if (typeof spec.command !== "string" ||
-    !Array.isArray(spec.args) || !spec.args.every(x => typeof x === "string") || !validEnvironment(spec.env)) throw new Error("Invalid owned MCP specification");
+    !Array.isArray(spec.args) || !spec.args.every(/** @param {unknown} x */ x => typeof x === "string") || !validEnvironment(spec.env)) throw new Error("Invalid owned MCP specification");
 assertWithin(spec.installRoot, spec.command); await assertNoSymlink(spec.command);
 assertWithin(spec.resource, spec.markerPath); await assertNoSymlink(spec.resource); await assertNoSymlink(spec.markerPath);
-let child, lease, runtimeLease, runtimeRelease, childClosed;
-let closing = false, requested = false, termination, escalation;
+/** @typedef {import("node:child_process").ChildProcessByStdio<import("node:stream").Writable, import("node:stream").Readable, import("node:stream").Readable>} OwnedChild */
+/** @type {OwnedChild | undefined} */ let child;
+/** @type {import("./managed-lifecycle.js").ConsumerLease | undefined} */ let lease;
+/** @type {import("./managed-lifecycle.js").ConsumerLease | undefined} */ let runtimeLease;
+/** @type {(() => Promise<void>) | undefined} */ let runtimeRelease;
+/** @type {Promise<void> | undefined} */ let childClosed;
+let closing = false, requested = false;
+/** @type {NodeJS.Timeout | undefined} */ let termination;
+/** @type {NodeJS.Timeout | undefined} */ let escalation;
 const startup = new AbortController();
 function close() {
   requested = true; startup.abort();
@@ -29,12 +37,19 @@ function close() {
   // Pi closes stdin, signals the process group after 0.5 s and SIGKILLs it at about 2.5 s.
   // These timers must fire inside that window or they never run; a SIGKILL of this launcher
   // skips lease release, which is why the lease and lock cleanup stays short and ordered.
-  termination = setTimeout(() => child.kill("SIGTERM"), 1000);
-  escalation = setTimeout(() => child.kill("SIGKILL"), 2000);
+  const owned = child;
+  termination = setTimeout(() => owned.kill("SIGTERM"), 1000);
+  escalation = setTimeout(() => owned.kill("SIGKILL"), 2000);
 }
 process.stdin.pause(); process.stdin.on("end", close);
 process.on("SIGTERM", close); process.on("SIGINT", close);
 process.stdout.on("error", close); process.stderr.on("error", close);
+/**
+ * @param {string} root
+ * @param {import("./managed-lifecycle.js").ConsumerLease} currentLease
+ * @param {string} resource
+ * @param {{ pid: number, start: string, host: string }} owner
+ */
 async function reassign(root, currentLease, resource, owner) {
   await publishJson(root, join(root, currentLease.token + ".json"), { schemaVersion: 1, token: currentLease.token, resource, ...owner });
 }
@@ -59,9 +74,10 @@ try {
     child = spawn(spec.command, spec.args, { cwd: spec.cwd, env: spec.env, stdio: ["pipe", "pipe", "pipe"] });
     child.stdin.on("error", () => {});
     child.on("error", error => { console.error(`Owned MCP child failed: ${error.message}`); });
-    childClosed = new Promise(resolve => child.once("close", code => {
+    const spawned = child;
+    childClosed = new Promise(/** @param {(value?: void) => void} resolve */ resolve => spawned.once("close", /** @param {number | null} code */ code => {
       clearTimeout(termination); clearTimeout(escalation);
-      process.stdin.unpipe(child.stdin); process.stdin.pause(); process.exitCode = code ?? 1; resolve();
+      process.stdin.unpipe(spawned.stdin); process.stdin.pause(); process.exitCode = code ?? 1; resolve();
     }));
     if (!child.pid) throw new Error("Owned MCP child did not spawn");
     const start = await processBirth(child.pid);
@@ -77,4 +93,4 @@ try {
   if (childClosed) await childClosed;
   await lease?.release(); await runtimeLease?.release(); throw error;
 } finally { await runtimeRelease?.(); }
-await childClosed.finally(async () => { await lease.release(); await runtimeLease?.release(); });
+await /** @type {Promise<void>} */ (childClosed).finally(async () => { await lease?.release(); await runtimeLease?.release(); });

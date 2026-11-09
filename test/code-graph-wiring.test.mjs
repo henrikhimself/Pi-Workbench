@@ -18,6 +18,7 @@ import { fakeCbmSource } from "./helpers/fake-cbm.mjs";
 
 const jiti = createJiti(import.meta.url);
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
+const { createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
 const {
   CODE_GRAPH_ASSETS,
   resolveAssetUrl,
@@ -42,7 +43,7 @@ function makePi() {
         return () => {};
       },
       appendEntry: () => {},
-      getActiveTools: () => mcp.has("codebase-memory") ? ["search_graph", "trace_path", "get_architecture", "get_code_snippet", "get_file_outline", "query_graph"].map(name => "mcp__codebase-memory__" + name) : [],
+      getActiveTools: () => mcp.has("codebase-memory") ? ["search_graph", "trace_path", "get_architecture", "get_code_snippet", "get_file_outline", "query_graph"].map(name => "mcp__codebase_memory__" + name) : [],
       registerCommand: (name, definition) => {
         commands.set(name, definition);
       },
@@ -141,8 +142,8 @@ async function seedVerifiedInstall(fixture) {
   await chmod(fakeBinary, 0o755);
   await writeFile(
     join(binDir, "asset.json"),
-    JSON.stringify({ version: asset.version, resolvedUrl, sha256: asset.sha256,
-      binarySha256: createHash("sha256").update(await readFile(fakeBinary)).digest("hex") }) + "\n",
+    JSON.stringify({ schemaVersion: 1, version: asset.version, resolvedUrl, sha256: asset.sha256,
+      binarySha256: createHash("sha256").update(await readFile(fakeBinary)).digest("hex"), installedAt: new Date().toISOString() }) + "\n",
   );
   return fakeBinary;
 }
@@ -475,6 +476,43 @@ test("command: off stops the owned MCP registration before deletion", async () =
   }
 });
 
+test("command: off refuses while another session uses the workspace and keeps this session registered", async () => {
+  const fixture = await makeFixture();
+  const { project } = await seedEnabledWorkspace(fixture);
+  try {
+    const start = makeCtx(fixture.workspace);
+    await fixture.piState.handlers.get("session_start")({}, start.ctx);
+    await waitFor(() => fixture.piState.mcp.has("codebase-memory"), 15000, "MCP registration");
+    await waitFor(() => start.statuses.some(([key, value]) => key === "code-graph" && /✓ Code Graph/.test(value)), 15000, "Code Graph status");
+    const foreign = await createConsumerLease(join(fixture.paths.codeGraphRuntime, "consumers", project.identifier), "session:" + project.directory);
+    const refused = makeCtx(fixture.workspace, { confirmAnswer: true });
+    await command(fixture).handler("off --confirm-delete", refused.ctx);
+    assert.ok(refused.notifications.some(({ level, message }) => level === "error" && /close the other sessions/i.test(message) && !/deferred/.test(message)), JSON.stringify(refused.notifications));
+    assert.deepEqual(fixture.piState.unregistered, []);
+    assert.equal(existsSync(project.optInPath), true);
+    await foreign.release();
+    const done = makeCtx(fixture.workspace, { confirmAnswer: true });
+    await command(fixture).handler("off --confirm-delete", done.ctx);
+    assert.ok(done.notifications.some(({ message }) => /Code Graph data deleted for this project/.test(message)), JSON.stringify(done.notifications));
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
+test("command: reindex without a registered server keeps the footer off", async () => {
+  const fixture = await makeFixture();
+  await seedEnabledWorkspace(fixture);
+  try {
+    const { ctx, notifications, statuses } = makeCtx(fixture.workspace);
+    await command(fixture).handler("reindex", ctx);
+    assert.ok(notifications.some(({ level, message }) => level === "info" && /reindexed/.test(message)), JSON.stringify(notifications));
+    assert.equal(statuses.some(([key, value]) => key === "code-graph" && /✓ Code Graph/.test(value)), false);
+    assert.equal(fixture.piState.mcp.size, 0);
+  } finally {
+    await fixture.cleanup();
+  }
+});
+
 // ─── Session lifecycle ────────────────────────────────────────────────
 
 test("session start with no state stays off without error noise", async () => {
@@ -564,9 +602,13 @@ test("prompt guidance follows actual active direct MCP tools, not pending regist
     fx.piState.pi.getActiveTools = () => [];
     let event = { systemPromptOptions: { sections: {} } }; fx.piState.handlers.get("before_agent_start")(event);
     assert.equal(event.systemPromptOptions.sections["pi-workbench-code-graph"], undefined);
-    fx.piState.pi.getActiveTools = () => ["mcp__codebase-memory__search_graph"];
+    fx.piState.pi.getActiveTools = () => ["mcp__codebase_memory__search_graph"];
     event = { systemPromptOptions: { sections: {} } }; fx.piState.handlers.get("before_agent_start")(event);
     assert.ok(event.systemPromptOptions.sections["pi-workbench-code-graph"].includes("tools (search_graph)"));
     assert.doesNotMatch(event.systemPromptOptions.sections["pi-workbench-code-graph"], /get_file_outline|trace_path/);
+    // Pi never produces hyphenated tool names, so they are not recognised.
+    fx.piState.pi.getActiveTools = () => ["mcp__codebase-memory__search_graph"];
+    event = { systemPromptOptions: { sections: {} } }; fx.piState.handlers.get("before_agent_start")(event);
+    assert.equal(event.systemPromptOptions.sections["pi-workbench-code-graph"], undefined);
   } finally { await fx.cleanup(); }
 });

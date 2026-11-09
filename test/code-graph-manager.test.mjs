@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -13,18 +13,21 @@ const {
   CodeGraphManager,
   CODE_GRAPH_EXPECTED_TOOLS,
   CODE_GRAPH_GUIDANCE_MESSAGE,
+  codeGraphGuidance,
   CODE_GRAPH_MCP_SERVER_NAME,
   createCbmEnvironment,
   curlShimDirectory,
   defaultMcpHandshakeRunner,
   ensureCurlDenyShim,
 } = await jiti.import("../src/code-graph-manager.ts");
+const { defaultProcessRunner } = await jiti.import("../src/exec-escalating.ts");
 const {
   codeGraphIdentity,
   resolveCodeGraphProject,
   validateCodeGraphState,
 } = await jiti.import("../src/code-graph-config.ts");
 const { writeOptIn } = await jiti.import("../src/project-opt-in.ts");
+const { activeConsumers, createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
 const { detectCodeGraphPlatform, installedBinaryPath } = await jiti.import("../src/code-graph-installer.ts");
 const { resolveWorkbenchPaths } = await jiti.import("../src/paths.ts");
 
@@ -104,7 +107,7 @@ test("ensureCurlDenyShim creates an executable deny script atomically", async ()
   const dir = await mkdtemp(join(tmpdir(), "cg-shim-"));
   try {
     const shimPath = join(dir, "deny-shims", "curl");
-    await ensureCurlDenyShim(shimPath);
+    await ensureCurlDenyShim(shimPath, dir);
     const info = await stat(shimPath);
     assert.equal(info.mode & 0o777, 0o755);
     const content = await readFile(shimPath, "utf8");
@@ -112,7 +115,7 @@ test("ensureCurlDenyShim creates an executable deny script atomically", async ()
     const siblings = await readdir(join(dir, "deny-shims"));
     assert.deepEqual(siblings, ["curl"]);
     // Idempotent re-run.
-    await ensureCurlDenyShim(shimPath);
+    await ensureCurlDenyShim(shimPath, dir);
     assert.deepEqual(await readdir(join(dir, "deny-shims")), ["curl"]);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -124,7 +127,7 @@ test("same-process concurrent deny shim publication cannot collide at identical 
   try {
     Date.now = () => 1770000000000;
     const shimPath = join(dir, "curl");
-    const results = await Promise.allSettled(Array.from({ length: 32 }, () => ensureCurlDenyShim(shimPath)));
+    const results = await Promise.allSettled(Array.from({ length: 32 }, () => ensureCurlDenyShim(shimPath, dir)));
     assert.ok(results.every(result => result.status === "fulfilled"), JSON.stringify(results.filter(result => result.status === "rejected").map(result => String(result.reason))));
     assert.equal(await readFile(shimPath, "utf8"), "#!/bin/sh\nexit 3\n");
     assert.deepEqual(await readdir(dir), ["curl"]);
@@ -142,12 +145,12 @@ test("createCbmEnvironment builds the minimal owned-child environment", () => {
     CBM_DOWNLOAD_URL: "https://evil.example/cbm",
     CBM_OTHER: "must-not-escape",
   };
-  const env = createCbmEnvironment({ projectDirectory: "/proj", shimPath: "/root/deny-shims/curl", source });
+  const env = createCbmEnvironment({ projectDirectory: "/proj", shimPath: "/root/deny-shims/curl", runtimeDirectory: "/runtime", homeDirectory: "/owned/home", workspacePath: "/workspace", source });
   assert.equal(env.CBM_CACHE_DIR, "/proj");
+  assert.equal(env.HOME, "/owned/home");
   assert.equal(env.CBM_LOG_LEVEL, "error");
   assert.ok(env.PATH.startsWith("/root/deny-shims:/"));
   assert.equal(env.PATH, "/root/deny-shims:/usr/bin:/bin");
-  assert.equal(env.HOME, "/home/user");
   assert.equal("CBM_DOWNLOAD_URL" in env, false);
   assert.equal("CBM_OTHER" in env, false);
   // Pure: the source object is never mutated.
@@ -371,8 +374,8 @@ test("bare curl inside the owned CBM environment resolves to the deny shim", asy
   const root = await mkdtemp(join(tmpdir(), "cg-mgr-shim-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const shimPath = join(root, "deny-shims", "curl");
-  await ensureCurlDenyShim(shimPath);
-  const env = createCbmEnvironment({ projectDirectory: join(root, "proj"), shimPath });
+  await ensureCurlDenyShim(shimPath, root);
+  const env = createCbmEnvironment({ projectDirectory: join(root, "proj"), shimPath, runtimeDirectory: join(root, "runtime"), homeDirectory: join(root, "home"), workspacePath: root });
   // Resolve + run exactly what a CBM child would run when it invokes a bare
   // `curl` for its upstream update check: PATH puts the shim directory
   // first, so the deny shim must win over the host curl. The shim exits 3
@@ -409,23 +412,23 @@ test("activate: workspace path with spaces and shell metacharacters stays a JSON
           if (args[0] === "config" && args[1] === "set") {
             await mkdir(options.env.CBM_CACHE_DIR, { recursive: true });
             await writeFile(join(options.env.CBM_CACHE_DIR, "_config.db"), "auto_index = true\n");
-            return { exitCode: 0, stdout: "auto_index = true\n", stderr: "" };
+            return { code: 0, stdout: "auto_index = true\n", stderr: "" };
           }
           if (args[0] === "config" && args[1] === "get") {
-            return { exitCode: 0, stdout: "true\n", stderr: "" };
+            return { code: 0, stdout: "true\n", stderr: "" };
           }
           if (args[0] === "cli" && args[2] === "index_repository") {
             assert.equal(args[3], "--repo-path");
             assert.equal(args[4], project.projectPath);
             const projectName = project.projectPath.replace(/^\//, "").replace(/\//g, "-");
             await writeFile(join(options.env.CBM_CACHE_DIR, `${projectName}.db`), "INDEX");
-            return { exitCode: 0, stdout: JSON.stringify({ project: projectName, status: "indexed" }) + "\n", stderr: "" };
+            return { code: 0, stdout: JSON.stringify({ project: projectName, status: "indexed" }) + "\n", stderr: "" };
           }
           if (args[0] === "cli" && args[2] === "list_projects") {
-            return { exitCode: 0, stdout: JSON.stringify({ projects: ["p"] }) + "\n", stderr: "" };
+            return { code: 0, stdout: JSON.stringify({ projects: ["p"] }) + "\n", stderr: "" };
           }
           if (args[0] === "cli" && args[2] === "index_status") {
-            return { exitCode: 0, stdout: JSON.stringify({ project: "p", status: "ready" }) + "\n", stderr: "" };
+            return { code: 0, stdout: JSON.stringify({ project: "p", status: "ready" }) + "\n", stderr: "" };
           }
           throw new Error(`unexpected args: ${JSON.stringify(args)}`);
         },
@@ -468,6 +471,74 @@ test("activate: index failure rolls back staging, publishes no state, registers 
     // Staging directory rolled back; no opt-in.json survived.
     await assert.rejects(stat(fx.project.directory));
     await assert.rejects(stat(fx.project.optInPath));
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("activate: a same-name MCP conflict is refused before install or indexing", async () => {
+  const fx = await makeFixture();
+  try {
+    const calls = [];
+    const manager = new CodeGraphManager(
+      fx.makeDeps({
+        ensureInstalled: async () => { calls.push("install"); throw new Error("must not install"); },
+        conflict: async () => 'same-name MCP declaration "codebase_memory" in /x/mcp.json',
+        registerMcp: () => assert.fail("must not register"),
+      }),
+    );
+    const result = await manager.activate(fx.project);
+    assert.equal(result.ok, false);
+    assert.equal(result.kind, "mcp_failed");
+    assert.match(result.detail, /mcp\.json/);
+    assert.deepEqual(calls, []);
+    assert.equal(existsSync(fx.project.directory), false);
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("activate: a failure after the opt-in is written removes the opt-in and keeps pre-existing data", async () => {
+  const fx = await makeFixture();
+  try {
+    const { binary } = await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    await rm(fx.project.optInPath);
+    const manager = new CodeGraphManager(
+      fx.makeDeps({
+        ensureInstalled: async () => installResult(binary),
+        runMcpHandshake: okHandshake(),
+        registerMcp: () => { throw new Error("injected registration failure"); },
+      }),
+    );
+    const result = await manager.activate(fx.project);
+    assert.equal(result.ok, false);
+    assert.equal(existsSync(fx.project.optInPath), false);
+    assert.ok(await readFile(fx.project.identityPath, "utf8"));
+    assert.ok(await readFile(join(fx.project.directory, "_config.db"), "utf8"));
+    assert.ok(await readFile(join(fx.project.directory, "derived-project.db"), "utf8"));
+    assert.equal((await validateCodeGraphState(fx.project)).problem, "missing");
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("activate: a conflict that appears during indexing stops before the opt-in", async () => {
+  const fx = await makeFixture();
+  try {
+    const binary = await writeFakeCbm(fx.fakeDir, "cbm-late-conflict.cjs", {});
+    let conflictCalls = 0;
+    const manager = new CodeGraphManager(
+      fx.makeDeps({
+        ensureInstalled: async () => installResult(binary),
+        runMcpHandshake: okHandshake(),
+        conflict: async () => (++conflictCalls === 1 ? null : 'same-name MCP declaration "codebase_memory" in /x/mcp.json'),
+        registerMcp: () => assert.fail("must not register"),
+      }),
+    );
+    const result = await manager.activate(fx.project);
+    assert.equal(result.ok, false);
+    assert.equal(conflictCalls, 2);
+    assert.equal(existsSync(fx.project.directory), false);
   } finally {
     await fx.cleanup();
   }
@@ -559,7 +630,7 @@ test("restore: absent state stays off without installer or CBM work", async () =
         },
         runProcess: async () => {
           calls.push("cbm");
-          return { exitCode: 0, stdout: "", stderr: "" };
+          return { code: 0, stdout: "", stderr: "" };
         },
         runMcpHandshake: okHandshake(),
       }),
@@ -636,7 +707,9 @@ test("restore: packaged update failure never executes prior binary", { skip: det
     await import("node:fs/promises").then((fsp) => fsp.chmod(join(priorDir, "codebase-memory-mcp"), 0o755));
     await writeFile(
       join(priorDir, "asset.json"),
-      JSON.stringify({ version: identity.codeGraphVersion, resolvedUrl: FAKE_URL, sha256: FAKE_SHA, installedAt: new Date().toISOString() }),
+      JSON.stringify({ schemaVersion: 1, version: identity.codeGraphVersion, resolvedUrl: FAKE_URL, sha256: FAKE_SHA,
+        binarySha256: (await import("node:crypto")).createHash("sha256").update(await readFile(join(priorDir, "codebase-memory-mcp"))).digest("hex"),
+        installedAt: new Date().toISOString() }),
       "utf8",
     );
 
@@ -779,7 +852,7 @@ test("buildStatusReport reflects state without side effects", async () => {
       platform: "linux-arm64",
       manifestVersion: "v0.12.1",
       installedVersion: "v0.12.1",
-      indexSummary: "project p: ready, 3 nodes, 2 edges",
+      indexSummary: "ready (p)",
     });
     assert.equal(enabled.kind, "enabled");
     assert.equal(enabled.mcpRegistered, false);
@@ -979,4 +1052,98 @@ test("L15: loading the extension does not load node:sqlite (no ExperimentalWarni
     (error, stdout, stderr) => resolve({ error, stdout, stderr })));
   assert.match(result.stdout, /LOADED/, result.stderr);
   assert.doesNotMatch(result.stderr, /SQLite is an experimental feature|ExperimentalWarning/);
+});
+
+test("reindex leaves the project lock free: a concurrent restore succeeds and deletion waits for the reindex", async () => {
+  const fx = await makeFixture();
+  try {
+    const { binary } = await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    let reached = false, openGate;
+    const gate = new Promise(resolve => { openGate = resolve; });
+    const real = defaultProcessRunner();
+    const a = new CodeGraphManager(fx.makeDeps({
+      ensureInstalled: async () => installResult(binary),
+      runProcess: async (command, args, options) => {
+        if (args.includes("index_repository")) { reached = true; await gate; }
+        return real(command, args, options);
+      },
+    }));
+    const b = new CodeGraphManager(fx.makeDeps({
+      ensureInstalled: async () => installResult(binary),
+      registerMcp: () => {}, runMcpHandshake: okHandshake(),
+    }));
+    const reindexing = a.reindex(fx.project);
+    try {
+      for (let i = 0; i < 200 && !reached; i++) await new Promise(resolve => setTimeout(resolve, 25));
+      assert.equal(reached, true, "reindex reached the index step");
+      const restored = await Promise.race([b.restore(fx.project), new Promise((_, reject) => setTimeout(() => reject(new Error("restore blocked by reindex")), 5000))]);
+      assert.equal(restored.ok, true);
+      assert.ok((await activeConsumers(join(fx.paths.codeGraphRuntime, "consumers", fx.project.identifier))).length >= 1);
+      await assert.rejects(b.removeProject(fx.project, { timeoutMs: 0 }), /Active workspace consumers/);
+    } finally { openGate(); }
+    assert.equal((await reindexing).ok, true);
+    assert.deepEqual((await readdir(join(fx.paths.codeGraphRuntime, "coordination"))).filter(name => name.endsWith(".reindex.lock")), []);
+    await b.shutdown?.();
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("otherSessionCount ignores this session's own and launcher leases", async () => {
+  const fx = await makeFixture();
+  try {
+    await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    const binary = await writeFakeCbm(fx.fakeDir, "cbm-other-sessions.cjs", {});
+    const make = () => new CodeGraphManager(fx.makeDeps({ ensureInstalled: async () => installResult(binary), registerMcp: () => {} }));
+    const a = make();
+    assert.equal((await a.restore(fx.project)).ok, true);
+    assert.equal(await a.otherSessionCount(fx.project), 0);
+    const launcher = await createConsumerLease(join(fx.paths.codeGraphRuntime, "consumers", fx.project.identifier), fx.project.directory);
+    assert.equal(await a.otherSessionCount(fx.project), 0, "a launcher-style lease is not another session");
+    const b = make();
+    assert.equal((await b.restore(fx.project)).ok, true);
+    assert.equal(await a.otherSessionCount(fx.project), 1);
+    assert.equal(await b.otherSessionCount(fx.project), 1);
+    await b.shutdown();
+    assert.equal(await a.otherSessionCount(fx.project), 0);
+    await launcher.release();
+    await a.shutdown();
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("activate: a workspace this session already serves keeps the live server", async () => {
+  const fx = await makeFixture();
+  try {
+    await writeValidState(fx.project, fx.paths, fx.fakeDir);
+    const binary = await writeFakeCbm(fx.fakeDir, "cbm-activate-live.cjs", {});
+    let probes = 0;
+    const registered = [], unregistered = [];
+    const handshake = okHandshake();
+    const manager = new CodeGraphManager(fx.makeDeps({
+      ensureInstalled: async () => installResult(binary),
+      runMcpHandshake: async (...args) => { probes++; return handshake(...args); },
+      registerMcp: (name) => registered.push(name),
+      unregisterMcp: (name) => unregistered.push(name),
+    }));
+    assert.equal((await manager.restore(fx.project)).ok, true);
+    const result = await manager.activate(fx.project);
+    assert.equal(result.ok, true);
+    assert.equal(result.alreadyOn, true);
+    assert.equal(probes, 1, "only the restore probed");
+    assert.equal(registered.length, 1);
+    assert.equal(unregistered.length, 0);
+    assert.equal(manager.isMcpRegistered, true);
+    await manager.shutdown();
+  } finally {
+    await fx.cleanup();
+  }
+});
+
+test("codeGraphGuidance lists only the given tools", () => {
+  const text = codeGraphGuidance(["search_graph"]);
+  assert.ok(text.includes("tools (search_graph)"));
+  assert.match(text, /verify/i);
+  assert.doesNotMatch(text, /trace_path/);
 });

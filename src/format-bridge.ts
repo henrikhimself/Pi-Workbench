@@ -258,14 +258,12 @@ function alignUserMessage(comp: OpenAIMessage & { role: "system" | "user" }, ori
 
   if (orig.role === "user") {
     if (comp.role === "user" && isDeepStrictEqual(comp.content, convertUserMessage(orig).content)) return orig;
-    return {
-      ...orig,
-      // Headroom may return string content even when input had images. Keep the
-      // original image parts because they cannot safely be associated otherwise.
-      content: hasImageParts(orig.content)
-        ? replaceTextPreservingImages(orig.content, textFromContentParts(content))
-        : content,
-    };
+    if (!hasImageParts(orig.content)) return { ...orig, content };
+    // Headroom may return string content even when input had images. Keep the original image
+    // parts because they cannot safely be associated otherwise; when captions would lose their
+    // images, keep the whole message.
+    const merged = mergeCompressedParts(orig.content, content);
+    return merged ? { ...orig, content: merged } : orig;
   }
 
   // Role mismatch: build fresh
@@ -315,7 +313,7 @@ function alignAssistantMessage(comp: OpenAIMessage & { role: "assistant" }, orig
       const tc = compCallById.get(block.id);
       if (!tc) continue; // Headroom dropped this call
       seenCalls.add(block.id);
-      content.push({ ...block, arguments: safeJsonParse(tc.function.arguments) });
+      content.push({ ...block, arguments: parseArguments(tc.function.arguments) ?? block.arguments });
       continue;
     }
     content.push(block);
@@ -337,6 +335,8 @@ function alignAssistantMessage(comp: OpenAIMessage & { role: "assistant" }, orig
 function alignToolResultMessage(comp: OpenAIMessage & { role: "tool" }, orig: Message): Message {
   if (orig.role === "toolResult") {
     if (comp.content === convertToolResultMessage(orig).content) return orig;
+    // Several text parts around images cannot be told apart in one string: keep the message.
+    if (hasImageParts(orig.content) && orig.content.filter((part) => part.type === "text").length > 1) return orig;
     return {
       ...orig,
       // OpenAI tool messages only support string content, so retain original
@@ -482,6 +482,27 @@ function textFromContentParts(content: Array<TextContent | ImageContent>): strin
     .join("\n");
 }
 
+/**
+ * Fold compressed content into the original parts. The same part layout keeps every caption next to
+ * its image; a single text part (or none) takes all compressed text; anything else cannot be mapped
+ * back safely, so the caller keeps the original message. Images always come from the original.
+ */
+function mergeCompressedParts(
+  original: Array<TextContent | ImageContent>,
+  compressed: Array<TextContent | ImageContent>,
+): Array<TextContent | ImageContent> | null {
+  if (original.length === compressed.length && original.every((part, i) => part.type === compressed[i].type)) {
+    return original.map((part, i) => {
+      const next = compressed[i];
+      return part.type === "text" && next.type === "text" ? { ...part, text: next.text } : part;
+    });
+  }
+  if (original.filter((part) => part.type === "text").length <= 1) {
+    return replaceTextPreservingImages(original, textFromContentParts(compressed));
+  }
+  return null;
+}
+
 function replaceTextPreservingImages(
   original: Array<TextContent | ImageContent>,
   compressedText: string,
@@ -506,6 +527,16 @@ function replaceTextPreservingImages(
   }
 
   return result;
+}
+
+/** Tool-call arguments as a plain object, or null (invalid, truncated, `null` or an array) so the caller keeps the original. */
+function parseArguments(str: string): Record<string, any> | null {
+  try {
+    const value: unknown = JSON.parse(str);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, any> : null;
+  } catch {
+    return null;
+  }
 }
 
 function safeJsonParse(str: string): Record<string, any> {

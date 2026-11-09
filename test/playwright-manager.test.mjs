@@ -68,6 +68,13 @@ test("Playwright activation failure retains explicit intent and later restore re
   await assert.rejects(f.manager.on(), /Synthetic readiness failure/); assert.equal(await config.playwrightOptedIn(f.project), true);
   fail = false; await f.manager.restore(); assert.ok(f.registry()); await f.manager.shutdown();
 });
+test("Playwright restore never provisions; only on does", async t => {
+  const f = await fixture(t), seen = [];
+  f.deps.runtime.ensure = async (_progress, _signal, options) => { seen.push(options?.provision); return f.ready; };
+  await f.manager.on(); await f.manager.shutdown();
+  const next = new PlaywrightManager(f.workspace, f.deps); await next.restore(); await next.shutdown();
+  assert.deepEqual(seen, [true, false]);
+});
 test("Playwright configured-server conflict preserves intent and never provisions or overrides server", async t => {
   const f = await fixture(t, { conflict: async () => "same-name configured server" });
   await assert.rejects(f.manager.on(), /same-name configured server/);
