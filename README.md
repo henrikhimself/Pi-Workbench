@@ -23,7 +23,7 @@ pi remove git:github.com/henrikhimself/Pi-Workbench
 
 ## Where Workbench keeps its state
 
-Workbench keeps everything under `~/.pi/pi-workbench`, so every Pi proces on one machine shares the same store.
+Workbench keeps everything under `~/.pi/pi-workbench`, so every Pi process on one machine shares the same store.
 
 ## Headroom configuration
 
@@ -124,9 +124,9 @@ Headroom Memory gives Pi durable, project-scoped context. Pi can then search rel
 
 | Field | Meaning |
 |---|---|
-| `memory.root`  | Optional absolute or `~/` Memory base path for storing memory in a sqlite database. |
-| `memory.namespace` | Logical Memory namespace; default `project`. |
-| `memory.export` | Project-relative bundle directory for export/import memory as plain text files. Must remain inside the project. |
+| `root`  | Optional absolute or `~/` Memory base path for storing memory in a sqlite database. |
+| `namespace` | Logical Memory namespace; default `project`. |
+| `export` | Project-relative bundle directory for export/import memory as plain text files. Must remain inside the project. |
 
 #### Merging Memories
 
@@ -199,4 +199,4 @@ Displays the system prompt which models usually will refuse to do when asked. Ev
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Third-party component attribution: [NOTICE](NOTICE).
