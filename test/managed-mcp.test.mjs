@@ -101,8 +101,10 @@ test("launcher waits for the store lock without holding the shared install lock"
 test("launcher takes the store lock first, then the install lock, and releases both before running the server", () => fixture(async ({ spec, launch, installLock, storeLock }) => {
   const run = launch();
   assert.ok(await waitFor(() => exists(spec.args[0])), run.stderr);
-  assert.equal(await exists(installLock), false);
-  assert.equal(await exists(storeLock), false, "neither lock is held while the server runs");
+  // The launcher releases both locks right after spawning (once the child's lease owner is recorded),
+  // so the server can write its file first. Wait for release instead of sampling at that instant.
+  assert.ok(await waitFor(async () => !(await exists(installLock)) && !(await exists(storeLock))), "both locks are released while the server keeps running");
+  assert.equal(run.child.exitCode, null, "the server is still running after the locks are released");
   run.child.stdin.end(); await run.exited;
 }));
 
