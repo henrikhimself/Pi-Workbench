@@ -21,9 +21,7 @@ export interface DescribeDependencies {
   /** Test seam only; production uses the fixed 60 s from VISION_LIMITS. */
   timeoutMs?: number;
 }
-export type DescribeResult =
-  | { ok: true; text: string; model: string; elapsedMs: number; usage?: VisionUsage }
-  | { ok: false; reason: VisionFailureReason; message: string };
+export type DescribeResult = VisionTextResult;
 
 const fail = (reason: VisionFailureReason, message: string): DescribeResult => ({ ok: false, reason, message });
 /** A rendered page must not be able to forge the end marker or a second description header. */
@@ -61,8 +59,8 @@ async function requireLoaded(deps: DescribeDependencies, model: Parameters<Visio
   try { listing = await response.json(); } catch { return fail("unavailable", "Vision endpoint returned an unreadable model listing."); }
   const entry = Array.isArray(listing?.data) ? listing.data.find((item: any) => item?.id === model.id) : undefined;
   if (!entry) return fail("not loaded", "Vision model is not listed by the endpoint; Workbench never loads models.");
-  const status = entry.status?.value;
-  if (status !== undefined && status !== "loaded") return fail("not loaded", "Vision model is not loaded; Workbench never loads models.");
+  const raw = entry.status, status = typeof raw === "string" ? raw : raw?.value;
+  if (raw !== undefined && status !== "loaded") return fail("not loaded", "Vision model is not loaded; Workbench never loads models.");
   return null;
 }
 

@@ -11,7 +11,6 @@ export interface HeadroomStoreIdentity extends StoreIdentityBase {
   kind: "proxy" | "memory";
   model?: string;
   dimensions?: number;
-  namespace?: string;
   modelRevision?: string;
   modelSha256?: string;
   tokenizerSha256?: string;
@@ -52,6 +51,12 @@ export async function readStoreIdentity(directory: string): Promise<Record<strin
   return actual;
 }
 
+/** True when `actual` has exactly the keys and values of `expected`. */
+export function identityMatches(actual: Record<string, unknown>, expected: StoreIdentity): boolean {
+  return Object.keys(actual).length === Object.keys(expected).length &&
+    Object.entries(expected).every(([key, value]) => actual[key] === value);
+}
+
 /** A new, empty directory is marked with `expected`. An existing one must carry exactly the same
  * identity; anything else, including a non-empty directory without an identity file, is refused and
  * left unchanged. Nothing is converted and nothing is deleted. */
@@ -62,6 +67,5 @@ export async function prepareDataStore(directory: string, expected: StoreIdentit
   if (actual === null) {
     if ((await readdir(directory)).length !== 0) throw refusal;
     await publishJson(directory, join(directory, STORE_MARKER), expected);
-  } else if (Object.keys(actual).length !== Object.keys(expected).length ||
-      Object.entries(expected).some(([key, value]) => actual[key] !== value)) throw refusal;
+  } else if (!identityMatches(actual, expected)) throw refusal;
 }

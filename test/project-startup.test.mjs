@@ -96,6 +96,17 @@ test("compression commands persist project choice; restart restores it, other pr
   assert.ok(first.notices.some(item => item.message === "Headroom compression already off for this project"), "a second off has nothing to do");
 }));
 
+test("X-2b: unknown proxy arguments print usage and change nothing", async () => fixture(async ({ home, paths, make }) => {
+  const s = make(); await s.start(); await s.command("on");
+  for (const args of ["off now", "foo"]) {
+    const before = s.notices.length;
+    await s.command(args);
+    assert.deepEqual(s.notices.slice(before), [{ message: "Usage: /wb:headroom-proxy [on|off|status]", level: "error" }], args);
+  }
+  assert.equal(await compressionOptedIn(resolveCompressionProject(home, paths)), true);
+  assert.equal(s.calls.stop, 0);
+}));
+
 test("failed compression activation retains explicit opt-in for later startup retry", async () => fixture(async ({ home, paths, make }) => {
   const s = make(home, { ensureRunning: async () => false });
   await s.start(); await s.command("on");

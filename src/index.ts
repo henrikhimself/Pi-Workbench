@@ -31,11 +31,12 @@ import {
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import { MemoryManager, MEMORY_SERVER_NAME } from "./memory-manager.js";
 import { compressionOptedIn, resolveCompressionProject, setCompressionOptIn } from "./headroom-project.js";
-import { assertNoSymlink } from "./managed-lifecycle.js";
 import {
   CODE_GRAPH_GUIDANCE_MESSAGE,
+  CODE_GRAPH_GUIDANCE_TOOLS,
   CODE_GRAPH_MCP_SERVER_NAME,
   CodeGraphManager,
+  codeGraphGuidance,
 } from "./code-graph-manager.js";
 import { detectMcpConflict } from "./mcp-conflict.js";
 import { enabledMessage, formatStatus, offMessage } from "./command-messages.js";
@@ -50,6 +51,7 @@ import { getAsset } from "./code-graph-assets.js";
 import {
   formatCodeGraphStatus,
   resolveCodeGraphProject,
+  sameBackend,
   validateManagedProjectPath,
   validateCodeGraphState,
 } from "./code-graph-config.js";
@@ -106,6 +108,8 @@ export default function piWorkbenchExtension(
   let memoryRegistered = false;
   let memoryRegistrationDirectory: string | null = null;
   let memoryConflict: string | null = null;
+  /** Why Memory is down in this session, for `status`; cleared when it registers. */
+  let memoryProblem: string | null = null;
   let memoryRootWarningShown = false;
   let codeGraphManager: CodeGraphManager | null = null;
   let codeGraphActivationQuiet = false;
@@ -125,16 +129,16 @@ export default function piWorkbenchExtension(
   const headroomConfigPath = options?.headroomConfigPath ?? paths.headroomConfig;
   let headroomConfig: HeadroomConfig = { schemaVersion: 1 };
   let port = DEFAULT_HEADROOM_PORT;
-  let portConfigError: string | null = null;
+  let configError: string | null = null;
   try {
     headroomConfig = loadHeadroomConfigSync(headroomConfigPath);
     port = headroomConfig.port ?? DEFAULT_HEADROOM_PORT;
   } catch (error) {
-    portConfigError = error instanceof Error ? error.message : String(error);
+    configError = error instanceof Error ? error.message : String(error);
   }
   // The client always waits longer than the proxy's own (configurable) compression timeout.
   const requestTimeoutMs = headroomRequestTimeoutMs(headroomConfig.proxy);
-  const proxyManager = !portConfigError ? (options?.proxyManager ?? new ProxyManager({ port, runtime: headroomRuntime, tuning: headroomConfig.proxy, requestTimeoutMs })) : null;
+  const proxyManager = !configError ? (options?.proxyManager ?? new ProxyManager({ port, runtime: headroomRuntime, tuning: headroomConfig.proxy, requestTimeoutMs })) : null;
   const baseUrl = `http://127.0.0.1:${port}`;
   // Keep SDK fallback disabled so proxy failures reach the context handler,
   // which marks the proxy offline, attempts managed recovery, and fails open.
@@ -158,7 +162,7 @@ export default function piWorkbenchExtension(
     proxyRetryAt = null;
     if (!recovered) return;
     proxyWarningShown = false;
-    ctx.ui.setStatus("headroom-proxy", colorText(ctx, "success", "✓") + colorText(ctx, "dim", " Headroom"));
+    setProxyStatus(ctx, "ok");
   }
 
   function markProxyUnavailable(): void {
@@ -194,19 +198,16 @@ export default function piWorkbenchExtension(
         failures = 0;
         proxyAvailable = false;
         proxyRetryAt = null; // the restart below decides when compression is available again
-        ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "⏳ Headroom restarting..."));
+        setProxyStatus(ctx, "progress", "Headroom restarting...");
         const recovered = await proxyManager.tryRestart((msg) => {
-          if (generation === proxyWatchdogGeneration) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", `⏳ ${msg}`));
+          if (generation === proxyWatchdogGeneration) setProxyStatus(ctx, "progress", msg);
         });
         if (generation !== proxyWatchdogGeneration || !enabled) return;
         if (recovered) {
           markProxyAvailable(ctx);
         } else {
           markProxyUnavailable();
-          ctx.ui.setStatus(
-            "headroom-proxy",
-            colorText(ctx, "warning", "⚠") + colorText(ctx, "dim", " Headroom offline"),
-          );
+          setProxyStatus(ctx, "warning");
         }
       })().catch(() => {}).finally(() => { busy = false; });
     }, 30_000);
@@ -214,6 +215,16 @@ export default function piWorkbenchExtension(
 
   function colorText(ctx: ExtensionContext, color: "dim" | "warning" | "success" | "error", text: string): string {
     return ctx.ui.theme?.fg?.(color, text) ?? text;
+  }
+
+  /** The one place that builds the proxy footer status. */
+  function setProxyStatus(ctx: ExtensionContext, kind: "off" | "ok" | "warning" | "progress" | "plain", text = ""): void {
+    const value = kind === "ok" ? colorText(ctx, "success", "✓") + colorText(ctx, "dim", ` Headroom${text ? ` ${text}` : ""}`)
+      : kind === "warning" ? colorText(ctx, "warning", `⚠ ${text || "Headroom offline"}`)
+      : kind === "off" ? colorText(ctx, "dim", "○ Headroom off")
+      : kind === "progress" ? colorText(ctx, "dim", `⏳ ${text}`)
+      : colorText(ctx, "dim", text);
+    ctx.ui.setStatus("headroom-proxy", value);
   }
 
   function compressionStatus(): string {
@@ -224,7 +235,6 @@ export default function piWorkbenchExtension(
     const activeToolNames = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [];
     return resolveMemoryGuidanceMode({
       memoryRegistered,
-      studyEnabled,
       activeToolNames,
     });
   }
@@ -233,10 +243,8 @@ export default function piWorkbenchExtension(
     if (!codeGraphGuidanceActive || !codeGraphManager?.isMcpRegistered) return undefined;
     if (typeof pi.getActiveTools !== "function") return CODE_GRAPH_GUIDANCE_MESSAGE; // Injected minimal test API only.
     const active = new Set(pi.getActiveTools());
-    const known = ["search_graph", "trace_path", "get_architecture", "get_code_snippet", "get_file_outline", "query_graph"];
-    const available = known.filter(name => active.has(`mcp__codebase-memory__${name}`) || active.has(`mcp__codebase_memory__${name}`));
-    if (!available.length) return undefined;
-    return CODE_GRAPH_GUIDANCE_MESSAGE.replace("(" + known.join(", ") + ")", "(" + available.join(", ") + ")");
+    const available = CODE_GRAPH_GUIDANCE_TOOLS.filter(name => active.has(`mcp__codebase_memory__${name}`));
+    return available.length ? codeGraphGuidance(available) : undefined;
   }
 
   function setMemoryStatus(ctx: ExtensionContext, state: "starting" | "ready" | "offline" | "off"): void {
@@ -264,15 +272,20 @@ export default function piWorkbenchExtension(
     pi.appendEntry(STUDY_ENTRY_TYPE, { enabled: studyEnabled });
   }
 
-  /** Workbench's own prompt sections as they would be built now (study, memory, Code Graph, Playwright). */
-  function workbenchSections(ctx: ExtensionCommandContext, base: Record<string, string> | undefined): Record<string, string> {
-    const sections = { ...base };
+  /** The study, Memory and Code Graph sections; Playwright's differ per caller. */
+  function applyCoreSections(sections: Record<string, string>): void {
     if (studyEnabled) sections[STUDY_PROMPT_SECTION] = STUDY_GUIDANCE;
     else delete sections[STUDY_PROMPT_SECTION];
     applyMemoryGuidance(sections, memoryGuidanceMode());
     const graphGuidance = activeCodeGraphGuidance();
     if (graphGuidance) sections[CODE_GRAPH_PROMPT_SECTION] = graphGuidance;
     else delete sections[CODE_GRAPH_PROMPT_SECTION];
+  }
+
+  /** Workbench's own prompt sections as they would be built now (study, memory, Code Graph, Playwright). */
+  function workbenchSections(ctx: ExtensionCommandContext, base: Record<string, string> | undefined): Record<string, string> {
+    const sections = { ...base };
+    applyCoreSections(sections);
     const playwrightGuidance = playwright.guidance(ctx);
     if (playwrightGuidance) sections[PLAYWRIGHT_PROMPT_SECTION] = playwrightGuidance;
     else delete sections[PLAYWRIGHT_PROMPT_SECTION];
@@ -308,7 +321,11 @@ export default function piWorkbenchExtension(
   }
 
   function managerFor(ctx: ExtensionContext, passive = false): MemoryManager | null {
-    if (portConfigError) { setMemoryStatus(ctx, "off"); return null; }
+    if (configError) {
+      if (!passive) ctx.ui.notify(`Headroom Memory unavailable: ${configError}`, "error");
+      setMemoryStatus(ctx, "off");
+      return null;
+    }
     try {
       const manager = new MemoryManager({
         cwd: ctx.cwd ?? process.cwd(),
@@ -433,7 +450,6 @@ export default function piWorkbenchExtension(
       setMemoryStatus(ctx, "off");
       return false;
     }
-
     try {
       await manager.ensureRoot();
       if (!currentGeneration(generation)) return false;
@@ -442,10 +458,22 @@ export default function piWorkbenchExtension(
     } catch (error) {
       if (!currentGeneration(generation)) return false;
       const message = error instanceof Error ? error.message : String(error);
+      memoryProblem = message;
       setMemoryStatus(ctx, "offline");
       ctx.ui.notify(`Headroom Memory root unavailable: ${message}`, "warning");
       return false;
     }
+
+    // After the root check (an unsafe root is reported first) and before anything flashes in the status bar.
+    try {
+      const refusal = await manager.storeRefusal();
+      if (!currentGeneration(generation)) return false;
+      if (refusal) {
+        setMemoryStatus(ctx, "off");
+        ctx.ui.notify(refusal, "warning");
+        return false;
+      }
+    } catch { /* the steps below report an unreadable store */ }
 
     setMemoryStatus(ctx, "starting");
     const python = await manager.prepare((message) => {
@@ -453,13 +481,14 @@ export default function piWorkbenchExtension(
     });
     if (!currentGeneration(generation)) return false;
     if (!python) {
+      memoryProblem = "Managed runtime or ONNX preflight unavailable";
       setMemoryStatus(ctx, "offline");
       ctx.ui.notify("Headroom Memory unavailable; context compression remains available.", "warning");
       return false;
     }
 
     try {
-      if (createStore) await manager.createStore();
+      if (createStore && !manager.enabled) await manager.createStore();
       if (!currentGeneration(generation)) return false;
       // Pi gives mcp.json precedence and silently drops a same-name extension registration.
       memoryConflict = await detectMcpConflict(pi, {
@@ -468,18 +497,20 @@ export default function piWorkbenchExtension(
       });
       if (!currentGeneration(generation)) return false;
       if (memoryConflict) {
+        memoryProblem = `Not registered: ${memoryConflict}`;
         setMemoryStatus(ctx, "offline");
         ctx.ui.notify(`Headroom Memory not registered: ${memoryConflict}. The existing server was left untouched.`, "warning");
         return false;
       }
       pi.registerMcpServer(MEMORY_SERVER_NAME, manager.getMcpConfig(python));
-      memoryRegistered = true; memoryRegistrationDirectory = manager.store.directory;
+      memoryRegistered = true; memoryRegistrationDirectory = manager.store.directory; memoryProblem = null;
       setMemoryStatus(ctx, "ready");
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setMemoryStatus(ctx, "offline");
       if (!currentGeneration(generation)) return false;
+      memoryProblem = message;
       ctx.ui.notify(`Headroom Memory unavailable: ${message}`, "warning");
       return false;
     }
@@ -515,7 +546,6 @@ export default function piWorkbenchExtension(
 
   /** Only opted-in features create configuration or prepare managed storage. */
   async function ensureConfiguration(ctx: ExtensionContext): Promise<void> {
-    await assertNoSymlink(headroomConfigPath);
     if (await ensureHeadroomConfigFile(headroomConfigPath)) ctx.ui.notify("Created managed Headroom configuration.", "info");
   }
 
@@ -524,10 +554,10 @@ export default function piWorkbenchExtension(
 
   async function activateCompression(ctx: ExtensionContext, generation: number, epoch: number): Promise<boolean> {
     if (!compressionCurrent(generation, epoch)) return false;
-    if (portConfigError || !proxyManager) {
+    if (configError || !proxyManager) {
       enabled = false; proxyAvailable = false;
-      ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
-      ctx.ui.notify(`Headroom compression disabled: ${portConfigError}`, "error");
+      setProxyStatus(ctx, "warning");
+      ctx.ui.notify(`Headroom compression disabled: ${configError}`, "error");
       return false;
     }
     await ensureConfiguration(ctx);
@@ -536,12 +566,12 @@ export default function piWorkbenchExtension(
     await proxyManager.resume();
     if (!compressionCurrent(generation, epoch) || !enabled) return false;
     const ok = await proxyManager.ensureRunning(message => {
-      if (compressionCurrent(generation, epoch) && enabled) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", message));
+      if (compressionCurrent(generation, epoch) && enabled) setProxyStatus(ctx, "plain", message);
     });
     if (!compressionCurrent(generation, epoch) || !enabled) return false;
     proxyAvailable = ok;
     if (ok) startProxyWatchdog(ctx);
-    ctx.ui.setStatus("headroom-proxy", colorText(ctx, ok ? "success" : "warning", ok ? "✓ Headroom" : "⚠ Headroom offline"));
+    setProxyStatus(ctx, ok ? "ok" : "warning");
     return ok;
   }
 
@@ -564,21 +594,21 @@ export default function piWorkbenchExtension(
     memoryRegistered = false; memoryRegistrationDirectory = null;
     restoreStudyState(ctx); codeGraphGuidanceActive = false;
     proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false; proxyRetryAt = null;
-    memoryRootWarningShown = false; memoryConflict = null; sessionTotals = { calls: 0, tokensSaved: 0 };
-    ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
+    memoryRootWarningShown = false; memoryConflict = null; memoryProblem = null; sessionTotals = { calls: 0, tokensSaved: 0 };
+    setProxyStatus(ctx, "off");
     codeGraphStatusOff(ctx);
     const proxyJob = async () => {
       try {
         const optedIn = await compressionOptedIn(resolveCompressionProject(ctx.cwd ?? process.cwd(), paths));
         if (!compressionCurrent(generation, epoch) || !optedIn) return;
         const ok = await activateCompression(ctx, generation, epoch);
-        if (!ok && compressionCurrent(generation, epoch) && !portConfigError) {
+        if (!ok && compressionCurrent(generation, epoch) && !configError) {
           ctx.ui.notify("Managed Headroom unavailable; original context remains usable. Project opt-in retained; retry /wb:headroom-proxy on.", "warning");
         }
       } catch (error) {
         if (!compressionCurrent(generation, epoch)) return;
         enabled = false; proxyAvailable = false;
-        ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
+        setProxyStatus(ctx, "warning");
         ctx.ui.notify(`Project Headroom compression unavailable: ${String(error)}`, "warning");
       }
     };
@@ -611,18 +641,11 @@ export default function piWorkbenchExtension(
   // ─── Prompt guidance before every agent run ────────────────────────
 
   pi.on("before_agent_start", async (event, ctx) => {
-    if (studyEnabled) {
-      event.systemPromptOptions.sections[STUDY_PROMPT_SECTION] = STUDY_GUIDANCE;
-    } else {
-      delete event.systemPromptOptions.sections[STUDY_PROMPT_SECTION];
-    }
-    applyMemoryGuidance(event.systemPromptOptions.sections, memoryGuidanceMode());
-    const graphGuidance = activeCodeGraphGuidance();
-    if (graphGuidance) event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION] = graphGuidance;
-    else delete event.systemPromptOptions.sections[CODE_GRAPH_PROMPT_SECTION];
+    applyCoreSections(event.systemPromptOptions.sections);
     await playwright.beforeAgent(event.systemPromptOptions, ctx);
   });
 
+  pi.on("model_select", event => playwright.modelSelect(event));
   pi.on("tool_call", (event, ctx) => playwright.toolCall(event, ctx));
   pi.on("tool_result", (event, ctx) => playwright.toolResult(event, ctx));
 
@@ -632,12 +655,6 @@ export default function piWorkbenchExtension(
     const generation = lifecycleGeneration, epoch = compressionGeneration;
     const active = () => compressionCurrent(generation, epoch) && enabled;
     if (!active()) return;
-    if (portConfigError) {
-      proxyAvailable = false;
-      ctx.ui.notify(`Headroom proxy unavailable: ${portConfigError}`, "warning");
-      ctx.ui.setStatus("headroom-proxy", colorText(ctx, "warning", "⚠ Headroom offline"));
-      return;
-    }
     if (proxyAvailable === false) {
       // Offline after a failure: skip compression during the back-off, then probe once per
       // call. Activation and watchdog restarts leave no retry time, so they are never probed.
@@ -673,11 +690,7 @@ export default function piWorkbenchExtension(
       compressionWarningShown = false;
 
       if (!result.compressed || result.tokensSaved <= 0) {
-        ctx.ui.setStatus(
-          "headroom-proxy",
-          colorText(ctx, "success", "✓") +
-            colorText(ctx, "dim", ` Headroom (${openaiMessages.length} msgs, no compression needed)`),
-        );
+        setProxyStatus(ctx, "ok", `(${openaiMessages.length} msgs, no compression needed)`);
         return;
       }
 
@@ -686,11 +699,7 @@ export default function piWorkbenchExtension(
       const conversion = openAIToPiWithOutcome(result.messages, piMessages);
       if (!conversion.applied) {
         const detail = conversion.reason === "unmatched-after-count-change" ? "message count changed" : "images retained";
-        ctx.ui.setStatus(
-          "headroom-proxy",
-          colorText(ctx, "warning", "⚠") +
-            colorText(ctx, "dim", ` Headroom safety fallback (${detail})`),
-        );
+        setProxyStatus(ctx, "warning", `Headroom safety fallback (${detail})`);
         return;
       }
       // When the message count is unchanged, hand back the original agent messages
@@ -709,10 +718,7 @@ export default function piWorkbenchExtension(
       // Update status bar
       const saved = result.tokensSaved.toLocaleString();
       const pct = Math.round((1 - result.compressionRatio) * 100);
-      ctx.ui.setStatus(
-        "headroom-proxy",
-        colorText(ctx, "success", "✓") + colorText(ctx, "dim", ` Headroom -${pct}% (${saved} saved)`),
-      );
+      setProxyStatus(ctx, "ok", `-${pct}% (${saved} saved)`);
 
       return { messages: compressedPiMessages as any };
     } catch (error) {
@@ -730,10 +736,7 @@ export default function piWorkbenchExtension(
           compressionWarningShown = true;
           ctx.ui.notify(`Headroom compression request failed: ${errMsg}`, "warning");
         }
-        ctx.ui.setStatus(
-          "headroom-proxy",
-          colorText(ctx, "warning", "⚠") + colorText(ctx, "dim", " Headroom request failed"),
-        );
+        setProxyStatus(ctx, "warning", "Headroom request failed");
         return;
       }
 
@@ -742,10 +745,7 @@ export default function piWorkbenchExtension(
         proxyWarningShown = true;
         const diagnostic = "Headroom proxy unavailable";
         ctx.ui.notify(`${diagnostic}: ${errMsg}`, "warning");
-        ctx.ui.setStatus(
-          "headroom-proxy",
-          colorText(ctx, "warning", "⚠") + colorText(ctx, "dim", " Headroom offline"),
-        );
+        setProxyStatus(ctx, "warning");
       }
 
       // Mid-session crash recovery (one attempt per session). Only when the proxy process is
@@ -754,7 +754,7 @@ export default function piWorkbenchExtension(
         restartAttempted = true;
         proxyRetryAt = null; // the restart decides when compression is available again
         const recovered = await proxyManager.tryRestart((msg) => {
-          if (active()) ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", `⏳ ${msg}`));
+          if (active()) setProxyStatus(ctx, "progress", msg);
         });
         if (!active()) return;
         if (recovered) {
@@ -762,6 +762,7 @@ export default function piWorkbenchExtension(
           // Don't retry compression this call — next context event will use it
         } else {
           markProxyUnavailable();
+          setProxyStatus(ctx, "warning");
         }
       }
 
@@ -775,14 +776,19 @@ export default function piWorkbenchExtension(
     getArgumentCompletions: completions(PROXY_COMPLETIONS),
     description: "Persist project compression on/off, or show status. Usage: /wb:headroom-proxy [on|off|status]",
     handler: async (args, ctx) => {
-      const action = args.trim().toLowerCase();
+      const tokens = args.trim().toLowerCase().split(/\s+/).filter(Boolean);
+      const action = tokens[0] ?? "status";
+      if (tokens.length > 1 || !["on", "off", "status"].includes(action)) {
+        ctx.ui.notify("Usage: /wb:headroom-proxy [on|off|status]", "error");
+        return;
+      }
       if (action === "off" || action === "on") {
         const generation = lifecycleGeneration, epoch = ++compressionGeneration;
         const signal = sessionAbort.signal;
         enabled = false; proxyAvailable = false; stopProxyWatchdog();
         if (action === "off") {
           if (proxyManager) background(proxyManager.stop(), ctx, "Managed proxy stop");
-          ctx.ui.setStatus("headroom-proxy", colorText(ctx, "dim", "○ Headroom off"));
+          setProxyStatus(ctx, "off");
         }
         // Serialize commands in this session; the managed lock coordinates peers.
         let wasOn = true;
@@ -803,12 +809,13 @@ export default function piWorkbenchExtension(
           proxyWarningShown = false; compressionWarningShown = false; restartAttempted = false; proxyRetryAt = null;
           const ok = await activateCompression(ctx, generation, epoch);
           if (!compressionCurrent(generation, epoch)) return;
+          if (!ok && configError) return; // activateCompression already reported it
           ctx.ui.notify(ok ? enabledMessage(TOOL_NAMES.compression) : "Managed Headroom unavailable; project opt-in retained and context remains usable",
             ok ? "info" : "warning");
         } catch (error) {
           if (!compressionCurrent(generation, epoch)) return;
           enabled = false; proxyAvailable = false;
-          ctx.ui.setStatus("headroom-proxy", colorText(ctx, action === "off" ? "dim" : "warning", action === "off" ? "○ Headroom off" : "⚠ Headroom offline"));
+          setProxyStatus(ctx, action === "off" ? "off" : "warning");
           ctx.ui.notify(action === "off"
             ? `Compression disabled for this session, but project opt-out could not be saved; startup may retry. ${String(error)}`
             : `Project compression opt-in/activation failed; context remains usable. ${String(error)}`, "warning");
@@ -819,7 +826,7 @@ export default function piWorkbenchExtension(
       let projectState: string;
       try { projectState = await compressionOptedIn(project) ? "on" : "off"; }
       catch (error) { projectState = `refused (${error instanceof Error ? error.message : String(error)})`; }
-      const healthy = (await checkActiveProxy()).ok;
+      const healthy = !!proxyManager && await proxyManager.healthCheck().catch(() => false);
       const expected = await getHeadroomAiVersion();
       const installed = await getManagedHeadroomVersion(headroomRuntime).catch(() => null);
       ctx.ui.notify(formatStatus(TOOL_NAMES.compression, {
@@ -829,7 +836,7 @@ export default function piWorkbenchExtension(
         data: existsSync(project.directory) ? project.directory : null,
         version: { installed, ...(expected ? { expected } : {}) },
         link: healthy ? "running" : "not running",
-        ...(portConfigError ? { problem: portConfigError } : {}),
+        ...(configError ? { problem: configError } : {}),
         details: [
           `This session: ${enabled ? "on" : "off"}. On/off persists for this project; active peers keep their current session state.`,
           "Mode: extension-managed only", `URL: ${baseUrl}`,
@@ -908,7 +915,11 @@ export default function piWorkbenchExtension(
       }
       const manager = managerFor(ctx);
       if (!manager) return;
-      if (manager.recoveryPending) { ctx.ui.notify("Incomplete Memory publication; preserve backup/staging and follow manual recovery instructions.", "error"); return; }
+      // Status stays available so the problem can be shown; every other action refuses.
+      if (action !== "status" && manager.recoveryPending) {
+        ctx.ui.notify(`Incomplete Memory publication; preserve backup/staging and follow "Recover an interrupted import or merge" in the README. Recovery record: ${manager.pendingPath}`, "error");
+        return;
+      }
 
       if (action === "on") {
         if (tokens.length > 1) {
@@ -996,25 +1007,37 @@ export default function piWorkbenchExtension(
           return;
         }
 
+        const generation = lifecycleGeneration;
+        const wasRegistered = memoryRegistered && memoryRegistrationDirectory === manager.store.directory;
         try {
           if (memoryRegistered) pi.unregisterMcpServer(MEMORY_SERVER_NAME);
-          memoryRegistered = false;
+          memoryRegistered = false; memoryRegistrationDirectory = null;
           await manager.deleteStore();
           setMemoryStatus(ctx, "off");
           ctx.ui.notify(offMessage(TOOL_NAMES.memory, "deleted"), "info");
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           ctx.ui.notify(`Could not delete Headroom Memory: ${message}`, "error");
+          // The store is still there: put Memory back as it was, unless another generation took over.
+          if (wasRegistered && manager.enabled && currentGeneration(generation)) await startMemory(ctx, false);
+          else if (currentGeneration(generation)) setMemoryStatus(ctx, manager.enabled ? "offline" : "off");
         }
         return;
       }
 
+      const pending = manager.recoveryPending;
+      const refusal = pending ? null : await manager.storeRefusal().catch(() => null);
+      const expected = await getHeadroomAiVersion();
+      const installed = await getManagedHeadroomVersion(headroomRuntime).catch(() => null);
+      const problem = pending ? `Incomplete publication; recovery record ${manager.pendingPath}` : refusal ?? memoryProblem;
       ctx.ui.notify(formatStatus(TOOL_NAMES.memory, {
-        state: manager.enabled ? "on" : "off",
+        state: pending ? "refused (incomplete publication)" : refusal ? "refused (other version)" : manager.enabled ? "on" : "off",
+        ...(problem ? { problem } : {}),
         projectPath: manager.store.projectPath,
         identifier: manager.store.identifier,
         data: existsSync(manager.store.directory) ? manager.store.directory : null,
-        link: memoryRegistered ? "registered" : memoryConflict ? `not registered (${memoryConflict})` : manager.enabled ? "not connected" : "not registered",
+        version: { installed, ...(expected ? { expected } : {}) },
+        link: memoryRegistered && memoryRegistrationDirectory === manager.store.directory ? "registered" : "not registered",
         details: ["Backend: ONNX Runtime CPU"],
       }).join("\n"), "info");
     },
@@ -1047,8 +1070,9 @@ export default function piWorkbenchExtension(
           const result = await manager.reindex(project);
           codeGraphGuidanceActive = result.ok && manager.isMcpRegistered;
           if (result.ok) {
-            codeGraphStatusOn(ctx);
-            ctx.ui.notify(`Code graph reindexed for ${project.identifier}`, "info");
+            // A reindex never registers the server: show the tools as available only when it is registered.
+            if (manager.isMcpRegistered) codeGraphStatusOn(ctx);
+            ctx.ui.notify(`Code graph reindexed for ${project.identifier}${manager.isMcpRegistered ? "" : " (server not running in this session; run /wb:code-graph on)"}`, "info");
           } else {
             ctx.ui.notify(`Code graph reindex failed (${result.kind}): ${result.detail}`, "error");
           }
@@ -1155,6 +1179,14 @@ export default function piWorkbenchExtension(
           ctx.ui.notify("Code graph deletion cancelled", "info");
           return;
         }
+        // Advisory pre-check: do not take this session's server away while another session uses the
+        // workspace. removeProject still re-checks every lease.
+        try {
+          if (await manager.otherSessionCount(project) > 0) throw new Error("in use");
+        } catch {
+          ctx.ui.notify("Code Graph is in use by another Pi session for this workspace. Close the other sessions first, then run /wb:code-graph off again. Nothing was changed.", "error");
+          return;
+        }
         // Off transaction order: (1) stop owned MCP first, (2) delete the
         // matching project directory only, (3) verify the deletion.
         try {
@@ -1206,9 +1238,7 @@ export default function piWorkbenchExtension(
       const statusPathValidation = validateManagedProjectPath(project, paths);
       const stateValidation = statusPathValidation.ok ? await validateCodeGraphState(project) : null;
       const binaryCompatible = stateValidation?.ok && installed
-        ? installed.version === stateValidation.identity.codeGraphVersion
-          && installed.resolvedUrl === stateValidation.identity.resolvedUrl
-          && installed.sha256 === stateValidation.identity.sha256
+        ? sameBackend(stateValidation.identity, installed)
         : undefined;
       const report = await manager.buildStatusReport({
         project,

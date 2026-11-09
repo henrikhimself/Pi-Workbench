@@ -28,15 +28,18 @@ export interface CodeGraphAsset {
   sizeBytes?: number;
 }
 
+/** The one packaged backend version; both platform entries and the manager use it. */
+export const CODE_GRAPH_VERSION = "v0.12.1";
+
 export const CODE_GRAPH_ASSETS: Record<CodeGraphPlatform, CodeGraphAsset> = {
   "linux-arm64": {
-    version: "v0.12.1",
+    version: CODE_GRAPH_VERSION,
     url: "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.x.y/codebase-memory-mcp-linux-arm64-portable.tar.gz",
     sha256: "ed0f1f548cd79b121c401c2e9f7841c189a001af26d3768368088c24f6a53533",
     sizeBytes: 48_466_763,
   },
   "linux-amd64": {
-    version: "v0.12.1",
+    version: CODE_GRAPH_VERSION,
     url: "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.x.y/codebase-memory-mcp-linux-amd64-portable.tar.gz",
     sha256: "8c3d0341064301e78ecc84cf7348d4e2c6562a0f57448243ea560aaa34de36c1",
     sizeBytes: 48_920_994,

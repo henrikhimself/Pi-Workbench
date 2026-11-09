@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -51,7 +51,7 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
   });
   assert.throws(() => config.parseHeadroomConfig({ schemaVersion: 1, url: "http://127.0.0.1:9000/" }), /url is unsupported/);
   assert.throws(() => config.parseHeadroomConfig({ port: 8787 }), /new schemaVersion/);
-  for (const mode of ["ccr", "lossy_inline", "lossless_then_lossy"]) {
+  for (const mode of ["lossy_inline", "lossless_then_lossy"]) {
     assert.deepEqual(config.parseHeadroomConfig({ schemaVersion: 1, compression: { mode } }), { schemaVersion: 1, port: 8787, compression: { mode } });
   }
   for (const value of [
@@ -68,6 +68,7 @@ test("Headroom config: validates proxy, Memory, and compression values", () => {
     { memory: { unknown: true } },
     { compression: null },
     { compression: { mode: "token" } },
+    { compression: { mode: "ccr" } },
     { compression: { targetRatio: 1.1 } },
     { compression: { targetRatio: Number.NaN } },
     { compression: { compressUserMessages: "false" } },
@@ -184,4 +185,33 @@ test("Headroom config: client request timeout always exceeds the proxy's compres
   assert.equal(config.headroomRequestTimeoutMs({}), 45_000);
   assert.equal(config.headroomRequestTimeoutMs({ compressionTimeoutSeconds: 120 }), 135_000);
   assert.equal(config.headroomRequestTimeoutMs({ compressionTimeoutSeconds: 5 }), 20_000);
+});
+
+test("H-4: ccr mode is refused and the existing file is not rewritten", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pi-headroom-config-ccr-"));
+  const configPath = join(directory, "headroom.json");
+  try {
+    const original = JSON.stringify({ schemaVersion: 1, compression: { mode: "ccr" } });
+    await writeFile(configPath, original);
+    assert.throws(() => config.loadHeadroomConfigSync(configPath), /ccr is not supported/);
+    assert.equal(await readFile(configPath, "utf8"), original);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("H-8: bootstrap creates an owner-only directory and file and refuses a symlink", { skip: process.platform === "win32" }, async () => {
+  const dir = await mkdtemp(join(tmpdir(), "wb-headroom-h8-"));
+  try {
+    await chmod(dir, 0o700);
+    const nested = join(dir, "nested");
+    await mkdir(nested, { mode: 0o755 }); await chmod(nested, 0o755);
+    const path = join(nested, "headroom.json");
+    assert.equal(await config.ensureHeadroomConfigFile(path), true);
+    assert.equal((await stat(nested)).mode & 0o777, 0o700);
+    assert.equal((await stat(path)).mode & 0o777, 0o600);
+    const target = join(dir, "elsewhere.json");
+    await writeFile(target, "untouched");
+    await symlink(target, join(nested, "link.json"));
+    await assert.rejects(config.ensureHeadroomConfigFile(join(nested, "link.json")), /Symlink in managed path/);
+    assert.equal(await readFile(target, "utf8"), "untouched");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

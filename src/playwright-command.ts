@@ -18,9 +18,8 @@ export async function executePlaywrightCommand(raw: string, context: {
   const command = parsePlaywrightCommand(raw);
   if (command.action === "on") await context.manager.on();
   if (command.action === "off") {
-    const confirmed = context.hasUI
-      ? await context.confirm?.("Turn off Playwright and delete workspace data?", "Stops only this session. Deletes this workspace's managed browser artifacts and diagnostics. Active same-workspace peers prevent deletion; shared installation is retained.") ?? false
-      : command.confirmDelete;
+    if ((await context.manager.status()).dataPresent === false) return offMessage(TOOL_NAMES.playwright, "already-off");
+    const confirmed = command.confirmDelete || (context.hasUI && ((await context.confirm?.("Turn off Playwright and delete workspace data?", "Stops only this session. Deletes this workspace's managed browser artifacts and session records. Active same-workspace peers prevent deletion; shared installation is retained.")) ?? false));
     if (!confirmed) return context.hasUI ? "Playwright off cancelled; session, intent, and data unchanged." : "Playwright off requires --confirm-delete without interactive UI; nothing changed.";
     await context.manager.off(true);
     return offMessage(TOOL_NAMES.playwright, "deleted");

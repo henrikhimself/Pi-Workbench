@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -29,7 +30,10 @@ test("Memory Git setup adds only managed attribute block and preserves existing 
     const attributes = await readFile(join(root, ".gitattributes"), "utf8");
     assert.match(attributes, /^\*\.bin filter=lfs/m);
     assert.equal((attributes.match(/>>> pi-workbench Headroom Memory/g) ?? []).length, 1);
-    assert.match(attributes, /\.headroom-memory\/\*\* merge=pi-workbench-theirs\n/);
+    for (const member of ["manifest.json", "memories/**", "entities/**", "relationships/**"]) {
+      assert.ok(attributes.includes(`.headroom-memory/${member} merge=pi-workbench-theirs\n`), member);
+    }
+    assert.doesNotMatch(attributes, /\.headroom-memory\/\*\* /);
     assert.doesNotMatch(attributes, /merge=theirs/);
     const { stdout } = await git(root, "config", "--local", "--get", "merge.theirs.driver");
     assert.equal(stdout.trim(), "user-owned-driver", "a user's own `theirs` driver is neither reused nor overwritten");
@@ -78,7 +82,10 @@ test("L13: an attribute block written by an earlier version (merge=theirs) is mi
     assert.equal(await configureMemoryGit(root, join(root, ".headroom-memory")), null);
     const attributes = await readFile(join(root, ".gitattributes"), "utf8");
     assert.match(attributes, /^\*\.bin filter=lfs/m);
-    assert.match(attributes, /\.headroom-memory\/\*\* merge=pi-workbench-theirs/);
+    for (const member of ["manifest.json", "memories/**", "entities/**", "relationships/**"]) {
+      assert.ok(attributes.includes(`.headroom-memory/${member} merge=pi-workbench-theirs`), member);
+    }
+    assert.doesNotMatch(attributes, /\.headroom-memory\/\*\* /);
     assert.doesNotMatch(attributes, /merge=theirs/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -157,4 +164,101 @@ test("M8: derived mode keeps every per-record check and rejects stray owned file
     await assert.rejects(validate(dir, bundle, "--derive-manifest"), /version or namespace/, "version and namespace still come from the manifest");
     await assert.rejects(execFile("python3", [BUNDLE_SCRIPT, "export", "--store", dir, "--bundle", join(dir, "x"), "--namespace", "tester", "--derive-manifest"]), /only valid for/);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("M-1: a cloned bundle without empty kind directories validates", async () => {
+  await gitMergeFixture(async ({ root }) => {
+    const cloneRoot = `${root}-clone`;
+    try {
+      // `git clone` is blocked by the offline guard; a worktree checks out the same tracked files only.
+      await git(root, "worktree", "add", "-q", "--detach", cloneRoot);
+      const cloned = join(cloneRoot, ".headroom-memory");
+      assert.equal(existsSync(join(cloned, "entities")), false);
+      const expected = { entities: 0, memories: 1, relationships: 0 };
+      assert.deepEqual(JSON.parse((await validate(cloneRoot, cloned)).stdout), expected);
+      assert.deepEqual(JSON.parse((await validate(cloneRoot, cloned, "--derive-manifest")).stdout), expected);
+    } finally { await rm(cloneRoot, { recursive: true, force: true }); }
+  });
+});
+
+test("M-1: a missing kind is empty, but a symlinked or non-directory kind is refused", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-workbench-memory-kinds-"));
+  const bundle = join(dir, "bundle");
+  try {
+    await writeRecords(bundle, { a: "x" });
+    await rm(join(bundle, "entities"), { recursive: true });
+    await writeFile(join(bundle, "entities"), "not a directory");
+    await assert.rejects(validate(dir, bundle), /must be a directory: entities/);
+    await rm(join(bundle, "entities"));
+    await symlink(join(dir, "nowhere"), join(bundle, "entities"));
+    await assert.rejects(validate(dir, bundle), /symbolic link/);
+    await rm(join(bundle, "entities"));
+    const payload = canonicalJson({ id: "e", user_id: "tester", content: "x" });
+    const files = [{ path: "entities/e.json", sha256: createHash("sha256").update(payload).digest("hex") }];
+    await writeFile(join(bundle, "manifest.json"), canonicalJson({ version: 1, namespace: "tester", files }));
+    await assert.rejects(validate(dir, bundle), /bundle file is required/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+async function checkMerge(root, ...paths) {
+  const { stdout } = await git(root, "check-attr", "merge", "--", ...paths);
+  return stdout.trim().split("\n").map(line => line.slice(line.lastIndexOf(": ") + 2));
+}
+
+test("M-3: merge attributes cover only bundle members", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workbench-memory-git-members-"));
+  try {
+    await git(root, "init");
+    assert.equal(await configureMemoryGit(root, join(root, "docs")), null);
+    const result = await checkMerge(root, "docs/manifest.json", "docs/memories/a.json", "docs/entities/b.json", "docs/relationships/c.json", "docs/guide.md", "docs/memories.md");
+    assert.deepEqual(result, [...Array(4).fill(MEMORY_MERGE_DRIVER), "unspecified", "unspecified"]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("M-3: export paths with spaces and glob characters are quoted", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workbench-memory-git-quoted-"));
+  try {
+    await git(root, "init");
+    assert.equal(await configureMemoryGit(root, join(root, "my mem [1]")), null);
+    assert.deepEqual(await checkMerge(root, "my mem [1]/manifest.json", "my mem [1]/memories/a.json", "my mem 1/manifest.json"), [MEMORY_MERGE_DRIVER, MEMORY_MERGE_DRIVER, "unspecified"]);
+    const attributes = await readFile(join(root, ".gitattributes"), "utf8");
+    assert.ok(attributes.includes(String.raw`"my mem \\[1\\]/manifest.json" merge=${MEMORY_MERGE_DRIVER}`), attributes);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("M-3: an export path with control characters is refused and .gitattributes is not written", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workbench-memory-git-control-"));
+  try {
+    await git(root, "init");
+    assert.match(await configureMemoryGit(root, join(root, "bad\nname")), /control characters/);
+    assert.equal(existsSync(join(root, ".gitattributes")), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("M-7: a symlinked .gitattributes is refused and its target is unchanged", async () => {
+  const outer = await mkdtemp(join(tmpdir(), "pi-workbench-memory-git-symlink-"));
+  const root = join(outer, "repo");
+  try {
+    await mkdir(root);
+    await git(root, "init");
+    const victim = join(outer, "victim.txt");
+    await writeFile(victim, "keep\n");
+    await symlink(victim, join(root, ".gitattributes"));
+    assert.match(await configureMemoryGit(root, join(root, ".headroom-memory")), /not a regular file/);
+    assert.equal(await readFile(victim, "utf8"), "keep\n");
+    await assert.rejects(git(root, "config", "--local", "--get", `merge.${MEMORY_MERGE_DRIVER}.driver`));
+  } finally { await rm(outer, { recursive: true, force: true }); }
+});
+
+test("M-7: an existing .gitattributes keeps its mode", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pi-workbench-memory-git-mode-"));
+  try {
+    await git(root, "init");
+    const attributes = join(root, ".gitattributes");
+    await writeFile(attributes, "*.bin filter=lfs\n", { mode: 0o644 });
+    await chmod(attributes, 0o644);
+    assert.equal(await configureMemoryGit(root, join(root, ".headroom-memory")), null);
+    assert.equal((await stat(attributes)).mode & 0o777, 0o644);
+    assert.deepEqual((await readdir(root)).filter(name => name.endsWith(".tmp")), []);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

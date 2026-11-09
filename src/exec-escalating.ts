@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { basename } from "node:path";
 
 export const KILL_GRACE_MS = 3_000;
 
@@ -39,4 +40,19 @@ export function execWithKillEscalation(command: string, args: string[], options:
     if (options.timeoutMs !== undefined) timer = setTimeout(terminate, options.timeoutMs);
     if (options.signal?.aborted) terminate(); else options.signal?.addEventListener("abort", terminate, { once: true });
   });
+}
+
+export type ProcessRunnerOptions = EscalatingExecOptions & { timeoutMs: number };
+/** Exact-argument, no-shell process runner shared by the Code Graph modules. */
+export type ProcessRunner = (command: string, args: string[], options: ProcessRunnerOptions) => Promise<EscalatingExecResult>;
+export function defaultProcessRunner(): ProcessRunner {
+  return (command, args, options) => execWithKillEscalation(command, args, options);
+}
+
+/** Run a command through the escalation and return trimmed stdout; a non-zero exit throws with the stderr text. */
+export async function execText(command: string, args: string[], options: EscalatingExecOptions): Promise<string> {
+  const result = await execWithKillEscalation(command, args, { ...options, maxBuffer: options.maxBuffer ?? 8 * 1024 * 1024 });
+  options.signal?.throwIfAborted();
+  if (result.code !== 0) throw new Error(result.stderr.trim() || `${basename(command)} exited with code ${result.code}`);
+  return result.stdout.trim();
 }

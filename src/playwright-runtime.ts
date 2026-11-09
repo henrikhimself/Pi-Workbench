@@ -201,7 +201,8 @@ export class PlaywrightRuntime {
       if (!same) throw new PlaywrightHostChangedError(host.path);
     }
   }
-  async ensure(onProgress: PlaywrightProgress = () => {}, signal?: AbortSignal): Promise<PlaywrightRuntimeRecord> {
+  async ensure(onProgress: PlaywrightProgress = () => {}, signal?: AbortSignal, options: { provision?: boolean } = {}): Promise<PlaywrightRuntimeRecord> {
+    const provision = options.provision ?? true;
     const report = onProgress;
     onProgress = message => { try { report(message); } catch { /* UI teardown cannot invalidate runtime publication. */ } };
     signal?.throwIfAborted();
@@ -221,8 +222,15 @@ export class PlaywrightRuntime {
         catch (error) {
           // Only a changed host Node/npm is repaired here, by provisioning a new runtime below; the old slot is left in place.
           if (!(error instanceof PlaywrightHostChangedError)) throw error;
-          hostChanged = error; onProgress("Playwright host Node/npm changed; provisioning a new runtime...");
+          hostChanged = error;
+          if (provision) onProgress("Playwright host Node/npm changed; provisioning a new runtime...");
         }
+      }
+      if (!provision) {
+        // Passive restore never installs: only an explicit `on` may provision a runtime.
+        throw new Error(hostChanged
+          ? `${hostChanged.message} Run /wb:playwright on to provision a runtime for the new host.`
+          : "No installed Playwright runtime for this version; run /wb:playwright on to install it.");
       }
       if ((await playwrightConsumers(this.paths, "runtime:")).some(consumer => consumer.active)) {
         throw new Error(hostChanged

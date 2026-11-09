@@ -1,5 +1,6 @@
-import { execFile } from "node:child_process";
-import { readFile, writeFile } from "node:fs/promises";
+import { execText } from "./exec-escalating.js";
+import { randomUUID } from "node:crypto";
+import { lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -10,12 +11,31 @@ const DRIVER = fileURLToPath(new URL("./memory-merge-theirs.mjs", import.meta.ur
 export const MEMORY_MERGE_DRIVER = "pi-workbench-theirs";
 
 function runGit(cwd: string, args: string[]): Promise<string> {
-  return new Promise((resolvePromise, reject) => {
-    execFile("git", args, { cwd }, (error, stdout, stderr) => {
-      if (error) reject(new Error(stderr || error.message));
-      else resolvePromise(stdout.trim());
-    });
-  });
+  return execText("git", args, { cwd, timeoutMs: 30_000 });
+}
+
+const BUNDLE_MEMBERS = ["manifest.json", "memories/**", "entities/**", "relationships/**"] as const;
+
+/**
+ * One `.gitattributes` pattern for a bundle member under `directory` (slash-separated). Glob characters
+ * in the directory are escaped, and a path with anything beyond plain characters is double-quoted
+ * with C-style escapes. Returns null for a path with control characters, which cannot be written safely.
+ */
+function attributePattern(directory: string, member: string): string | null {
+  if (/[\u0000-\u001f\u007f]/.test(directory)) return null;
+  const pattern = `${directory.replace(/[\\*?[\]]/g, "\\$&")}/${member}`;
+  if (!/[^A-Za-z0-9._/@+-]/.test(directory)) return pattern;
+  return `"${pattern.replace(/[\\"]/g, "\\$&")}"`;
+}
+
+/** Temp file plus rename, so a crash never leaves a half-written `.gitattributes`. */
+async function writeAttributesAtomically(path: string, content: string, mode: number): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    const handle = await open(temporary, "wx", mode);
+    try { await handle.writeFile(content, "utf8"); await handle.sync(); } finally { await handle.close(); }
+    await rename(temporary, path);
+  } finally { await rm(temporary, { force: true }); }
 }
 
 /** Warning-only Git integration for an opted-in canonical Memory export. */
@@ -29,10 +49,19 @@ export async function configureMemoryGit(projectPath: string, exportDirectory?: 
     }
     const attributes = resolve(root, ".gitattributes");
     let current = "";
-    try { current = await readFile(attributes, "utf8"); } catch (error: unknown) {
+    let mode = 0o666;
+    try {
+      const info = await lstat(attributes);
+      if (!info.isFile()) return ".gitattributes is not a regular file; merge attributes were not changed.";
+      mode = info.mode & 0o777;
+      current = await readFile(attributes, "utf8");
+    } catch (error: unknown) {
       if (!(typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT")) throw error;
     }
-    const block = `${START}\n${pattern.replaceAll("\\", "/")}/** merge=${MEMORY_MERGE_DRIVER}\n${END}\n`;
+    const directory = pattern.split(sep).join("/");
+    const lines = BUNDLE_MEMBERS.map(member => attributePattern(directory, member));
+    if (lines.some(line => line === null)) return "Memory export path contains control characters; merge attributes were not configured.";
+    const block = `${START}\n${lines.map(line => `${line} merge=${MEMORY_MERGE_DRIVER}`).join("\n")}\n${END}\n`;
     const begin = current.indexOf(START);
     const end = current.indexOf(END);
     if (begin !== -1 && end !== -1 && end >= begin) {
@@ -43,7 +72,7 @@ export async function configureMemoryGit(projectPath: string, exportDirectory?: 
     } else {
       return "Malformed pi-workbench .gitattributes block; merge attributes were not changed.";
     }
-    await writeFile(attributes, current, "utf8");
+    await writeAttributesAtomically(attributes, current, mode);
     // The path of Node and of this extension is part of the command; refresh it whenever it changed
     // (Node upgrade, nvm switch, extension moved), so the driver never points at a dead path.
     const command = `"${process.execPath}" "${DRIVER}" %A %B`;

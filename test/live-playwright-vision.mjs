@@ -28,7 +28,8 @@ assert.equal(loadedVision?.status?.value, "loaded", "MODEL_NOT_READY: vision mod
 
 const root = await mkdtemp(join(tmpdir(), "wb-playwright-vision-")), home = join(root, "home"), agent = join(root, "agent"), workspace = join(root, "a");
 const repo = fileURLToPath(new URL("..", import.meta.url));
-const token = `WBV-${randomBytes(3).toString("hex").toUpperCase()}`;
+const { visionToken } = await import("./helpers/vision-token.mjs");
+const token = visionToken();
 const report = { agentModel: `llama.cpp/${agentModel}`, visionModel: `llama.cpp/${visionModel}`, token, transport: "real `pi --mode rpc` subprocess, JSONL stdin/stdout", checks: [], metrics: {}, unverified: ["TUI is a manual procedure (owner-tested)", "Model-not-loaded behavior: harness cannot unload models; covered offline only", "Accuracy on real-world pages: only synthetic ground truth"], passed: false };
 let child, server, passed = false, stderr = "";
 const events = [], waiters = [], pending = new Map(); let buffer = "";

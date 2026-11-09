@@ -1,11 +1,12 @@
-import { execFile } from "node:child_process";
+import { execText } from "./exec-escalating.js";
 import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, open, readFile, readdir, rename as renamePath, rm } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { ManagedHeadroomRuntime, DEFAULT_HEADROOM_RUNTIME, getHeadroomAiVersion, type ManagedHeadroomDescriptor } from "./headroom-runtime.js";
 import { acquireManagedLock, activeConsumers, assertNoSymlink, ensurePrivateDirectory, publishJson, requireDiskSpace, treeBytes } from "./managed-lifecycle.js";
-import { prepareDataStore, STORE_MARKER, type HeadroomStoreIdentity } from "./store-identity.js";
+import { identityMatches, otherVersionMessage, prepareDataStore, readStoreIdentity, STORE_MARKER, type HeadroomStoreIdentity } from "./store-identity.js";
+import { TOOL_NAMES } from "./tool-names.js";
 import { fileURLToPath } from "node:url";
 import type { McpServerConfig } from "@earendil-works/pi-coding-agent";
 import { hasMemoryStore, resolveMemoryStore, type MemoryStore } from "./memory-config.js";
@@ -45,7 +46,7 @@ export type ProcessRunner = (
   command: string,
   args: string[],
   options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
-) => Promise<void | string>;
+) => Promise<string>;
 export type RenameOperation = (oldPath: string, newPath: string) => Promise<void>;
 
 class SwapRecoveryError extends Error {}
@@ -82,7 +83,7 @@ export class MemoryManager {
       this.descriptor = await this.runtime.ensure(onStatus);
       return this.descriptor?.python ?? null;
     });
-    this.runProcess = options?.runProcess ?? runProcess;
+    this.runProcess = options?.runProcess ?? defaultMemoryRunner;
     this.rename = options?.rename ?? renamePath;
   }
 
@@ -92,7 +93,7 @@ export class MemoryManager {
 
   private get coordinationRoot(): string { return join(this.store.root, "coordination"); }
   private get leaseRoot(): string { return join(this.store.root, "consumers", this.store.identifier); }
-  private get pendingPath(): string { return join(this.coordinationRoot, this.store.identifier + ".pending.json"); }
+  get pendingPath(): string { return join(this.coordinationRoot, this.store.identifier + ".pending.json"); }
   get recoveryPending(): boolean { return existsSync(this.pendingPath); }
   private async expectedIdentity(): Promise<HeadroomStoreIdentity> {
     const version = await getHeadroomAiVersion();
@@ -104,11 +105,18 @@ export class MemoryManager {
     try {
       const owned = JSON.parse(await readFile(marker, "utf8"));
       if (owned.modelSha256 !== undefined) {
-        if (!/^[0-9a-f]{64}$/.test(owned.modelSha256) || !/^[0-9a-f]{64}$/.test(owned.tokenizerSha256) || !/^[0-9a-f]{40,64}$/.test(owned.modelRevision)) throw new Error("Invalid stored embedding identity");
+        if (!validEmbeddingIdentity(owned)) throw new Error("Invalid stored embedding identity");
         Object.assign(base, { modelSha256: owned.modelSha256, tokenizerSha256: owned.tokenizerSha256, modelRevision: owned.modelRevision });
       }
     } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     return this.identity = base;
+  }
+  private async waitForNoConsumers(timeoutMs: number): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while ((await activeConsumers(this.leaseRoot)).length) {
+      if (Date.now() >= deadline) throw new Error("Memory store busy in another/closing session; operation deferred");
+      await new Promise(done => setTimeout(done, 50));
+    }
   }
   private async transaction<T>(action: () => Promise<T>, options: { create?: boolean; readOnly?: boolean } = {}): Promise<T> {
     this.signal?.throwIfAborted();
@@ -119,11 +127,7 @@ export class MemoryManager {
       const release = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
       try {
         if (this.recoveryPending) throw new Error(`Incomplete Memory publication; preserve recovery paths in ${this.pendingPath}`);
-        const deadline = Date.now() + 2000;
-        while ((await activeConsumers(this.leaseRoot)).length) {
-          if (Date.now() >= deadline) throw new Error("Memory store busy in another/closing session; operation deferred");
-          await new Promise(done => setTimeout(done, 50));
-        }
+        await this.waitForNoConsumers(2000);
         if (!options.create && !this.enabled) throw new Error("Memory is not opted in for this new namespace");
         await prepareDataStore(this.store.directory, await this.expectedIdentity());
         const bytes = await treeBytes(this.store.directory);
@@ -149,8 +153,38 @@ export class MemoryManager {
   }
 
   /** Remove only calculated per-project directory. Never remove configurable root. */
-  async deleteStore(): Promise<void> {
-    await this.transaction(() => rm(this.store.directory, { recursive: true, force: true }));
+  async deleteStore({ timeoutMs = 10_000 }: { timeoutMs?: number } = {}): Promise<void> {
+    // An explicit deletion also removes data another release wrote, so it skips the identity guard
+    // and the free-disk check. It still needs the lock, no live consumer and no pending publication.
+    this.signal?.throwIfAborted();
+    await this.ensureRoot();
+    const release = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
+    try {
+      if (this.recoveryPending) throw new Error(`Incomplete Memory publication; preserve recovery paths in ${this.pendingPath}`);
+      await this.waitForNoConsumers(timeoutMs);
+      await assertNoSymlink(this.store.directory);
+      // Merge backups hold full copies of the old store. Remove them first, so an interrupted `off`
+      // can be re-run: the opt-in (`memory.db`) disappears last, with the store.
+      const parent = dirname(this.store.directory), prefix = `${basename(this.store.directory)}.merge-backup-`;
+      for (const name of await readdir(parent)) {
+        if (!name.startsWith(prefix)) continue;
+        const backup = join(parent, name);
+        await assertNoSymlink(backup);
+        await rm(backup, { recursive: true, force: true });
+      }
+      await rm(this.store.directory, { recursive: true, force: true });
+    } finally { await release(); }
+  }
+
+  /** Read-only: why this release will not use an existing store, or null. Creates and repairs nothing. */
+  async storeRefusal(): Promise<string | null> {
+    if (!this.enabled) return null;
+    const refusal = otherVersionMessage(TOOL_NAMES.memory);
+    let actual: Record<string, unknown> | null;
+    try { actual = await readStoreIdentity(this.store.directory); }
+    catch { return refusal; } // unparseable or unsupported identity file
+    if (actual === null) return null;
+    return identityMatches(actual, await this.expectedIdentity()) ? null : refusal;
   }
 
   /** Resolve managed Python without initializing Memory models or touching store data. */
@@ -181,19 +215,17 @@ export class MemoryManager {
         env: createPreflightEnvironment(this.runtime.environment()), timeoutMs: 180_000, signal: this.signal,
       });
       this.signal?.throwIfAborted();
-      if (typeof output === "string") {
-        const model = JSON.parse(output);
-        if (!/^[0-9a-f]{64}$/.test(model.modelSha256) || !/^[0-9a-f]{64}$/.test(model.tokenizerSha256) || !/^[0-9a-f]{40,64}$/.test(model.modelRevision)) throw new Error("Missing verified embedding asset identity");
-        const identity = { ...await this.expectedIdentity(), modelSha256: model.modelSha256,
-          tokenizerSha256: model.tokenizerSha256, modelRevision: model.modelRevision };
-        const release = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
-        try {
-          if ((await readdir(this.store.directory)).every(name => name === STORE_MARKER)) {
-            await publishJson(this.store.directory, join(this.store.directory, STORE_MARKER), identity);
-          } else await prepareDataStore(this.store.directory, identity);
-          this.identity = identity;
-        } finally { await release(); }
-      }
+      const model = JSON.parse(output);
+      if (!validEmbeddingIdentity(model)) throw new Error("Missing verified embedding asset identity");
+      const identity = { ...await this.expectedIdentity(), modelSha256: model.modelSha256,
+        tokenizerSha256: model.tokenizerSha256, modelRevision: model.modelRevision };
+      const releaseStore = await acquireManagedLock(this.coordinationRoot, this.store.identifier);
+      try {
+        if ((await readdir(this.store.directory)).every(name => name === STORE_MARKER)) {
+          await publishJson(this.store.directory, join(this.store.directory, STORE_MARKER), identity);
+        } else await prepareDataStore(this.store.directory, identity);
+        this.identity = identity;
+      } finally { await releaseStore(); }
       return python;
     } catch (error) {
       onStatus(`Headroom Memory ONNX preflight failed: ${error instanceof Error ? error.message : String(error)}`); return null;
@@ -202,7 +234,7 @@ export class MemoryManager {
 
   /** Export current configured namespace into a staged canonical JSON bundle. */
   async exportBundle(python: string): Promise<string> {
-    return this.transaction(() => this.exportBundleUnlocked(python), { readOnly: false });
+    return this.transaction(() => this.exportBundleUnlocked(python));
   }
   private async exportBundleUnlocked(python: string): Promise<string> {
     const bundle = this.requireExportDirectory();
@@ -346,7 +378,7 @@ export class MemoryManager {
   }
 
   private async runBundle(python: string, operation: "export" | "validate" | "replace" | "merge" | "show", store: string, bundle: string, options: { deriveManifest?: boolean } = {}): Promise<string> {
-    return runProcessOutput(python, [MEMORY_BUNDLE_SCRIPT, operation, "--store", store, "--bundle", bundle, "--namespace", this.store.userId, ...(options.deriveManifest ? ["--derive-manifest"] : [])], {
+    return execText(python, [MEMORY_BUNDLE_SCRIPT, operation, "--store", store, "--bundle", bundle, "--namespace", this.store.userId, ...(options.deriveManifest ? ["--derive-manifest"] : [])], {
       env: createMcpEnvironment(this.runtime.environment()),
       timeoutMs: 180_000, signal: this.signal,
       ...(operation === "show" ? { maxBuffer: MEMORY_SHOW_MAX_BUFFER } : {}),
@@ -376,7 +408,7 @@ export class MemoryManager {
     return {
       command: process.execPath, args: [MCP_LAUNCHER, JSON.stringify(spec)],
       cwd: this.store.projectPath,
-      exposure: "direct", timeout: 60,
+      exposure: "direct",
       description: "Search and save project-scoped persistent Headroom Memory.",
     };
   }
@@ -392,11 +424,22 @@ export function createPreflightEnvironment(source: NodeJS.ProcessEnv = process.e
 }
 
 /** MCP must use model cached by preflight and never select MPS/Torch runtime. */
+/** The Memory server runs offline, and its launcher spec is visible in argv (ps, /proc, `/mcp`). */
+const MCP_ENVIRONMENT_EXCLUDED_KEYS = [
+  "HF_TOKEN", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+] as const;
+
+function validEmbeddingIdentity(v: { modelSha256?: unknown; tokenizerSha256?: unknown; modelRevision?: unknown }): boolean {
+  const hex = (value: unknown, pattern: RegExp) => typeof value === "string" && pattern.test(value);
+  return hex(v.modelSha256, /^[0-9a-f]{64}$/) && hex(v.tokenizerSha256, /^[0-9a-f]{64}$/) && hex(v.modelRevision, /^[0-9a-f]{40,64}$/);
+}
+
 export function createMcpEnvironment(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env = Object.fromEntries(
     Object.entries(source).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
   );
   delete env.HEADROOM_EMBEDDER_RUNTIME;
+  for (const key of MCP_ENVIRONMENT_EXCLUDED_KEYS) delete env[key];
   env.HF_HUB_OFFLINE = "1";
   env.TRANSFORMERS_OFFLINE = "1";
   return env;
@@ -409,24 +452,4 @@ function utcTimestamp(date = new Date()): string {
 /** `show` dumps every record; Node's default 1 MiB `execFile` buffer made large stores fail. */
 export const MEMORY_SHOW_MAX_BUFFER = 64 * 1024 * 1024;
 
-async function runProcessOutput(
-  command: string,
-  args: string[],
-  options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal; maxBuffer?: number },
-): Promise<string> {
-  return new Promise<string>((resolvePromise, reject) => {
-    execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal, ...(options.maxBuffer ? { maxBuffer: options.maxBuffer } : {}) }, (error, stdout, stderr) => {
-      if (error) reject(new Error(stderr || error.message));
-      else resolvePromise(stdout.trim());
-    });
-  });
-}
-
-async function runProcess(command: string, args: string[], options: { env: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal }): Promise<string> {
-  return new Promise<string>((resolvePromise, reject) => {
-    execFile(command, args, { env: options.env, timeout: options.timeoutMs, signal: options.signal, maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
-      if (error) reject(new Error(stderr || error.message));
-      else resolvePromise(stdout.trim());
-    });
-  });
-}
+const defaultMemoryRunner: ProcessRunner = (command, args, options) => execText(command, args, options);

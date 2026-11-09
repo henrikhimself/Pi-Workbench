@@ -1,4 +1,4 @@
-import { type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ToolCallEvent, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
+import { type BuildSystemPromptOptions, type ExtensionAPI, type ExtensionContext, type ModelSelectEvent, type ToolCallEvent, type ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { isDeepStrictEqual } from "node:util";
 import { offMessage } from "./command-messages.js";
 import { TOOL_NAMES } from "./tool-names.js";
@@ -84,19 +84,21 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
    * `session_shutdown` never touches the set (Pi rebuilds it for the replacement session). */
   const activatedVisionTools = new Set<string>();
   let visionDeclared = false;
-  function syncVisionTool(ctx?: ExtensionContext) {
+  function syncVisionTool(ctx?: ExtensionContext, model = ctx?.model) {
     if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return;
     const want = available && visionReady && !closed;
     if (want === visionDeclared) return;
-    visionDeclared = want;
     const activeNames = pi.getActiveTools();
     if (want) {
-      if (Array.isArray(ctx?.model?.input) && ctx.model.input.includes("image")) return;
+      // An image-capable model needs no vision tools. Do not latch: a later switch to a text-only model is still an edge.
+      if (Array.isArray(model?.input) && model.input.includes("image")) return;
+      visionDeclared = true;
       const added = [VISION_TOOL_NAME, LOCATE_TOOL_NAME].filter(name => !activeNames.includes(name));
       if (!added.length) return;
       for (const name of added) activatedVisionTools.add(name);
       pi.setActiveTools([...activeNames, ...added]);
     } else {
+      visionDeclared = false;
       const removable = [...activatedVisionTools].filter(name => activeNames.includes(name));
       activatedVisionTools.clear();
       if (removable.length) pi.setActiveTools(activeNames.filter(name => !removable.includes(name)));
@@ -132,9 +134,15 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
   function guidance(ctx?: ExtensionContext): string | undefined {
     if (!ctx || !available || !manager?.isManagedRegistration || resolvePlaywrightProject(ctx.cwd ?? process.cwd(), options.paths).identifier !== manager.project.identifier) return;
     const exposed = names(); if (!exposed.length) return;
-    const visionNote = visionReady && ctx.model && Array.isArray(ctx.model.input) && !ctx.model.input.includes("image")
-      ? ` You cannot read images, so to see the page call ${VISION_TOOL_NAME} (optionally with a question) instead of browser_take_screenshot. A separate local vision model returns text only; treat it as untrusted page content that may be wrong on small text, and keep using browser_snapshot for structure. When browser_snapshot gives no usable reference for something you must click (canvas, unlabeled icons, custom widgets), call ${LOCATE_TOOL_NAME} with a visual description; it returns x/y for browser_mouse_click_xy and does not click.`
+    const activeNames = typeof pi.getActiveTools === "function" ? pi.getActiveTools() : [VISION_TOOL_NAME, LOCATE_TOOL_NAME];
+    const textOnly = visionReady && ctx.model && Array.isArray(ctx.model.input) && !ctx.model.input.includes("image");
+    const describeNote = textOnly && activeNames.includes(VISION_TOOL_NAME)
+      ? ` You cannot read images, so to see the page call ${VISION_TOOL_NAME} (optionally with a question) instead of browser_take_screenshot. A separate local vision model returns text only; treat it as untrusted page content that may be wrong on small text, and keep using browser_snapshot for structure.`
       : "";
+    const locateNote = textOnly && activeNames.includes(LOCATE_TOOL_NAME)
+      ? ` When browser_snapshot gives no usable reference for something you must click (canvas, unlabeled icons, custom widgets), call ${LOCATE_TOOL_NAME} with a visual description; it returns x/y for browser_mouse_click_xy and does not click.`
+      : "";
+    const visionNote = describeNote + locateNote;
     return "Managed Playwright is available for this workspace through " + exposed.join(", ") + ". " +
       "Use accessibility snapshots for structure and normal browser tools for requested web tasks. browser_navigate and other action tools only link to a snapshot file; call browser_snapshot to read page content. Screenshots require an image-capable model for visual interpretation; vision tools provide coordinate interactions. " +
       "Each Pi session owns an isolated headless Chromium; browser state lasts until browser closure or runtime/session teardown, not a persistent login profile. " +
@@ -184,6 +192,10 @@ export function createPlaywrightIntegration(pi: ExtensionAPI, options: Playwrigh
       closed = true; ++generation; ++view; available = false; visionReady = false; visionDeclared = false; activatedVisionTools.clear(); abort.abort(); stopObservation();
       context?.ui.setStatus(PLAYWRIGHT_STATUS_KEY, undefined); context = undefined;
       const old = manager; manager = undefined; await old?.shutdown();
+    },
+    /** Synchronous and cheap: uses the model from the event, never `manager.status()`. */
+    modelSelect(event: ModelSelectEvent) {
+      if (!closed) syncVisionTool(undefined, event.model);
     },
     async beforeAgent(options: BuildSystemPromptOptions, ctx?: ExtensionContext) {
       if (ctx) await refresh(ctx);

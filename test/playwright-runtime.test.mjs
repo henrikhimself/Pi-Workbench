@@ -271,3 +271,20 @@ test("M10: other validation failures are not treated as a host change", async t 
   await assert.rejects(f.ensure(), error => !(error instanceof m.PlaywrightHostChangedError));
   assert.equal(f.calls.length, calls); assert.equal((await f.runtime.selected()).id, before);
 });
+test("Playwright passive ensure reuses a ready runtime and never provisions", async t => {
+  const f = await hostChangeFixture(t);
+  const passive = () => f.runtime.ensure(message => f.progress.push(message), undefined, { provision: false });
+  await assert.rejects(passive(), /\/wb:playwright on/);
+  assert.equal(f.calls.length, 0);
+  await assert.rejects(access(f.paths.playwrightRuntimes), { code: "ENOENT" });
+  const first = await f.ensure(), n = f.calls.length;
+  assert.equal((await passive()).id, first.id);
+  assert.equal(f.calls.length, n);
+  await writeFile(first.node.path, "upgraded node");
+  await assert.rejects(passive(), error => /host Node or npm was updated/.test(error.message) && /\/wb:playwright on/.test(error.message));
+  assert.equal(f.calls.length, n);
+  assert.equal((await readdir(join(f.paths.playwrightRuntimes, config.PLAYWRIGHT_VERSION))).length, 1);
+  assert.equal((await f.runtime.selected()).id, first.id);
+  const afterHostChange = f.progress.filter(message => /provisioning/.test(message));
+  assert.equal(afterHostChange.length, 0, "passive mode never announces provisioning");
+});

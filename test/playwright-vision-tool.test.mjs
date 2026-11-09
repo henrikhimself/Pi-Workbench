@@ -22,6 +22,12 @@ function toolFixture({ outcome = shot, registry, state = READY, available = true
 }
 const run = (f, params = {}, signal = new AbortController().signal) => f.def.execute("id", params, signal, undefined, f.ctx);
 
+test("describe refuses before any screenshot when browser_take_screenshot is not callable", async () => {
+  const f = toolFixture(); f.ctx.tools = [{ name: "mcp__playwright__browser_snapshot" }];
+  await assert.rejects(run(f), /browser_take_screenshot.*active.*browser_snapshot/s); assert.equal(f.calls.length, 0);
+  const g = toolFixture(); g.ctx.tools = [{ name: "mcp__playwright__browser_take_screenshot" }];
+  await run(g).catch(() => {}); assert.equal(g.calls.length, 1);
+});
 test("tool schema is strict and the tool is inactive by default", () => {
   const f = toolFixture(); assert.equal(f.def.name, "wb_screenshot_describe"); assert.equal(f.def.defaultActive, false);
   assert.equal(Value.Check(f.def.parameters, {}), true); assert.equal(Value.Check(f.def.parameters, { question: "x", fullPage: true }), true);
@@ -137,6 +143,33 @@ test("guidance recommends the tool only to a model without image input and follo
   f.ctx.model = undefined; assert.doesNotMatch(await f.guidance(), /wb_screenshot_describe/);
   f.ctx.model = textModel; assert.match(await f.guidance(), /wb_screenshot_describe/);
   f.setVision({ state: "unset" }); assert.doesNotMatch(await f.guidance(), /wb_screenshot_describe/);
+});
+test("L2: switching from an image model to a text-only model adds the vision tools once", async t => {
+  const f = await integrationFixture(t, { model: imageModel });
+  await f.command("on"); f.setVision(READY); await f.integration.refresh(f.ctx);
+  assert.deepEqual(f.active().filter(n => n.startsWith("wb_")), []);
+  assert.equal(f.setCalls.length, 0);
+  f.ctx.model = textModel;
+  f.integration.modelSelect({ type: "model_select", model: textModel, previousModel: imageModel, source: "set" });
+  assert.deepEqual(f.active().filter(n => n.startsWith("wb_")).sort(), ["wb_screenshot_describe", "wb_screenshot_locate"]);
+  assert.equal(f.setCalls.length, 1);
+  await f.integration.refresh(f.ctx); await f.integration.refresh(f.ctx);
+  assert.equal(f.setCalls.length, 1);
+  assert.match(await f.guidance(), /wb_screenshot_describe/);
+  const lazy = await integrationFixture(t, { model: imageModel });
+  await lazy.command("on"); lazy.setVision(READY); await lazy.integration.refresh(lazy.ctx);
+  lazy.ctx.model = textModel;
+  assert.match(await lazy.guidance(), /wb_screenshot_describe/);
+  assert.deepEqual(lazy.active().filter(n => n.startsWith("wb_")).sort(), ["wb_screenshot_describe", "wb_screenshot_locate"]);
+});
+test("guidance names only the vision tools that are active", async t => {
+  const f = await integrationFixture(t, { model: textModel });
+  await f.command("on"); f.setVision(READY); await f.integration.refresh(f.ctx);
+  f.setActive(f.active().filter(n => n !== "wb_screenshot_describe"));
+  const text = await f.guidance();
+  assert.doesNotMatch(text, /wb_screenshot_describe/);
+  assert.match(text, /wb_screenshot_locate/);
+  assert.equal(f.active().includes("wb_screenshot_describe"), false, "not re-added");
 });
 test("the registered tool refuses before any screenshot when Playwright is not available", async t => {
   const f = await integrationFixture(t, { model: textModel }), def = f.registered[0], calls = [];

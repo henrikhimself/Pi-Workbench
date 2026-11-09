@@ -51,7 +51,7 @@ test("live Memory peer protects store from deletion and allows later safe retry"
   await manager.createStore();
   const peer = await createConsumerLease(join(manager.store.root, "consumers", manager.store.identifier), manager.store.directory);
   try {
-    await assert.rejects(manager.deleteStore(), /store busy/);
+    await assert.rejects(manager.deleteStore({ timeoutMs: 200 }), /store busy/);
     assert.equal(manager.enabled, true);
   } finally { await peer.release(); }
   await manager.deleteStore(); assert.equal(manager.enabled, false);
@@ -63,7 +63,7 @@ test("caught physical promotion failure restores old store and clears pending in
     await manager.createStore(); live = manager.store.directory;
     await writeFile(join(live, "sentinel"), "original");
     stage = join(manager.store.root, "candidate"); await mkdir(stage); await writeFile(join(stage, "sentinel"), "candidate");
-    await assert.rejects(manager.swapStagedDirectory(stage, live, live + ".backup", true), /injected promotion/);
+    await assert.rejects(manager.swapStagedDirectory(stage, live, live + ".backup"), /injected promotion/);
     assert.equal(await readFile(join(live, "sentinel"), "utf8"), "original");
     assert.equal(manager.recoveryPending, false);
   }, async (from, to) => { if (from === stage) throw new Error("injected promotion"); await rename(from, to); });
@@ -75,7 +75,7 @@ test("failed restoration retains full old store, candidate and recovery identity
     await manager.createStore(); live = manager.store.directory; backup = live + ".backup";
     await writeFile(join(live, "sentinel"), "original");
     stage = join(manager.store.root, "candidate"); await mkdir(stage); await writeFile(join(stage, "sentinel"), "candidate");
-    await assert.rejects(manager.swapStagedDirectory(stage, live, backup, true), /Automatic restore failed/);
+    await assert.rejects(manager.swapStagedDirectory(stage, live, backup), /Automatic restore failed/);
     assert.equal(manager.recoveryPending, true);
     assert.equal(await readFile(join(backup, "sentinel"), "utf8"), "original");
     assert.equal(await readFile(join(stage, "sentinel"), "utf8"), "candidate");
@@ -122,4 +122,14 @@ test("successful physical/logical swaps retain original backups without pruning"
   await manager.swapStagedDirectory(stage, live, backup);
   assert.equal(await readFile(join(live, "sentinel"), "utf8"), "replacement");
   assert.equal(await readFile(join(backup, "sentinel"), "utf8"), "original");
+}));
+
+test("M-5: deleteStore removes another release's store", () => fixture(async ({ project, root, manager }) => {
+  await manager.createStore();
+  const marker = join(manager.store.directory, "workbench-identity.json");
+  await writeFile(marker, JSON.stringify({ ...JSON.parse(await readFile(marker, "utf8")), headroomVersion: "0.1.0" }));
+  const next = new MemoryManager({ cwd: project, root: join(root, "configured-base"), userId: "fixture", ensurePython: async () => "/fixture/python", runProcess: async () => {} });
+  assert.match(await next.storeRefusal(), /another version/);
+  await next.deleteStore();
+  assert.equal(existsSync(manager.store.directory), false);
 }));

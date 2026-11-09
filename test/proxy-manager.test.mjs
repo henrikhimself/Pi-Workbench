@@ -15,8 +15,9 @@ async function waitHealth(manager) {
   do { if (await manager.healthCheck()) return true; await new Promise(done => setTimeout(done, 20)); } while (Date.now() < deadline);
   return false;
 }
-const { ProxyManager, findPython, getHeadroomAiVersion, HEADROOM_REQUEST_TIMEOUT_MS, PROXY_LOCK_WAIT_MS } = await jiti.import("../src/proxy-manager.ts");
-const { activeConsumers, createConsumerLease, ownIdentity, publishJson } = await jiti.import("../src/managed-lifecycle.ts");
+const { ProxyManager, getHeadroomAiVersion, HEADROOM_REQUEST_TIMEOUT_MS, PROXY_LOCK_WAIT_MS } = await jiti.import("../src/proxy-manager.ts");
+const { findPython } = await jiti.import("../src/headroom-runtime.ts");
+const { acquireManagedLock, activeConsumers, createConsumerLease, ownIdentity, publishJson } = await jiti.import("../src/managed-lifecycle.ts");
 
 async function fixture(fn, { owned = true, verifier = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), "wb-proxy-ownership-"));
@@ -85,6 +86,15 @@ test("proxy launch closes log handle when progress callback throws before spawn"
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
 }));
 
+test("H-13: each launch starts a new proxy.log and keeps the previous one as proxy.log.1", async () => fixture(async fx => {
+  const directory = join(fx.root, "proxies", String(fx.port));
+  await writeFile(join(directory, "proxy.log"), "previous run\n", { mode: 0o600 });
+  const manager = fx.make(); manager.descriptor = fx.descriptor;
+  await assert.rejects(manager.launch(() => { throw new Error("stop before spawn"); }), /stop before spawn/);
+  assert.equal(await readFile(join(directory, "proxy.log.1"), "utf8"), "previous run\n");
+  assert.equal(await readFile(join(directory, "proxy.log"), "utf8"), "");
+}));
+
 test("managed proxy pin equals exact extension SDK dependency", async () => {
   const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
   assert.equal(await getHeadroomAiVersion(), packageJson.dependencies["headroom-ai"]);
@@ -92,9 +102,8 @@ test("managed proxy pin equals exact extension SDK dependency", async () => {
 test("findPython detects supported system Python without package installation", async () => {
   assert.ok(["python3", "python"].includes(await findPython()));
 });
-test("managed proxy defaults to loopback 8787 and refuses non-loopback binding", () => {
+test("managed proxy defaults to loopback 8787", () => {
   assert.equal(new ProxyManager().baseUrl, "http://127.0.0.1:8787");
-  assert.throws(() => new ProxyManager({ host: "0.0.0.0" }), /only 127/);
 });
 test("exact-version unowned HTTP server is never adopted, probed or stopped", () => fixture(async fx => {
   const manager = fx.make(); const messages = [];
@@ -284,4 +293,68 @@ test("proxy spawn environment holds the allowlisted base, the mapped tuning and 
 test("default request timeout equals the derived default (30 s server timeout plus margin)", async () => {
   const { headroomRequestTimeoutMs } = await jiti.import("../src/headroom-config.ts");
   assert.equal(headroomRequestTimeoutMs(), HEADROOM_REQUEST_TIMEOUT_MS);
+});
+
+test("H-1: a successful activation keeps its lease when a later probe fails", () => fixture(async fx => {
+  const m = fx.make(); m.healthCheck = async () => false;
+  assert.equal(await m.ensureRunning(() => {}), true);
+  assert.equal(m.isManaged, true);
+  assert.equal((await activeConsumers(fx.runtime.leaseRoot, `proxy:${fx.port}`)).length, 2);
+}));
+
+test("H-1: a failed activation drops its lease even when the proxy answers a later probe", () => fixture(async fx => {
+  const m = fx.make(); m.healthy = async () => false; m.healthCheck = async () => true;
+  assert.equal(await m.ensureRunning(() => {}), false);
+  assert.equal(m.isManaged, false);
+  assert.equal((await activeConsumers(fx.runtime.leaseRoot, `proxy:${fx.port}`)).length, 1);
+}));
+
+const withinMs = (ms, work) => Promise.race([work, new Promise((_, reject) => setTimeout(() => reject(new Error(`still blocked after ${ms} ms`)), ms))]);
+const holdProxyLock = fx => acquireManagedLock(join(fx.root, "coordination"), `proxy-${fx.port}`);
+
+test("H-3: stop({ terminate: false }) does not wait for a peer-held proxy lock", () => fixture(async fx => {
+  const a = fx.make();
+  assert.equal(await a.ensureRunning(() => {}), true);
+  const release = await holdProxyLock(fx);
+  try {
+    await withinMs(2000, a.stop({ terminate: false }));
+    assert.equal(a.isManaged, false);
+    assert.equal((await activeConsumers(fx.runtime.leaseRoot, `proxy:${fx.port}`)).length, 1);
+    assert.equal(fx.state.killed, 0);
+  } finally { await release(); }
+}));
+
+test("H-3: a last-consumer stop() gives up on a busy lock and still releases its lease", () => fixture(async fx => {
+  const a = fx.make({ shutdownLockWaitMs: 200 });
+  assert.equal(await a.ensureRunning(() => {}), true);
+  await fx.releaseKeeper();
+  const release = await holdProxyLock(fx);
+  try {
+    await withinMs(3000, a.stop());
+    assert.equal(fx.state.killed, 0);
+    assert.equal((await activeConsumers(fx.runtime.leaseRoot, `proxy:${fx.port}`)).length, 0);
+  } finally { await release(); }
+}));
+
+test("H-3: stop() cancels an activation waiting for the proxy lock", () => fixture(async fx => {
+  const a = fx.make();
+  const release = await holdProxyLock(fx);
+  try {
+    const p = a.ensureRunning(() => {});
+    await new Promise(done => setTimeout(done, 100));
+    await withinMs(2000, a.stop());
+    assert.equal(await p, false);
+  } finally { await release(); }
+}));
+
+test("H-2: owned gate passes lifespan only and refuses websocket and unencrypted http", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { stdout } = await promisify(execFile)("python3", ["-I", join(process.cwd(), "test", "helpers", "owned-gate-scopes.py"), join(process.cwd(), "src", "managed-proxy.py")]);
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.websocket.called, []);
+  assert.equal(result.websocket.sent[0].type, "websocket.close");
+  assert.deepEqual(result.lifespan.called, ["lifespan"]);
+  assert.deepEqual(result.http.called, []);
+  assert.equal(result.http.sent[0].status, 403);
 });

@@ -5,13 +5,12 @@ import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
 const guidance = await jiti.import("../src/memory-guidance.ts");
 
-const MEMORY_SEARCH = "mcp__headroom-memory__memory_search";
-const MEMORY_SAVE = "mcp__headroom-memory__memory_save";
+const MEMORY_SEARCH = "mcp__headroom_memory__memory_search";
+const MEMORY_SAVE = "mcp__headroom_memory__memory_save";
 
 function mode(options) {
   return guidance.resolveMemoryGuidanceMode({
     memoryRegistered: true,
-    studyEnabled: false,
     activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE],
     ...options,
   });
@@ -20,8 +19,12 @@ function mode(options) {
 test("Memory guidance: normal policy requires registered search and save tools", () => {
   assert.equal(mode({}), "normal");
   assert.equal(mode({ memoryRegistered: false }), "off");
-  assert.equal(mode({ activeToolNames: [MEMORY_SEARCH] }), "off");
+  assert.equal(mode({ activeToolNames: [MEMORY_SEARCH] }), "search-only");
   assert.equal(mode({ activeToolNames: [MEMORY_SAVE] }), "off");
+});
+
+test("X-4b: hyphenated tool names are not Pi's and are not recognised", () => {
+  assert.equal(mode({ activeToolNames: ["mcp__headroom-memory__memory_search", "mcp__headroom-memory__memory_save"] }), "off");
 });
 
 test("Memory guidance names match actual Pi normalized MCP tools", () => {
@@ -31,10 +34,12 @@ test("Memory guidance names match actual Pi normalized MCP tools", () => {
   assert.doesNotMatch(guidance.MEMORY_GUIDANCE, /mcp__headroom-memory__/);
 });
 
-test("Memory guidance: Study Mode does not restrict available Memory tools", () => {
-  assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH] }), "study");
-  assert.equal(mode({ studyEnabled: true, activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE] }), "normal");
-  assert.equal(mode({ studyEnabled: true, activeToolNames: [] }), "off");
+test("Memory guidance: search without save is search-only, with Study Mode on or off", () => {
+  for (const studyEnabled of [true, false]) {
+    assert.equal(mode({ studyEnabled, activeToolNames: [MEMORY_SEARCH] }), "search-only");
+    assert.equal(mode({ studyEnabled, activeToolNames: [MEMORY_SEARCH, MEMORY_SAVE] }), "normal");
+    assert.equal(mode({ studyEnabled, activeToolNames: [] }), "off");
+  }
 });
 
 test("Memory guidance: policy preserves unrelated sections and removes unavailable Memory", () => {
@@ -46,9 +51,9 @@ test("Memory guidance: policy preserves unrelated sections and removes unavailab
   assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /explicitly asks to remember/);
   assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /Never save secrets/);
 
-  guidance.applyMemoryGuidance(sections, "study");
-  assert.equal(sections[guidance.MEMORY_PROMPT_SECTION], guidance.STUDY_MEMORY_GUIDANCE);
-  assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /not Study Mode, determines whether Memory can be saved/i);
+  guidance.applyMemoryGuidance(sections, "search-only");
+  assert.equal(sections[guidance.MEMORY_PROMPT_SECTION], guidance.SEARCH_ONLY_MEMORY_GUIDANCE);
+  assert.match(sections[guidance.MEMORY_PROMPT_SECTION], /Saving Memory is not available/);
 
   guidance.applyMemoryGuidance(sections, "off");
   assert.equal(sections[guidance.MEMORY_PROMPT_SECTION], undefined);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { access, chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, lstat, mkdir, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { createJiti } from "jiti";
@@ -113,6 +113,12 @@ test("Playwright runtime/selection schemas bind identity and canonical managed e
     assert.throws(() => m.parsePlaywrightRuntime({ ...record, ...changed }, f.paths));
   }
   assert.throws(() => m.parsePlaywrightSelection({ ...selection, slot: "/external" }, f.paths));
+});
+test("Playwright new session creates no diagnostics directory", async t => {
+  const f = await fixture(t), record = runtime(f.paths), session = m.resolvePlaywrightSession(f.project);
+  await m.enablePlaywrightOptIn(f.project); await m.preparePlaywrightSession(session, record);
+  assert.deepEqual((await readdir(session.directory)).sort(), ["artifacts", "cache", "config.json", "home", "session.json", "tmp"]);
+  assert.equal("diagnostics" in session, false);
 });
 test("Playwright fresh session has fixed sandbox/headless/vision/idle/output policy and private configuration", async t => {
   const f = await fixture(t), record = runtime(f.paths), session = m.resolvePlaywrightSession(f.project);

@@ -4,7 +4,7 @@
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { mkdir, open, rm, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rm, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createJiti } from "jiti";
@@ -643,7 +643,7 @@ test("session_start: invalid headroom.json compression disables compression with
     assert.ok(statuses.some((status) => status?.includes("✓ Study")));
     assert.ok(
       notifications.some(({ message, level }) =>
-        level === "error" && message.includes("headroom.json compression.mode must be ccr, lossy_inline, or lossless_then_lossy"),
+        level === "error" && message.includes("headroom.json compression.mode must be lossy_inline or lossless_then_lossy"),
       ),
     );
   } finally {
@@ -684,7 +684,7 @@ async function stabilityFixture(t, { timers = ["setInterval", "Date"], alive = t
     notify: (message, level) => notifications.push({ message, level }) };
   const proxyManager = {
     isManaged: true, baseUrl: "http://127.0.0.1:8787", resume() {}, stop: async () => {}, ensureRunning: async () => true,
-    tryRestart: async () => { state.restarts++; return state.restartOk; },
+    tryRestart: async (onStatus) => { state.restarts++; if (state.restartMessage) onStatus(state.restartMessage); return state.restartOk; },
     processAlive: async () => state.alive,
     healthCheck: async (timeoutMs) => { state.healthCalls.push(timeoutMs); return state.healthOk; },
     requestOwned: async (_path, _body, _method, signal) => {
@@ -786,6 +786,37 @@ test("context: a failed request restarts the proxy only when its process is gone
   assert.equal(gone.state.restarts, 1);
 });
 
+test("H-9: a failed mid-session restart leaves the footer offline", async (t) => {
+  const fx = await stabilityFixture(t, { timers: ["Date"], alive: false });
+  fx.state.compressOk = false; fx.state.healthOk = false; fx.state.restartOk = false;
+  fx.state.restartMessage = "Owned proxy startup failed";
+  await fx.context();
+  assert.equal(fx.state.restarts, 1);
+  assert.equal(fx.statuses.at(-1), "⚠ Headroom offline");
+});
+
+test("H-9: status Link is running for a peer-owned healthy proxy", async () => {
+  const notifications = [];
+  const proxyManager = { isManaged: false, resume() {}, stop: async () => {}, ensureRunning: async () => false, tryRestart: async () => false,
+    processAlive: async () => false, healthCheck: async () => true };
+  const pi = { on() { return () => {}; }, registerCommand() {} };
+  const { commands, home } = await installExtension(await jiti.import("../src/index.ts"), pi, { proxyManager });
+  await commands.get("wb:headroom-proxy").handler("status", { cwd: home, ui: { notify: (message) => notifications.push(message) } });
+  assert.match(notifications.join("\n"), /Link:\s+running/);
+});
+
+test("H-9: on with an invalid headroom.json notifies once", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "pi-headroom-h9-config-")); fixtureHomes.push(dir);
+  const configPath = join(dir, "headroom.json");
+  await writeFile(configPath, JSON.stringify({ schemaVersion: 1, compression: { mode: "token" } }));
+  const notifications = [];
+  const activationUi = { setStatus() {}, notify: (message, level) => notifications.push({ message, level }) };
+  const pi = { on() { return () => {}; }, registerCommand() {} };
+  await installExtension(await jiti.import("../src/index.ts"), pi, { headroomConfigPath: configPath, activationUi });
+  assert.equal(notifications.length, 1, JSON.stringify(notifications));
+  assert.equal(notifications.some(({ message }) => message.includes("Managed Headroom unavailable")), false);
+});
+
 test("context: an aborted run returns the original context and is not a proxy failure", async (t) => {
   const fx = await stabilityFixture(t, { timers: ["Date"] });
   fx.state.hang = true;
@@ -836,7 +867,82 @@ test("M7: Memory does not register over a same-name mcp.json server and status s
   assert.ok(f.notifications.some(({ message }) => /Headroom Memory not registered: same-name MCP declaration "headroom_memory" in .*mcp\.json/.test(message)), JSON.stringify(f.notifications));
   assert.match(f.statuses.filter(({ key }) => key === "headroom-memory").at(-1).text, /offline/);
   await f.command.handler("status", f.ctx);
-  assert.match(f.notifications.at(-1).message, /not registered \(same-name MCP declaration/);
+  assert.match(f.notifications.at(-1).message, /Link: {5}not registered/);
+  assert.match(f.notifications.at(-1).message, /Problem: {2}Not registered: same-name MCP declaration/);
+});
+
+test("M-8: status runs during an unfinished publication and names the recovery record", async (t) => {
+  const f = await memoryFixture(t);
+  const { publishJson } = await jiti.import("../src/managed-lifecycle.ts");
+  await f.command.handler("on", f.ctx);
+  const m = new f.MemoryManager({ cwd: f.ctx.cwd, root: join(f.ctx.cwd, "..", "memory-root"), userId: "tester" });
+  await publishJson(join(m.store.root, "coordination"), m.pendingPath, { schemaVersion: 1, live: m.store.directory, staging: "/x", backup: "/y" });
+  await f.command.handler("status", f.ctx);
+  const status = f.notifications.at(-1).message;
+  assert.match(status, /refused \(incomplete publication\)/);
+  assert.ok(status.includes(m.pendingPath), status);
+  await f.command.handler("show", f.ctx);
+  const refusal = f.notifications.at(-1);
+  assert.equal(refusal.level, "error");
+  assert.ok(refusal.message.includes(m.pendingPath), refusal.message);
+});
+
+test("M-9: a failed off restores the Memory registration", async (t) => {
+  const f = await memoryFixture(t);
+  await f.command.handler("on", f.ctx);
+  const original = f.MemoryManager.prototype.deleteStore;
+  f.MemoryManager.prototype.deleteStore = async () => { throw new Error("store busy"); };
+  t.after(() => { f.MemoryManager.prototype.deleteStore = original; });
+  await f.command.handler("off --confirm-delete", f.ctx);
+  assert.ok(f.notifications.some(({ message }) => /Could not delete Headroom Memory: store busy/.test(message)), JSON.stringify(f.notifications));
+  assert.deepEqual(f.unregistered, ["headroom-memory"]);
+  assert.equal(f.registered.length, 2, "Memory is registered again");
+  assert.match(f.statuses.filter(({ key }) => key === "headroom-memory").at(-1).text, /✓ Headroom Memory/);
+});
+
+test("X-2c: Memory status uses the shared layout", async (t) => {
+  const ok = await memoryFixture(t);
+  await ok.command.handler("on", ok.ctx);
+  await ok.command.handler("status", ok.ctx);
+  const status = ok.notifications.at(-1).message;
+  assert.match(status, /Version: {2}/);
+  assert.match(status, /Link: {5}registered/);
+  assert.doesNotMatch(status, /not connected/);
+  const down = await memoryFixture(t);
+  down.MemoryManager.prototype.prepare = async () => null;
+  await down.command.handler("on", down.ctx);
+  await down.command.handler("status", down.ctx);
+  const failed = down.notifications.at(-1).message;
+  assert.match(failed, /Link: {5}not registered/);
+  assert.match(failed, /Problem: {2}Managed runtime or ONNX preflight unavailable/);
+});
+
+test("M-4: on while already on keeps Memory registered and reports enabled", async (t) => {
+  const f = await memoryFixture(t);
+  const { createConsumerLease } = await jiti.import("../src/managed-lifecycle.ts");
+  await f.command.handler("on", f.ctx);
+  const m = new f.MemoryManager({ cwd: f.ctx.cwd, root: join(f.ctx.cwd, "..", "memory-root"), userId: "tester" });
+  const lease = await createConsumerLease(join(m.store.root, "consumers", m.store.identifier), m.store.directory);
+  t.after(() => lease.release());
+  await f.command.handler("on", f.ctx);
+  const enabled = f.notifications.filter(({ message }) => message === "Headroom Memory enabled for this project");
+  assert.equal(enabled.length, 2, JSON.stringify(f.notifications));
+  assert.equal(f.notifications.some(({ message }) => /busy|unavailable/.test(message)), false);
+  assert.match(f.statuses.filter(({ key }) => key === "headroom-memory").at(-1).text, /✓ Headroom Memory/);
+});
+
+test("M-5: status says refused (other version) and off --confirm-delete deletes it", async (t) => {
+  const f = await memoryFixture(t);
+  await f.command.handler("on", f.ctx);
+  const manager = new f.MemoryManager({ cwd: f.ctx.cwd, root: join(f.ctx.cwd, "..", "memory-root"), userId: "tester" });
+  const marker = join(manager.store.directory, "workbench-identity.json");
+  await writeFile(marker, JSON.stringify({ ...JSON.parse(await readFile(marker, "utf8")), headroomVersion: "0.1.0" }));
+  await f.command.handler("status", f.ctx);
+  assert.match(f.notifications.at(-1).message, /State: {4}refused \(other version\)/);
+  assert.match(f.notifications.at(-1).message, /Problem: .*another version/);
+  await f.command.handler("off --confirm-delete", f.ctx);
+  assert.ok(f.notifications.some(({ message }) => message === "Headroom Memory data deleted for this project"), JSON.stringify(f.notifications.slice(-3)));
+  assert.equal(existsSync(manager.store.directory), false);
 });
 
 test("M7: Memory registers normally when nothing conflicts", async (t) => {
@@ -892,4 +998,22 @@ test("M5: session_shutdown terminates the proxy on quit and hands it over for ev
   assert.deepEqual(outcomes.quit, [[undefined]], "quit: full stop");
   assert.deepEqual(outcomes.undefined, [[undefined]], "unknown reason: full stop (safe default)");
   for (const reason of ["reload", "new", "resume", "fork"]) assert.deepEqual(outcomes[reason], [[{ terminate: false }]], reason);
+});
+
+test("H-5: Memory commands report an invalid headroom.json", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "pi-headroom-config-invalid-memory-"));
+  const configPath = join(tempDir, "headroom.json");
+  try {
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, compression: { mode: "token" } }));
+    const commands = new Map();
+    const pi = { on() { return () => {}; }, registerCommand(name, options) { commands.set(name, options); } };
+    const mod = await jiti.import("../src/index.ts");
+    const fixture = await installExtension(mod, pi, { headroomConfigPath: configPath });
+    for (const action of ["status", "on", "export"]) {
+      const notifications = [];
+      const ctx = { cwd: fixture.home, ui: { setStatus() {}, notify: (message, level) => notifications.push({ message, level }) } };
+      await commands.get("wb:headroom-memory").handler(action, ctx);
+      assert.ok(notifications.some(({ message, level }) => level === "error" && message.includes("headroom.json compression.mode")), `${action}: ${JSON.stringify(notifications)}`);
+    }
+  } finally { await rm(tempDir, { recursive: true, force: true }); }
 });

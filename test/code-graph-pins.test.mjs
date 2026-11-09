@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createJiti } from "jiti";
 const jiti = createJiti(import.meta.url);
-const { CODE_GRAPH_ASSETS, getAsset, resolveAssetUrl, validateAsset } = await jiti.import("../src/code-graph-assets.ts");
+const { CODE_GRAPH_ASSETS, CODE_GRAPH_VERSION, getAsset, resolveAssetUrl, validateAsset } = await jiti.import("../src/code-graph-assets.ts");
 const { MAX_DOWNLOAD_BYTES, MAX_MEMBER_BYTES } = await jiti.import("../src/code-graph-installer.ts");
 test("both reviewed portable assets and bounded extraction limits have exact identities", () => {
   assert.deepEqual(Object.keys(CODE_GRAPH_ASSETS).sort(), ["linux-amd64", "linux-arm64"]);
@@ -20,4 +20,9 @@ test("both reviewed portable assets and bounded extraction limits have exact ide
     assert.ok(resolveAssetUrl(asset).endsWith("codebase-memory-mcp-" + platform + "-portable.tar.gz"));
     assert.deepEqual(validateAsset(platform, asset), []);
   }
+});
+test("every packaged asset uses the required backend version", async () => {
+  const { CODE_GRAPH_REQUIRED_VERSION } = await jiti.import("../src/code-graph-manager.ts");
+  assert.equal(CODE_GRAPH_REQUIRED_VERSION, CODE_GRAPH_VERSION);
+  for (const asset of Object.values(CODE_GRAPH_ASSETS)) assert.equal(asset.version, CODE_GRAPH_REQUIRED_VERSION);
 });

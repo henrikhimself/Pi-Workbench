@@ -126,7 +126,7 @@ export class PlaywrightManager {
         if (!await playwrightOptedIn(this.project)) throw new Error("Playwright workspace disabled during activation");
         workspaceLease = await createConsumerLease(this.paths.playwrightConsumers, `workspace:${this.project.identifier}`);
       } finally { await workspaceUnlock(); }
-      const ready = await this.runtime.ensure(message => { if (epoch === this.generation && !signal.aborted) this.progress(message); }, signal);
+      const ready = await this.runtime.ensure(message => { if (epoch === this.generation && !signal.aborted) this.progress(message); }, signal, { provision: explicit });
       this.fence(epoch, signal);
       const runtimeUnlock = await acquireManagedLock(this.paths.playwrightCoordination, "install", { signal, timeoutMs: 120000 });
       try {
@@ -153,7 +153,7 @@ export class PlaywrightManager {
       while (!await this.observe()) {
         this.fence(epoch, signal);
         if (!this.current()) throw new Error("Managed Playwright registration unavailable or overridden");
-        if (Date.now() >= deadline) throw new Error("Owned Playwright MCP did not start; check built-in MCP integration and session diagnostics");
+        if (Date.now() >= deadline) throw new Error("Owned Playwright MCP did not start; check the playwright server in /mcp");
         await pause(25);
       }
       this.fence(epoch, signal);
@@ -201,7 +201,7 @@ export class PlaywrightManager {
       await pause(25);
     }
   }
-  /** Stop only this controller's session; retain opt-in, artifacts, and diagnostics. */
+  /** Stop only this controller's session; retain opt-in and artifacts. */
   shutdown(): Promise<void> {
     ++this.stopEpoch; ++this.generation; this.controller?.abort();
     if (this.stopping) return this.stopping;
@@ -286,7 +286,7 @@ export function formatPlaywrightStatus(status: PlaywrightStatus): string {
     ...(status.vision ? formatPlaywrightVisionConfig(status.vision).split("\n") : []),
     "Browser state: lazy; status does not launch a browser or prove one is open",
     `Session: ${status.session ?? "none"}`,
-    "Artifacts/diagnostics retained until confirmed workspace off; no quota, TTL, or automatic artifact/runtime GC",
+    "Artifacts retained until confirmed workspace off; no quota, TTL, or automatic artifact/runtime GC",
   ];
   return formatStatus(TOOL_NAMES.playwright, {
     state: status.intent === "on" ? "on" : status.intent === "off" ? "off" : "refused (project opt-in invalid or unsafe)",

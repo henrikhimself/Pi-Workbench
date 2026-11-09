@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, open, readFile, rename as fsRename, rm, stat, writeFile } from "node:fs/promises";
-import { execWithKillEscalation } from "./exec-escalating.js";
-import { assertNoSymlink, assertWithin, acquireManagedLock, ensurePrivateDirectory, requireDiskSpace } from "./managed-lifecycle.js";
-import { basename, delimiter, dirname, join, resolve } from "node:path";
+import { chmod, lstat, mkdir, open, readFile, rename as fsRename, rm, stat } from "node:fs/promises";
+import { defaultProcessRunner, type EscalatingExecResult, type ProcessRunner } from "./exec-escalating.js";
+import { assertNoSymlink, assertWithin, acquireManagedLock, ensurePrivateDirectory, publishJson, requireDiskSpace } from "./managed-lifecycle.js";
+import { basename, delimiter, dirname, isAbsolute, join } from "node:path";
 import https from "node:https";
 import { WORKBENCH_PATHS, type WorkbenchPaths } from "./paths.js";
 import {
@@ -45,12 +45,16 @@ const ASSET_RECORD_FILE = "asset.json";
 // ─── Types ────────────────────────────────────────────────────────────
 
 export interface InstalledAssetRecord {
+  schemaVersion: 1;
   version: string;
   resolvedUrl: string;
   sha256: string;
   /** Digest of extracted bytes, bound to the verified archive at installation. */
-  binarySha256?: string;
+  binarySha256: string;
+  installedAt: string;
 }
+
+const ASSET_RECORD_KEYS = ["binarySha256", "installedAt", "resolvedUrl", "schemaVersion", "sha256", "version"];
 
 export interface InstalledBinary {
   path: string;
@@ -66,18 +70,6 @@ export type BinaryAction =
   | { action: "invalid_manifest"; detail: string };
 
 export type StatusReporter = (message: string) => void;
-
-export interface ProcessResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-}
-
-export type ProcessRunner = (
-  command: string,
-  args: string[],
-  options: { env: NodeJS.ProcessEnv; timeoutMs: number; cwd: string; signal?: AbortSignal; killGraceMs?: number },
-) => Promise<ProcessResult>;
 
 export interface DownloadResponse {
   statusCode: number;
@@ -119,11 +111,12 @@ export function unsupportedPlatformMessage(os: string, arch: string): string {
 /**
  * Compare an installed asset record with the packaged manifest.
  *
+ * - No record → install.
  * - Same version, resolved URL, and SHA-256 → reuse.
- * - Packaged version greater → install the update.
- * - Any other installed version → install/select the exact packaged pin.
  * - Same version but different resolved URL or SHA-256 → the package
  *   manifest is invalid; never silently replace a release identity.
+ *
+ * Callers read only the packaged version's own record, so any other installed version is not expected.
  */
 export function decideBinaryAction(
   installed: InstalledAssetRecord | null,
@@ -276,8 +269,9 @@ export async function findGnuTar(
   runProcess: ProcessRunner = defaultProcessRunner(),
   pathValue: string | undefined = process.env.PATH,
 ): Promise<string> {
-  for (const directory of (pathValue ?? "").split(delimiter).filter(Boolean)) {
-    const candidate = resolve(directory, "tar");
+  // A relative PATH entry would resolve against the untrusted workspace (the cwd): never run it.
+  for (const directory of (pathValue ?? "").split(delimiter).filter((entry) => isAbsolute(entry))) {
+    const candidate = join(directory, "tar");
     try {
       const info = await stat(candidate);
       if (!info.isFile() || (info.mode & 0o111) === 0) continue;
@@ -358,12 +352,6 @@ export function parseBinaryVersionOutput(raw: string, binaryName = "codebase-mem
   return null;
 }
 
-export function defaultProcessRunner(): ProcessRunner {
-  return (command, args, options) => execWithKillEscalation(command, args, {
-    env: options.env, timeoutMs: options.timeoutMs, cwd: options.cwd, signal: options.signal, killGraceMs: options.killGraceMs,
-  });
-}
-
 /** Minimal environment for verifying the managed binary: no CBM variables. */
 export function createVerificationEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {
@@ -383,7 +371,7 @@ export async function verifyBinaryVersion(
   if (!parseAssetVersion(expectedVersion)) {
     return { ok: false, detail: `Expected version ${expectedVersion} is not vMAJOR.MINOR.PATCH` };
   }
-  let result: ProcessResult;
+  let result: EscalatingExecResult;
   try {
     result = await runProcess(binaryPath, ["--version"], {
       env: { ...createVerificationEnvironment(), HOME: options.cwd },
@@ -416,25 +404,32 @@ export function assetRecordPath(binRoot: string, version: string, platform: Code
   return join(binRoot, version, platform, ASSET_RECORD_FILE);
 }
 
+/**
+ * null: not installed (no file, or a record without a readable schemaVersion, which is every install
+ * made before the field existed, so it is reinstalled). Throws for a record this release must not
+ * touch: another schemaVersion, or a version-1 record of the wrong shape.
+ */
 export async function readInstalledRecord(
   binRoot: string,
   version: string,
   platform: CodeGraphPlatform,
 ): Promise<InstalledAssetRecord | null> {
-  try {
-    const parsed: unknown = JSON.parse(await readFile(assetRecordPath(binRoot, version, platform), "utf8"));
-    if (typeof parsed !== "object" || parsed === null) return null;
-    const record = parsed as Partial<InstalledAssetRecord>;
-    if (typeof record.version !== "string" || typeof record.resolvedUrl !== "string" || typeof record.sha256 !== "string") {
-      return null;
-    }
-    if (!parseAssetVersion(record.version)) return null;
-    if (record.version !== version) return null;
-    return { version: record.version, resolvedUrl: record.resolvedUrl, sha256: record.sha256,
-      ...(typeof record.binarySha256 === "string" ? { binarySha256: record.binarySha256 } : {}) };
-  } catch {
-    return null;
+  const path = assetRecordPath(binRoot, version, platform);
+  let parsed: unknown;
+  try { parsed = JSON.parse(await readFile(path, "utf8")); }
+  catch { return null; }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || !("schemaVersion" in parsed)) return null;
+  const record = parsed as Record<string, unknown>;
+  if (record.schemaVersion !== 1) {
+    throw new Error(`Code Graph install record ${path} has schemaVersion ${String(record.schemaVersion)}, which this release does not read; it was left unchanged.`);
   }
+  const unreadable = () => new Error(`Code Graph install record ${path} is not readable by this release; it was left unchanged.`);
+  if (Object.keys(record).sort().join() !== ASSET_RECORD_KEYS.join()) throw unreadable();
+  const { version: recorded, resolvedUrl, sha256, binarySha256, installedAt } = record;
+  if (typeof recorded !== "string" || typeof resolvedUrl !== "string" || typeof sha256 !== "string" ||
+      typeof binarySha256 !== "string" || typeof installedAt !== "string" ||
+      !/^[0-9a-f]{64}$/.test(binarySha256) || !parseAssetVersion(recorded) || recorded !== version) throw unreadable();
+  return { schemaVersion: 1, version: recorded, resolvedUrl, sha256, binarySha256, installedAt };
 }
 
 export class CodeGraphInstaller {
@@ -468,12 +463,21 @@ export class CodeGraphInstaller {
   async inspectInstalled(): Promise<InstalledBinary | null> {
     const platform = this.detectPlatform(); if (!platform) return null;
     const asset = getAsset(platform).asset, resolvedUrl = resolveAssetUrl(asset);
+    return (await this.verifiedInstall(asset, resolvedUrl, platform)).binary;
+  }
+
+  /**
+   * The installed binary when its record matches the asset, its bytes match the record and it reports
+   * the pinned version. `detail` is set only when the bytes were right but `--version` failed.
+   */
+  private async verifiedInstall(asset: CodeGraphAsset, resolvedUrl: string, platform: CodeGraphPlatform): Promise<{ binary: InstalledBinary | null; detail?: string }> {
     const record = await readInstalledRecord(this.binRoot, asset.version, platform);
-    if (!record || record.resolvedUrl !== resolvedUrl || record.sha256 !== asset.sha256 ||
-        !await this.verifyInstalledBytes(record, platform)) return null;
+    if (!record || record.version !== asset.version || record.resolvedUrl !== resolvedUrl || record.sha256 !== asset.sha256 ||
+        !await this.verifyInstalledBytes(record, platform)) return { binary: null };
     const path = installedBinaryPath(this.binRoot, asset.version, platform);
-    if (!(await verifyBinaryVersion(path, asset.version, this.runProcess, { cwd: this.paths.codeGraphRoot, signal: this.cancellation })).ok) return null;
-    return { path, version: asset.version, resolvedUrl, sha256: asset.sha256, reused: true };
+    const verified = await verifyBinaryVersion(path, asset.version, this.runProcess, { cwd: this.paths.codeGraphRoot, signal: this.cancellation });
+    if (!verified.ok) return { binary: null, detail: verified.detail };
+    return { binary: { path, version: asset.version, resolvedUrl, sha256: asset.sha256, reused: true } };
   }
 
   /**
@@ -500,42 +504,17 @@ export class CodeGraphInstaller {
     const action = decideBinaryAction(installed, { version: asset.version, resolvedUrl, sha256: asset.sha256 });
     if (action.action === "invalid_manifest") throw new Error(action.detail);
 
-    if (action.action === "reuse" && installed && await this.verifyInstalledBytes(installed, platform)) {
-      const binaryPath = installedBinaryPath(this.binRoot, installed.version, platform);
-      const verified = await verifyBinaryVersion(binaryPath, installed.version, this.runProcess, {
-        cwd: this.paths.codeGraphRoot, signal: this.cancellation,
-      });
-      if (verified.ok) {
-        return {
-          path: binaryPath,
-          version: installed.version,
-          resolvedUrl: installed.resolvedUrl,
-          sha256: installed.sha256,
-          reused: true,
-        };
-      }
-      onStatus(`Installed binary failed verification (${verified.detail}); reinstalling the packaged version.`);
+    if (action.action === "reuse") {
+      const reused = await this.verifiedInstall(asset, resolvedUrl, platform);
+      if (reused.binary) return reused.binary;
+      if (reused.detail) onStatus(`Installed binary failed verification (${reused.detail}); reinstalling the packaged version.`);
     }
 
     const release = await acquireInstallLock(this.paths.codeGraphInstallLock, INSTALL_LOCK_TIMEOUT_MS, this.cancellation);
     try {
       // Re-check under the lock: another session may have finished while we waited.
-      const underLock = await readInstalledRecord(this.binRoot, asset.version, platform);
-      if (
-        underLock &&
-        underLock.version === asset.version &&
-        underLock.resolvedUrl === resolvedUrl &&
-        underLock.sha256 === asset.sha256 &&
-        await this.verifyInstalledBytes(underLock, platform)
-      ) {
-        const binaryPath = installedBinaryPath(this.binRoot, asset.version, platform);
-        const verified = await verifyBinaryVersion(binaryPath, asset.version, this.runProcess, {
-          cwd: this.paths.codeGraphRoot, signal: this.cancellation,
-        });
-        if (verified.ok) {
-          return { path: binaryPath, version: asset.version, resolvedUrl, sha256: asset.sha256, reused: true };
-        }
-      }
+      const underLock = await this.verifiedInstall(asset, resolvedUrl, platform);
+      if (underLock.binary) return underLock.binary;
       return await this.installFresh(asset, resolvedUrl, platform, onStatus);
     } finally {
       await release();
@@ -587,15 +566,9 @@ export class CodeGraphInstaller {
       // Stage the final directory beside its destination, then rename.
       await ensurePrivateDirectory(this.paths.codeGraphRoot, stagedFinal);
       await fsRename(stagedBinary, join(stagedFinal, CODE_GRAPH_BINARY_MEMBER));
-      await writeFile(
-        join(stagedFinal, ASSET_RECORD_FILE),
-        JSON.stringify(
-          { version: asset.version, resolvedUrl, sha256: asset.sha256,
-            binarySha256: await sha256OfFile(join(stagedFinal, CODE_GRAPH_BINARY_MEMBER)), installedAt: new Date().toISOString() },
-          null,
-          2,
-        ) + "\n",
-      );
+      const binarySha256 = await sha256OfFile(join(stagedFinal, CODE_GRAPH_BINARY_MEMBER));
+      await publishJson(this.paths.codeGraphRoot, join(stagedFinal, ASSET_RECORD_FILE),
+        { schemaVersion: 1, version: asset.version, resolvedUrl, sha256: asset.sha256, binarySha256, installedAt: new Date().toISOString() });
       await ensurePrivateDirectory(this.paths.codeGraphRoot, dirname(finalDir));
       this.cancellation?.throwIfAborted();
       await this.quarantineBrokenInstall(finalDir);

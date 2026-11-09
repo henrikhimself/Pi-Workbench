@@ -1,12 +1,12 @@
 # pi-workbench
 
-Headroom context compression, project-scoped Memory, Code Graph, managed Playwright, and optional Study Mode for [Pi](https://pi.dev).
+Headroom context compression, project-scoped Memory, Code Graph, Playwright, and Study Mode for [Pi](https://pi.dev).
 
 ## Requirements and verified scope
 
-- Pi 1.5.0 (developed and type-checked against 1.5.0; earlier versions are not tested)
+- Pi 1.5.0.
 - Node.js 22+.
-- Python 3.10+ with venv/pip. The venv Python creates must ship pip 22.2 or newer (the install uses `pip install --dry-run --report`). Some Python 3.10 builds ship an older pip, for example Ubuntu 22.04 (pip 22.0.2); install then stops with a message naming both versions, and nothing is upgraded for you.
+- Python 3.10+ with venv/pip.
 
 ## Install, update, remove
 
@@ -21,9 +21,13 @@ pi update --extensions
 pi remove git:github.com/henrikhimself/Pi-Workbench
 ```
 
+## Where Workbench keeps its state
+
+Workbench keeps everything under `~/.pi/pi-workbench`, so every Pi proces on one machine shares the same store.
+
 ## Headroom configuration
 
-Installs and manages a Headroom process using configuration loaded from `~/.pi/pi-workbench/headroom.json`.
+Installs and manages a Headroom process using configuration loaded from `headroom.json`.
 
 
 ```json
@@ -42,9 +46,9 @@ Installs and manages a Headroom process using configuration loaded from `~/.pi/p
 
 ### Headroom Proxy
 
-Headroom Proxy attempts to save tokens by compressing requests before they are sent.
+Headroom Proxy attempts to save tokens by compressing requests before they are sent to your LLM.
 
-- `/wb:headroom-proxy on` — saves this project's compression opt-in, then attempts managed activation.
+- `/wb:headroom-proxy on` — saves this project's compression opt-in first, then attempts managed activation. If activation fails the opt-in is kept, so the next session retries.
 - `/wb:headroom-proxy off` — disables this session and removes the project's compression opt-in.
 - `/wb:headroom-proxy status` — reports both this session's state and the project's saved startup choice.
 
@@ -72,7 +76,7 @@ Headroom Proxy attempts to save tokens by compressing requests before they are s
 
 #### Proxy tuning for slow machines
 
-The optional `proxy` section maps to Headroom's own settings and is applied when this session **starts** the managed proxy. A proxy that another session already started keeps its settings; stop it (turn compression off in every session) before changing them. `headroom.json` is read when Pi loads the extension, so use `/reload` or start a new session after editing it.
+The optional `proxy` section maps to Headroom's own settings and is applied when this session starts the managed proxy. A proxy that another session already started keeps its settings.
 
 ```json
 {
@@ -92,8 +96,6 @@ The optional `proxy` section maps to Headroom's own settings and is applied when
 | `quarantineThreshold` | Integer `1`–`64` | Number of timed-out compression workers that makes the proxy refuse new work. Headroom's default is half its worker pool. |
 | `quarantineMaxSeconds` | Integer `1`–`3600` | Longest time that refusal lasts. Default `60`. |
 
-Other `HEADROOM_*` environment variables are not passed to the proxy; only these validated values are.
-
 #### Troubleshoot editing failures
 
 If exact-match edits fail or source edits become unreliable, start with profile above. Reload extensions, retry same edit workflow, then compare editing reliability against token savings.
@@ -102,8 +104,9 @@ If exact-match edits fail or source edits become unreliable, start with profile 
 
 Headroom Memory gives Pi durable, project-scoped context. Pi can then search relevant prior project decisions.
 
-- `/wb:headroom-memory on` —  saves this project's Memory opt-in, then attempts managed activation.
+- `/wb:headroom-memory on` — prepares the managed runtime and ONNX model, then creates the project's Memory store, which is its opt-in. If any step fails nothing is saved.
 - `/wb:headroom-memory off [--confirm-delete]` — delete this workspace's Memory after confirmation (`--confirm-delete` replaces the prompt).
+- `/wb:headroom-memory status` — reports the status (layout in [Command results](#command-results)).
 - `/wb:headroom-memory show` — list current records in configured namespace.
 - `/wb:headroom-memory export` — write Memory data into export directory.
 - `/wb:headroom-memory import` — replace configured namespace from export directory; requires confirmation.
@@ -125,24 +128,40 @@ Headroom Memory gives Pi durable, project-scoped context. Pi can then search rel
 | `memory.namespace` | Logical Memory namespace; default `project`. |
 | `memory.export` | Project-relative bundle directory for export/import memory as plain text files. Must remain inside the project. |
 
+#### Merging Memories
+
+The `memory.export` is for exchanging memories. Run `/wb:headroom-memory merge` to merge them with your own memories. 
+
+Once memories are merged, you can share them using `/wb:headroom-memory export`.
+
+Git merge conflicts will occur. To help avoid this nuisance, a marked block is written to `.gitattributes` that chages git merge behavior for the memory export directory. 
+
+Each memories `merge` keeps the previous store under the Memory root. These backups are never pruned automatically.
+
 ## Code Graph
 
 Code Graph gives Pi structural code intelligence: symbol search, call paths, architecture overview, and impact queries over a local index of the current workspace.
 
-- `/wb:code-graph on` — saves this project's Code-Graph opt-in, then attempts managed activation.
+- `/wb:code-graph on` — installs, indexes and validates, then saves this project's opt-in as the last step. If any step fails nothing is saved.
 - `/wb:code-graph off [--confirm-delete]` — delete this workspace's Code-Graph after confirmation (`--confirm-delete` replaces the prompt).
 - `/wb:code-graph reindex` — reindexes code.
 - `/wb:code-graph status` — reports the status of the Code-Graph.
 
 ## Playwright
 
-Playwright gives Pi access to a browser, so it can use your website or the web.
+Playwright gives Pi access to a browser, so it can use your website or the web. Each workspace creates a managed session store that keeps Playwright artifacts.
 
-- `/wb:playwright on` — saves this project's Playwright opt-in, then attempts managed activation.
-- `/wb:playwright off [--confirm-delete]` — deletes this workspace's managed artifacts/diagnostics after confirmation (`--confirm-delete` replaces the prompt).
+It loads configuration from `playwright.json`.
+
+```json
+{
+  "schemaVersion": 1
+}
+```
+
+- `/wb:playwright on` — saves this project's Playwright opt-in first, then installs and activates. If the install fails the opt-in is kept. A new session reuses the installed runtime and never installs. If none is installed for this version, or the host Node/npm changed, run `/wb:playwright on` again.
+- `/wb:playwright off [--confirm-delete]` — deletes this workspace's managed artifacts and session records after confirmation (`--confirm-delete` replaces the prompt).
 - `/wb:playwright status` — reports the status of Playwright
-
-Each workspace creates a managed session store that saves Playwright configuration, artifacts, diagnostics and a private HOME/cache/tmp.
 
 ### Screenshots for text-only models
 
@@ -158,47 +177,12 @@ If your primary model cannot see images, a separate vision model can describe sc
 }
 ```
 
-Model must be selected and loaded manually before it can be used.
+| Field | Meaning |
+|---|---|
+| `vision.provider`  | The Pi model provider name.  |
+| `vision.model` | The name of the vision capable model that will be used. |
 
-Before each description Workbench checks that the model is loaded, without loading it: it sends one `GET <provider base URL>/models` with the provider's configured headers, adding the API key as a Bearer token only when no `Authorization` header is configured. The listing must contain the model. An entry with a `status` other than `loaded` counts as not loaded, and an entry with no `status` counts as loaded (a single-model server). A provider without a `/models` listing is reported as `unavailable` and cannot be used for vision.
-
-Images over 4 MiB are refused, and a failure returns a short reason (`unavailable`, `not loaded`, `too large`, `auth`, `timeout` or `model error`) so the agent can fall back to `browser_snapshot`.
-
-## Where Workbench keeps its state
-
-Workbench keeps everything under `~/.pi/pi-workbench`. The location follows your home directory, not `PI_CODING_AGENT_DIR`, so every Pi configuration on one machine shares the same store, the same leases and the same proxy port. For an isolated setup (a container or a test agent directory) use a separate `HOME`.
-
-```
-~/.pi/pi-workbench/
-  headroom.json, playwright.json     your settings
-  headroom/                          managed Python runtime, Memory stores, compression opt-ins
-  codebase-memory-mcp/               Code Graph binary, downloads, per-project index data
-  playwright/                        Playwright runtime, per-project artifacts and diagnostics
-```
-
-What is shared and what is per session:
-
-- **Headroom compression:** one managed proxy on the configured `port` (default 8787). The first session that needs it starts it, and later sessions use it while it is healthy and on the same runtime. It stops after the last session releases it. If something else holds the port, Workbench does not start another proxy.
-- **Headroom Memory:** the store is per project.
-- **Code Graph:** an MCP server over stdio, started for each Pi session. There is no port. The downloaded binary, the install lock and each project's index data are shared; `/wb:code-graph off` waits for other sessions that still use the index.
-- **Playwright:** also one server per session. Only the runtime install is shared.
-
-A project is on when its opt-in exists. Headroom compression, Code Graph and Playwright save it as `opt-in.json`, written last so a project without one is off; Headroom Memory counts the presence of its database. Headroom Memory and Code Graph also keep a `workbench-identity.json` in the project's data folder that says which release wrote it. Workbench never converts data and never deletes it on its own. If that marker is from another release, or the folder has content but no marker, the tool says "`<Tool>` data was written by another version, which this release does not read. It was left unchanged." and stays off.
-
-### Command results
-
-`on`, `off` and `status` answer the same way in all four tools. `on` ends with "`<Tool>` enabled for this project". `off` ends with "disabled for this project" (Headroom compression), "already off for this project", or, for the three tools that store project data, "data deleted for this project". `status` prints one layout:
-
-```
-<Tool>
-  State:    on | off | off (<reason>) | refused (<reason>)
-  Project:  <workspace path>  (<identifier>)
-  Data:     <directory> | none
-  Version:  <installed> (expected <pinned>) | not installed
-  Link:     registered | not registered | running | not running
-  Problem:  only when something is wrong
-  Details:  tool-specific lines
-```
+Vision model must be loaded manually before it can be used. Images over 4 MiB are refused
 
 ## Study Mode
 

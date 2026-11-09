@@ -11,9 +11,10 @@ test("Study guidance strongly prefers learning without claiming an execution bou
   assert.match(study.STUDY_GUIDANCE, /unless user explicitly asks/);
   assert.match(study.STUDY_GUIDANCE, /guidance only, not an execution boundary/);
   assert.doesNotMatch(study.STUDY_GUIDANCE, /hard-block|read-only boundary|only permitted/i);
+  assert.doesNotMatch(study.STUDY_GUIDANCE, /SourceLink|learner/);
 });
 
-test("restoreStudyModeState accepts legacy state and ignores saved tool names", () => {
+test("restoreStudyModeState accepts legacy state and ignores unknown fields", () => {
   const legacyEnabled = {
     type: "custom",
     customType: study.STUDY_ENTRY_TYPE,
